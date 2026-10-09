@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>About · ChatTorrent</title>
+  <meta name="description" content="A free AI chatbot run by its users: a large language model split across visitors' browsers, on their own graphics cards." />
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/site.css" />
+</head>
+<body>
+<!--
+  ABOUT THIS PAGE
+
+  Served at /about.
+  What ChatTorrent is, how it works and why it exists, for someone who has
+  never heard of it. Linked from the welcome popup ("How it works"), the site
+  header and the credit ribbon.
+-->
+  <header class="site-header">
+    <a class="brand" href="/"><img src="/favicon.svg" alt="" />ChatTorrent</a>
+    <nav>
+      <a href="/chat">Chat</a>
+      <a href="/about" aria-current="page">About</a>
+      <a href="/privacy">Privacy</a>
+      <a href="/terms">Terms</a>
+    </nav>
+  </header>
+  <main>
+    <h1>What is ChatTorrent?</h1>
+    <p>ChatTorrent is a free AI chatbot that runs on its users' computers. There's no data centre behind it: visitors lend part of their graphics card, and together their browsers run one large AI model that everyone can chat with.</p>
+
+    <h2>How it works</h2>
+    <p>The AI model ChatTorrent runs, Qwen3.8-27B, is about 27 GB: too big for most single computers. So it's cut into pieces, and every visitor who chooses to contribute downloads one or more of them onto their graphics card.</p>
+    <figure class="diagram">
+      <img src="/mesh.jpg" width="651" height="570" alt="Several browsers, each open at chattorrent.net/chat and holding a different number of blocks of the model, linked to one another by WebRTC connections through the relay server. On the right, the signalling server brings a new browser into the mesh.">
+      <figcaption>Each browser holds some blocks of the model and passes the work on to the next. The signalling server introduces new browsers to the mesh.</figcaption>
+    </figure>
+    <p>When you send a message, it passes from browser to browser, each running its own piece of the model, until the last one produces the next word of the reply. That repeats for every word. It's like a torrent, except that instead of sharing pieces of a file, people share the work of running the model.</p>
+    <p>People come and go all the time, so the mesh rearranges itself as they do: several browsers can hold the same piece, and when one leaves, another carries on. A new browser starts with a small piece and takes on more while it's idle, up to the limit its owner chose.</p>
+    <p>You can chat without contributing anything. Contributing is what keeps the model running, though, so if your computer has a graphics card to spare, please consider it.</p>
+
+    <h2>The technology</h2>
+    <ul>
+      <li><strong>WebGPU</strong> lets a web page use your graphics card. ChatTorrent's model code is written from scratch for it: no AI libraries, no plugins, nothing to install.</li>
+      <li><strong>WebRTC</strong> lets browsers talk to each other. It carries the model's working data from one browser to the next, encrypted, through a relay so that nobody learns anyone else's IP address.</li>
+      <li><strong>Two small servers</strong> help out. One introduces browsers to each other, and the other relays their encrypted traffic. Neither runs the AI or can read your messages.</li>
+    </ul>
+    <p>All of it is open source: the code is on <a href="https://github.com/l-wn/ChatTorrent" rel="noopener">GitHub</a>.</p>
+
+    <h2>Why it exists</h2>
+    <p>ChatTorrent is an experiment that explores the question: Can large AI models be run by ordinary people, on consumer hardware, freely and privately?</p>
+    <p>In a world where AI is dominated by large, private, data centers - or really expensive GPUs - ChatTorrent aims to bring control back and make private AI more affordable.</p>
+
+    <ul>
+      <li><strong>A more democratic AI.</strong> No company gatekeeps AI deciding who can use what and how. The model runs by the people using it, the code is open source, and anybody can host their own private instance.</li>
+      <li><strong>A more accessible AI.</strong> It's free. There is no account or subscription, and works in any browser. A school, library, friend group or community can pool a few graphics cards together and run their own models.</li>
+      <li><strong>Your own everyday hardware, put to use.</strong> It takes advantage of all the GPUs that ordinary people (predominantly gamers) already own. It puts those computers to work rather than relying on more data centers.</li>
+      <li><strong>Your own data.</strong> No accounts and no companies collecting your data so they can sell you more things. In a private mesh, only those you trust could see anything you send - you may prompt in peace.</li>
+    </ul>
+
+    <h2>What to expect</h2>
+    <ul>
+      <li><strong>It's slower</strong> than commercial chatbots: a few words a second when the mesh is healthy, and it needs enough people contributing to run at all.</li>
+      <li><strong>It isn't private in the global mesh.</strong> Your messages are processed in strangers' browsers, so don't send anything sensitive. For more privacy, create a private mesh and share its link only with people you trust. The <a href="/privacy">privacy notice</a> explains exactly who sees what.</li>
+      <li><strong>It can be wrong.</strong> Like any AI, it makes mistakes. Check anything important.</li>
+    </ul>
+
+    <p>Yes, as you can probably tell, this project used a lot of help from LLMs. It allowed me to create it - and to be honest, even attempt it - way faster than I otherwise would have been able to. The idea, architecture & design choices were all mine, and AI focussed on implementation and domain specific knowledge.</p>
+    <p>Thanks for checking out my project :)</p>
+    <p><a href="/chat">Start chatting</a></p>
+  </main>
+  <footer class="ribbon">
+    <span>ChatTorrent</span>
+    <span>by lwn</span>
+    <a href="/about">about</a>
+    <a href="https://github.com/l-wn/ChatTorrent" target="_blank" rel="noopener">source</a>
+    <a href="/privacy">privacy</a>
+    <a href="/terms">terms</a>
+    <a href="/terms#conduct">code of conduct</a>
+  </footer>
+</body>
+</html>

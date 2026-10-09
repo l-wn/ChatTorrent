@@ -1,0 +1,42 @@
+# Development: the whole repo on http://localhost:8001, including
+# web/dev.html (kernel tests, oracle checks, benchmarks) and web/chat.html
+# (the whole model in one tab), with same-origin /weights/<dir> checkpoints.
+# Runs beside the production Caddy, with its own signaling server on :8081.
+#
+# If a tunnel maps a public hostname here, the dev site is reachable from
+# anywhere while this runs. A request not addressed to localhost needs the
+# deploy's basic-auth password (CHAT_PASS_HASH). Without that variable Caddy
+# does not start.
+#
+#   ./start.sh dev               # both, in the foreground; Ctrl-C stops them
+#   http://localhost:8001/web/peer.html?direct=1
+
+{
+	auto_https off
+	admin off
+}
+
+:8001 {
+	bind 127.0.0.1 [::1]
+	root * .
+
+	@remote not host localhost 127.0.0.1
+	basic_auth @remote {
+		chatbot {env.CHAT_PASS_HASH}
+	}
+
+	handle /ws {
+		reverse_proxy 127.0.0.1:{$SIGNAL_PORT:8081}
+	}
+
+	handle {
+		@weights path *.bin *.npy
+		header @weights Cache-Control "public, max-age=2592000, immutable"
+		@code path *.html *.js *.css *.json
+		header @code Cache-Control "no-cache"
+
+		file_server {
+			hide .*
+		}
+	}
+}

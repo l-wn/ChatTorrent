@@ -1,0 +1,577 @@
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel-2: #1e222b;
+  --line: #2a2f3a;
+  --text: #e6e8ee;
+  --muted: #8b93a7;
+  --accent: #6ea8fe;
+  --accent-dim: #2b4a7d;
+  --warn: #e0a458;
+  --err: #e0645c;
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+  display: flex;
+  flex-direction: column;
+}
+
+/* --- header --- */
+header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .5rem .75rem;
+  padding: .7rem 1rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  flex: none;
+}
+
+header h1 { font-size: 15px; font-weight: 600; margin: 0; }
+header .sub { color: var(--muted); font-size: 13px; }
+header .spacer, .stats .spacer { flex: 1; }
+
+/* The brand, and the checkpoint beside it. */
+header .brand { display: flex; align-items: center; gap: .5rem; color: var(--text); text-decoration: none; }
+header .brand img { display: block; }
+header .model {
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: .1rem .45rem;
+  white-space: nowrap;
+}
+
+.pill {
+  font-size: 12px;
+  padding: .15rem .55rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.pill.ok   { color: #8fd39a; border-color: #2f5137; }
+.pill.busy { color: var(--accent); border-color: var(--accent-dim); }
+.pill.err  { color: var(--err); border-color: #5a2f2c; }
+/* This tab is in a private mesh. Styled to stand out from the global one. */
+.pill.private { color: #1a1206; background: var(--warn); border-color: var(--warn); font-weight: 600; }
+
+/* --- the block map ---
+   One cell per position of the model, coloured by how many ready peers hold
+   it. Cells flex to fit any number of positions. */
+#mapstrip {
+  flex: none;
+  padding: .45rem 1rem .4rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.map {
+  display: flex;
+  gap: 2px;
+  align-items: stretch;
+  height: 12px;
+}
+.map .cell {
+  flex: 1 1 0;
+  min-width: 3px;
+  border-radius: 2px;
+  background: var(--panel-2);
+  border: 1px solid transparent;
+  transition: background .25s, border-color .25s;
+}
+/* The two ends (the embedding and the head) have a fixed width and rounder corners. */
+.map .cell.end { flex: 0 0 14px; border-radius: 4px; }
+
+/* never held by anyone: drawn faintly, so the strip shows the model's full size */
+.map .cell[data-state="empty"]   { background: var(--panel-2); border-color: var(--line); }
+/* claimed by a peer that is still downloading it */
+.map .cell[data-state="loading"] {
+  background: repeating-linear-gradient(135deg,
+    var(--panel-2) 0 3px, var(--accent-dim) 3px 6px);
+}
+/* one holder: the model runs, and breaks if that tab closes */
+.map .cell[data-state="thin"]    { background: var(--warn); }
+/* two or more: survives a departure */
+.map .cell[data-state="deep"]    { background: #8fd39a; }
+/* held before, and now held by nobody */
+.map .cell[data-state="lost"]    { background: var(--panel-2); border-color: var(--err); }
+
+/* this tab's own holding: an outline, visible over any of the states above */
+.map .cell.mine { outline: 1px solid var(--text); outline-offset: 1px; }
+
+/* Plays the first time a position is held by any peer. peer.js adds the class
+   once per position per tab. */
+.map .cell.lit { animation: light 900ms ease-out; }
+@keyframes light {
+  0%   { transform: scaleY(2.2); filter: brightness(2.4); }
+  100% { transform: scaleY(1);   filter: brightness(1); }
+}
+
+button, a.button {
+  font: inherit;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: .45rem .9rem;
+  cursor: pointer;
+}
+button:hover:not(:disabled), a.button:hover { border-color: #3b4252; background: #232833; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+a.button { text-decoration: none; }
+a.button[hidden] { display: none; }
+button.primary { background: var(--accent-dim); border-color: #3a63a6; }
+button.primary:hover:not(:disabled) { background: #33578f; }
+
+/* --- transcript --- */
+#transcript {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.25rem 1rem 2rem;
+}
+
+.inner { max-width: 46rem; margin: 0 auto; display: flex; flex-direction: column; gap: 1rem; }
+
+.msg { display: flex; flex-direction: column; gap: .3rem; }
+.msg .who {
+  font-size: 11px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.msg .body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: .65rem .85rem;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+}
+.msg.user .body { background: var(--panel-2); }
+.msg.model .body { border-color: #26303f; }
+.msg.note .body {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+.msg.note.err .body { color: var(--err); }
+.msg.note .who { display: none; }
+.msg .meta { font-size: 11px; color: var(--muted); }
+.msg details.prof { font-size: 11px; color: var(--muted); }
+.msg details.prof summary { cursor: pointer; }
+.msg details.prof pre { margin: .3rem 0; overflow-x: auto; white-space: pre; font-size: 11px; }
+
+/* Blinking caret while tokens are still arriving. */
+.streaming .body::after {
+  content: "▍";
+  color: var(--accent);
+  animation: blink 1s steps(2, start) infinite;
+}
+@keyframes blink { to { visibility: hidden; } }
+
+/* --- boot / loading --- */
+#boot { max-width: 46rem; margin: 0 auto; color: var(--muted); font-size: 14px; }
+#boot .bar {
+  height: 6px;
+  background: var(--panel-2);
+  border-radius: 999px;
+  overflow: hidden;
+  margin: .6rem 0 .35rem;
+}
+#boot .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .15s; }
+
+/* --- composer --- */
+footer {
+  flex: none;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+  padding: .75rem 1rem 1rem;
+}
+.composer { max-width: 46rem; margin: 0 auto; display: flex; flex-direction: column; gap: .6rem; }
+.row { display: flex; gap: .5rem; align-items: flex-end; }
+
+textarea {
+  flex: 1;
+  resize: none;
+  font: inherit;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: .6rem .75rem;
+  min-height: 2.6rem;
+  max-height: 12rem;
+}
+textarea:focus { outline: none; border-color: var(--accent-dim); }
+textarea:disabled { opacity: .5; }
+
+.settings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .35rem 1rem;
+  align-items: center;
+  font-size: 12px;
+  color: var(--muted);
+}
+.settings label { display: flex; align-items: center; gap: .35rem; }
+.settings label[hidden] { display: none; }
+.settings input[type=number], .settings input[type=text], .settings select {
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: .2rem .35rem;
+}
+.settings input[type=number] { width: 4.2rem; }
+.settings input[type=text] { width: 6rem; }
+.settings .grow { flex: 1; }
+.hint { font-size: 12px; color: var(--muted); }
+a { color: var(--accent); }
+
+/* The model's <think> block, collapsed above its answer. */
+.msg .think {
+  margin: 0 0 8px;
+  border-left: 2px solid var(--line, #3a3a3a);
+  padding-left: 10px;
+  font-size: 0.9em;
+  opacity: 0.75;
+}
+.msg .think > summary { cursor: pointer; user-select: none; opacity: 0.8; }
+.msg .think > div { white-space: pre-wrap; margin-top: 6px; }
+
+/* --- stats, under the map ---
+   The .pill elements peer.js updates, shown as one line of plain text. Their
+   ok/busy/err colours are kept. */
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .15rem .5rem;
+  margin-top: .35rem;
+  font-size: 12px;
+  color: var(--muted);
+}
+.stats .pill { border: 0; padding: 0; border-radius: 0; font-size: 12px; }
+.stats .pill + .pill::before { content: "·"; color: #4a5162; margin-right: .5rem; }
+
+/* --- icon buttons, and the settings gear --- */
+button.icon {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: .4rem;
+  line-height: 1;
+}
+/* A setting differs from its default. */
+#settingsBtn.changed::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+/* --- the settings drawer --- */
+.scrim {
+  position: fixed;
+  inset: 0;
+  background: rgba(5, 6, 9, .55);
+  z-index: 10;
+  animation: fade .18s ease-out;
+}
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(22rem, 100vw);
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+  box-shadow: -12px 0 32px rgba(0, 0, 0, .35);
+  z-index: 11;
+  animation: slidein .2s ease-out;
+}
+.drawer[hidden], .scrim[hidden] { display: none; }
+@keyframes slidein { from { transform: translateX(100%); } }
+@keyframes fade { from { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .drawer, .scrim { animation: none; } }
+
+.drawer-head, .drawer-foot {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: .7rem 1rem;
+  border-bottom: 1px solid var(--line);
+}
+.drawer-foot { border-bottom: 0; border-top: 1px solid var(--line); }
+.drawer-head h2 { font-size: 15px; font-weight: 600; margin: 0; }
+.drawer-head .icon { font-size: 20px; width: 2rem; height: 2rem; padding: 0; }
+.drawer-body { flex: 1; overflow-y: auto; padding: .25rem 1rem 1rem; }
+.drawer section { padding: .5rem 0; }
+.drawer section + section { border-top: 1px solid var(--line); }
+.drawer h3 {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: .6rem 0 .3rem;
+}
+.field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: .45rem 0;
+}
+.field .name { display: block; font-size: 14px; }
+.field .desc { display: block; font-size: 12px; color: var(--muted); line-height: 1.35; }
+.field input, .field select {
+  flex: none;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: .3rem .45rem;
+}
+.field > span { flex: 1; min-width: 0; }
+.field input { width: 5rem; }
+.field select { width: 9.5rem; }
+.field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
+
+/* --- the chat list: a left drawer, or a sidebar that stays open --- */
+:root { --side: 17rem; }
+.drawer.left {
+  left: 0;
+  right: auto;
+  border-left: 0;
+  border-right: 1px solid var(--line);
+  box-shadow: 12px 0 32px rgba(0, 0, 0, .35);
+  animation-name: slidein-left;
+}
+@keyframes slidein-left { from { transform: translateX(-100%); } }
+/* Docked: laid out as part of the page, not over it (peer.js's layoutChats()). */
+.drawer.left.docked { width: var(--side); box-shadow: none; animation: none; z-index: 5; }
+body.chats-docked { padding-left: var(--side); }
+
+.newchat { width: 100%; margin: .6rem 0 .2rem; text-align: left; }
+.chats-note { font-size: 12px; color: var(--muted); line-height: 1.4; margin: .6rem 0; }
+.chats-note[hidden] { display: none; }
+#chatList .group + .group { margin-top: .4rem; }
+.chat-item {
+  display: flex;
+  align-items: center;
+  gap: .15rem;
+  border-radius: 7px;
+}
+.chat-item:hover, .chat-item.current { background: var(--panel-2); }
+.chat-item.current { box-shadow: inset 2px 0 0 var(--accent); }
+.chat-item .open {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: none;
+  border: 0;
+  padding: .4rem .5rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-item .open:hover:not(:disabled) { background: none; }
+.chat-item .open.foreign { color: var(--muted); font-style: italic; }
+.chat-item button.icon {
+  background: none;
+  border: 0;
+  color: var(--muted);
+  padding: .3rem;
+  opacity: 0;
+}
+.chat-item:hover button.icon, .chat-item.current button.icon,
+.chat-item button.icon:focus-visible { opacity: 1; }
+.chat-item button.icon:hover:not(:disabled) { color: var(--text); background: none; }
+.chat-item input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: .3rem .45rem;
+}
+#chats .drawer-foot { justify-content: flex-start; }
+#chats .drawer-foot button { font-size: 12px; padding: .3rem .6rem; }
+
+/* --- credit ribbon --- */
+.ribbon {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: .1rem .6rem;
+  padding: .3rem 1rem;
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--bg);
+  border-top: 1px solid var(--line);
+}
+/* inline-block, so a link's underline and colour do not extend to the dot. */
+.ribbon > * + *::before { content: "·"; display: inline-block; margin-right: .6rem; color: #4a5162; }
+
+/* --- narrow screens --- */
+@media (max-width: 640px) {
+  header { padding: .55rem .75rem; gap: .4rem .5rem; }
+  header button, header a.button { font-size: 13px; padding: .35rem .6rem; }
+  #mapstrip { padding: .4rem .75rem; }
+  footer { padding: .6rem .75rem .75rem; }
+  .settings .hint { display: none; }
+  .drawer { width: 100vw; border-left: 0; }
+  .drawer.left { border-right: 0; }
+  .chat-item button.icon { opacity: 1; }
+}
+
+.ribbon > *::before { display: inline-block; }
+
+/* --- the welcome popup (peer.html's <dialog id="welcome">) --- */
+/* One scrolling column: intro, warnings, the agreement, the GPU question. Uses
+   larger type than the rest of the app. */
+#welcome {
+  width: min(38rem, calc(100vw - 2rem));
+  max-height: calc(100vh - 2rem);
+  padding: 0;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, .45);
+  font-size: 16px;
+  line-height: 1.6;
+}
+#welcome[open] { display: flex; flex-direction: column; animation: fade .18s ease-out; }
+#welcome::backdrop { background: rgba(5, 6, 9, .65); }
+@media (prefers-reduced-motion: reduce) { #welcome[open] { animation: none; } }
+.welcome-scroll { overflow-y: auto; padding: 1.5rem 1.75rem 1.75rem; }
+#welcome h2 { font-size: 22px; font-weight: 650; margin: 0 0 .75rem; outline: none; }
+#welcome p { margin: 0 0 .75rem; }
+#welcome a { color: var(--accent); }
+#welcome h3 { font-size: 16px; font-weight: 650; margin: 0 0 .75rem; }
+
+/* The warnings: a red-edged box. */
+.welcome-warn {
+  margin: 1.25rem 0 0;
+  padding: 1rem 1.1rem;
+  border: 1px solid rgba(224, 100, 92, .4);
+  border-left: 4px solid var(--err);
+  border-radius: 8px;
+  background: rgba(224, 100, 92, .08);
+}
+#welcome .welcome-warn h3 {
+  font-size: 13px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--err);
+  margin-bottom: .6rem;
+}
+.welcome-warn ul { margin: 0; padding-left: 1.2rem; }
+.welcome-warn li + li { margin-top: .75rem; }
+.welcome-warn strong { display: block; }
+
+/* Page 2: the agreement and the GPU question, each under its own heading. */
+.welcome-scroll[hidden] { display: none; }
+.welcome-step + .welcome-step { margin-top: 1.5rem; padding-top: 1.5rem; border-top: 1px solid var(--line); }
+#welcome h3[tabindex] { outline: none; }
+
+/* The pager: a small ‹ 1/2 › centred under the page. */
+.welcome-pager {
+  flex: none;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: .25rem;
+  padding: .4rem 0 .6rem;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+#welcome .welcome-pager button {
+  width: 1.6rem;
+  height: 1.6rem;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+}
+#welcome .welcome-pager button:hover:not(:disabled) { color: var(--text); background: none; }
+#welcome .welcome-pager button:disabled { opacity: .3; cursor: default; }
+
+/* The agreement boxes: one per line, the box beside its first line of text. */
+.welcome-agree { display: flex; flex-direction: column; gap: .75rem; }
+.welcome-agree label { display: flex; align-items: flex-start; gap: .75rem; cursor: pointer; }
+.welcome-agree input {
+  flex: none;
+  width: 1.15rem;
+  height: 1.15rem;
+  margin: .2rem 0 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* The GPU answers: side by side, stacking on a narrow screen. */
+.welcome-choices { display: flex; flex-wrap: wrap; gap: .75rem; margin-top: 1rem; }
+.welcome-choices > * { flex: 1 1 14rem; }
+.welcome-choices button { font-size: 16px; padding: .7rem 1rem; }
+.welcome-yes { display: flex; }
+.welcome-yes button { flex: 1; white-space: nowrap; border-radius: 7px 0 0 7px; }
+.welcome-yes select {
+  flex: none;
+  font: inherit;
+  font-size: 15px;
+  color: var(--text);
+  background: var(--accent-dim);
+  border: 1px solid #3a63a6;
+  border-left-color: rgba(0, 0, 0, .35);
+  border-radius: 0 7px 7px 0;
+  padding: 0 .6rem;
+}
+.welcome-yes select:focus { outline: none; border-color: var(--accent); }
+
+@media (max-width: 640px) {
+  .welcome-scroll { padding: 1.25rem 1.1rem 1.4rem; }
+  #welcome h2 { font-size: 20px; }
+}
+
+/* --- the AI notice above the prompt input: muted, always visible --- */
+.ai-notice {
+  margin: 0;
+  font-size: 12px;
+  text-align: center;
+  color: var(--muted);
+}

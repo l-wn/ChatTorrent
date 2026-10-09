@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>history.js on IndexedDB</title>
+  <style>body { font: 14px/1.5 monospace; background: #0f1115; color: #e6e8ee; padding: 1rem; }
+         .fail { color: #e0645c; }</style>
+</head>
+<body>
+<!-- Tests web/history.js on a real IndexedDB, which Node does not have.
+     tools/history.test.mjs tests the same store on memoryBackend(). This page
+     runs its scoping, round-trip and cross-tab checks on idbBackend(), in a
+     temporary database. `window.historyResult` is { pass, fail } when done. -->
+<pre id="out"></pre>
+<script type="module">
+import { openHistory, idbBackend, newRecord } from '../history.js';
+
+const out = document.getElementById('out');
+let pass = 0, fail = 0;
+const ok = (name, cond, detail = '') => {
+    if (cond) pass++; else fail++;
+    const line = `${cond ? '  ok  ' : '  FAIL'}  ${name} ${cond ? '' : detail}`;
+    out.insertAdjacentHTML('beforeend', `<div class="${cond ? '' : 'fail'}"></div>`);
+    out.lastChild.textContent = line;
+    console.log(line);
+};
+
+const NAME = `chattorrent-test-${crypto.randomUUID()}`;
+const PRIV = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+const chat = (mesh, text, ids = [1, 2, 3]) => ({
+    ...newRecord({ mesh, model: 'm', weights: 'w' }),
+    messages: [{ role: 'user', text, reasoning: null, meta: '', opts: {} }],
+    ids: Uint32Array.from(ids),
+});
+
+try {
+    const chA = new BroadcastChannel(NAME), chB = new BroadcastChannel(NAME);
+    const g = openHistory({ mesh: 'global', backend: idbBackend(NAME), channel: chA });
+    const p = openHistory({ mesh: PRIV, backend: idbBackend(NAME), channel: chB });
+    const heard = [];
+    const other = openHistory({ mesh: 'global', backend: idbBackend(NAME), channel: chB });
+    other.onChange((m) => heard.push(m.op));
+
+    const g1 = await g.save(chat('global', 'one', [151644, 4294967295]));
+    await g.save(chat('global', 'two'));
+    const p1 = await p.save(chat(PRIV, 'secret'));
+
+    ok('the global list never shows a private chat',
+        JSON.stringify((await g.list()).map((r) => r.title).sort()) === '["one","two"]');
+    ok('another mesh\'s chat cannot be read by id', (await g.get(p1.id)) === null);
+    ok('nor deleted', (await p.remove(g1.id)) === false && (await g.get(g1.id)) !== null);
+    ok('saving into another mesh is refused', await g.save(chat(PRIV, 'x')).then(() => false, () => true));
+    ok('counts of the other meshes', (await p.countElsewhere()) === 2 && (await g.countElsewhere()) === 1);
+
+    const back = await g.get(g1.id);
+    ok('ids come back as a Uint32Array, intact',
+        back.ids instanceof Uint32Array && back.ids[0] === 151644 && back.ids[1] === 4294967295);
+
+    await new Promise((r) => setTimeout(r, 50));      // BroadcastChannel is async
+    ok('another tab in the mesh heard the two saves', JSON.stringify(heard) === '["put","put"]',
+        JSON.stringify(heard));
+
+    ok('forgetting a mesh forgets only it', (await p.forgetAll()) === 1 && (await g.list()).length === 2);
+
+    const persisted = await navigator.storage?.persist?.().catch(() => 'threw');
+    ok('persist() answers without breaking anything', persisted !== 'threw', String(persisted));
+} catch (err) {
+    ok('the run finished', false, err?.stack ?? String(err));
+} finally {
+    indexedDB.deleteDatabase(NAME);
+}
+
+console.log(`${pass} passed, ${fail} failed`);
+window.historyResult = { pass, fail };
+</script>
+</body>
+</html>

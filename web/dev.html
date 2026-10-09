@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>ChatTorrent dev checks</title>
+  <!-- An empty data: icon, so a load does not log a 404 for /favicon.ico. -->
+  <link rel="icon" href="data:," />
+  <style>
+    body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem; max-width: 60rem; }
+    #log { background: #111; color: #ddd; padding: 1rem; border-radius: 6px;
+           font: 12px/1.45 ui-monospace, Consolas, monospace;
+           white-space: pre-wrap; max-height: 75vh; overflow: auto; }
+    .err { color: #c00; }
+  </style>
+</head>
+<body>
+  <h1>ChatTorrent dev checks</h1>
+  <p>
+    Kernel tests → tokenizer → weight load → oracle verification →
+    generation. The same output goes to the browser console (F12).
+  </p>
+
+  <pre id="log">booting…
+</pre>
+
+  <script type="module">
+    import { start } from "./dev/main.js";
+
+    if (!navigator.gpu) {
+      document.getElementById("log").textContent =
+        "WebGPU is not available in this browser.";
+    } else {
+      start().catch((err) => {
+        console.error(err);
+        document.body.insertAdjacentHTML(
+          "beforeend",
+          `<pre class='err'>${err.stack || err}</pre>`
+        );
+      });
+    }
+  </script>
+</body>
+</html>

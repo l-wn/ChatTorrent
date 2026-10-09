@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ChatTorrent: mesh harness peer</title>
+<!--
+  One tab of tools/mesh.gpu.test.mjs: a peer with no interface, driven over the
+  DevTools protocol.
+
+  peer.html puts an Engine behind a chat window. This page puts the same Engine
+  behind an API, so a test can run several peers at once, prompt from several
+  of them concurrently, and read back what each one did.
+-->
+<style>
+    body { font: 13px/1.5 ui-monospace, monospace; margin: 0; padding: 1rem;
+           background: #111; color: #ddd; }
+    pre { white-space: pre-wrap; margin: 0; }
+    .err { color: #f88; }
+</style>
+</head>
+<body>
+<pre id="log">booting…</pre>
+<script type="module">
+// The global is set here, not in the module: tools/parse.test.mjs imports
+// web/dev/harness.js under Node, so the module must not use `window` at import
+// time.
+import { boot, api } from './harness.js';
+window.harness = api;
+boot();
+</script>
+</body>
+</html>

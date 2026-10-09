@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- A private mesh's invite is in the URL fragment, which browsers never
+       send. This also keeps the page's address out of every request it makes. -->
+  <meta name="referrer" content="no-referrer" />
+  <title>ChatTorrent</title>
+  <meta name="description" content="A large language model run by its users: each browser tab holds part of the model on its own GPU, and the tabs pass each token between them over WebRTC." />
+  <meta name="theme-color" content="#0f1115" />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="ChatTorrent" />
+  <meta property="og:title" content="ChatTorrent" />
+  <meta property="og:description" content="A large language model run by its users, split across their browsers' GPUs." />
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="manifest" href="/site.webmanifest" />
+  <link rel="stylesheet" href="./app.css" />
+  <script type="module" src="./peer-start.js"></script>
+</head>
+<body>
+  <header>
+    <button id="chatsBtn" class="icon" aria-label="Chats" title="Chats" aria-expanded="false" aria-controls="chats">
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+        <path d="M4 6h16M4 12h16M4 18h16"/>
+      </svg>
+    </button>
+    <a class="brand" href="/" title="ChatTorrent">
+      <img src="/favicon.svg" alt="" width="22" height="22" />
+      <h1 id="title">ChatTorrent</h1>
+    </a>
+    <!-- The checkpoint the mesh runs, filled in once the manifest is read. -->
+    <span class="model" id="model" hidden></span>
+    <span class="spacer"></span>
+    <span class="pill" id="status">booting…</span>
+    <span class="pill err" id="authfail" hidden title="Offers to link with this tab that were not sealed with this mesh's invite. They were refused; nothing was sent to them. A steady count means someone without the invite is trying to connect."></span>
+    <!-- The mesh this tab is in, always shown: the global one, or a private
+         one with the tag its members can compare. -->
+    <span class="pill" id="mesh">global mesh</span>
+    <button id="newmesh" title="Start a private mesh and move this tab into it. Only people you send its invite link to can join, and only they will run your chats.">Create private mesh</button>
+    <button id="invite" hidden title="Copy this mesh's invite link. Anyone with it can join this mesh and run its chats. Send it only to people you trust.">Copy invite link</button>
+    <a id="leave" class="button" hidden title="Leave this private mesh and join the global one">Leave</a>
+    <button id="settingsBtn" class="icon" aria-label="Settings" title="Settings" aria-expanded="false" aria-controls="settings">
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"/>
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+      </svg>
+    </button>
+  </header>
+
+  <!-- The block map: one cell per position (the embedding, every block, the
+       head), lit when a ready peer holds it. Below it, live numbers for the
+       mesh and for this tab. -->
+  <div id="mapstrip">
+    <div id="map" class="map" title="the model, one cell per position: the embedding, each block, the head"></div>
+    <div class="stats">
+      <span id="role" title="this tab: its peer id, and which part of the model it holds">joining…</span>
+      <span class="spacer"></span>
+      <span class="pill" id="peers" title="tabs in this mesh">0 peers</span>
+      <span class="pill" id="covered" title="positions of the model at least one ready peer holds. A position is one unit of work: the embedding, each block, the head">— held</span>
+      <span class="pill" id="depth" title="redundancy: the fewest peers holding any one position. 0 = positions nobody holds, 1 = running but one departure from dead, 2 = survives any single peer leaving">r 0</span>
+      <span class="pill" id="vram" title="this tab's own VRAM: the weights it has uploaded, its KV pool and session state, and its scratch buffers">— GiB</span>
+      <span class="pill" id="ctx" title="tokens in this chat, of the most the model's context holds">context —</span>
+      <span class="pill" id="ran" title="tokens this tab has run for the mesh, across every session routed through it">ran 0 tok</span>
+      <span class="pill" id="speed" title="the last reply's generation speed">—</span>
+    </div>
+  </div>
+
+  <div id="transcript">
+    <div class="inner" id="messages">
+      <div id="boot">
+        <div id="bootwhat">joining the mesh…</div>
+        <div class="bar"><div id="bootbar"></div></div>
+        <div id="bootnote"></div>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    <div class="composer">
+      <!-- Always shown above the input: the EU AI Act (Article 50) requires a
+           chatbot to say it is one. The wording can change; it must stay
+           visible. -->
+      <p class="ai-notice" role="note">You are talking to an AI. Its replies can be wrong. Check anything important.</p>
+      <div class="row">
+        <textarea id="input" rows="1" placeholder="Waiting for the mesh…" disabled></textarea>
+        <button id="send" class="primary" disabled>Send</button>
+        <button id="stop" hidden>Stop</button>
+      </div>
+      <div class="settings">
+        <label id="thinkingLabel" title="Qwen's reasoning mode - off answers faster with no &lt;think&gt; text" hidden>
+          <input type="checkbox" id="thinking" autocomplete="off"> thinking
+        </label>
+        <label title="Stop this tab's background growth once its own VRAM use would exceed this. Blank = no limit: it keeps growing until the GPU is full or this tab holds the whole model.">VRAM limit <input id="vramlimit" type="text" placeholder="e.g. 4gb" autocomplete="off"></label>
+        <span class="grow"></span>
+        <span class="hint">Enter sends · Shift+Enter newline</span>
+      </div>
+    </div>
+  </footer>
+
+  <!-- The credit ribbon. Every site/ page has a copy at the bottom; keep them
+       in sync. -->
+  <div class="ribbon">
+    <span>ChatTorrent</span>
+    <span>by lwn</span>
+    <a href="/about" target="_blank" rel="noopener">about</a>
+    <a href="https://github.com/l-wn/ChatTorrent" target="_blank" rel="noopener">source</a>
+    <a href="/privacy" target="_blank" rel="noopener">privacy</a>
+    <a href="/terms" target="_blank" rel="noopener">terms</a>
+    <a href="/terms#conduct" target="_blank" rel="noopener">code of conduct</a>
+  </div>
+
+  <!-- This mesh's saved chats. A drawer on a narrow screen, and from 1100px
+       wide a sidebar that stays open (peer.js's layoutChats()). Only this
+       mesh's chats are listed. A private mesh shows a count of the others,
+       not their titles. -->
+  <aside id="chats" class="drawer left" role="dialog" aria-modal="true" aria-labelledby="chatsTitle" hidden>
+    <div class="drawer-head">
+      <h2 id="chatsTitle">Chats · <span id="chatsMesh">global mesh</span></h2>
+      <button id="chatsClose" class="icon" aria-label="Close chats" title="Close">&times;</button>
+    </div>
+
+    <div class="drawer-body">
+      <button id="chatsNew" class="newchat">+ New chat</button>
+      <p id="chatsElsewhere" class="chats-note" hidden></p>
+      <div id="chatList"></div>
+      <p id="chatsEmpty" class="chats-note">No saved chats in this mesh yet. A chat is saved in this browser once you send its first message.</p>
+    </div>
+
+    <div class="drawer-foot">
+      <button id="chatsForget" title="Delete every chat saved for this mesh in this browser">Forget this mesh's chats</button>
+    </div>
+  </aside>
+
+  <!-- Generation settings, opened by the gear button. Each field's HTML value
+       is its default: "Reset" and the gear's changed-dot read defaultValue /
+       defaultSelected. -->
+  <div id="scrim" class="scrim" hidden></div>
+  <aside id="settings" class="drawer" role="dialog" aria-modal="true" aria-labelledby="settingsTitle" hidden>
+    <div class="drawer-head">
+      <h2 id="settingsTitle">Settings</h2>
+      <button id="settingsClose" class="icon" aria-label="Close settings" title="Close">&times;</button>
+    </div>
+
+    <div class="drawer-body">
+      <section>
+        <h3>Sampling</h3>
+        <label class="field">
+          <span><span class="name">Temperature</span><span class="desc">0 = greedy argmax</span></span>
+          <input id="temp" type="number" min="0" max="2" step="0.05" value="0.7" autocomplete="off">
+        </label>
+        <label class="field">
+          <span><span class="name">Top-k</span><span class="desc">Sample from the k likeliest tokens. 0 = off</span></span>
+          <input id="topk" type="number" min="0" max="200" step="1" value="40" autocomplete="off">
+        </label>
+        <label class="field" title="Multiplicative, and does not count how often a token repeated. Frequency and presence below do.">
+          <span><span class="name">Repetition</span><span class="desc">1.0 = off</span></span>
+          <input id="rep" type="number" min="1" max="2" step="0.05" value="1" autocomplete="off">
+        </label>
+        <label class="field">
+          <span><span class="name">Frequency penalty</span><span class="desc">Per repeat of a token already seen. 0 = off</span></span>
+          <input id="freq" type="number" min="0" max="2" step="0.05" value="0.2" autocomplete="off">
+        </label>
+        <label class="field">
+          <span><span class="name">Presence penalty</span><span class="desc">Once for any token already seen. 0 = off</span></span>
+          <input id="pres" type="number" min="0" max="2" step="0.05" value="0.1" autocomplete="off">
+        </label>
+        <label class="field" title="Forbids any token that would repeat an n-gram this chat already contains. This is what stops a repeating loop. 6 rarely triggers on natural prose.">
+          <span><span class="name">No-repeat n-gram</span><span class="desc">Forbid repeating an n-gram. 0 = off</span></span>
+          <input id="ngram" type="number" min="0" max="12" step="1" value="6" autocomplete="off">
+        </label>
+        <label class="field">
+          <span><span class="name">Max tokens</span><span class="desc">0 = until the reply ends or the context is full</span></span>
+          <input id="maxtok" type="number" min="0" max="8192" step="16" value="0" autocomplete="off">
+        </label>
+      </section>
+
+      <section>
+        <h3>Prompt</h3>
+        <label class="field">
+          <span><span class="name">Mode</span><span class="desc">How the prompt is fed to the model</span></span>
+          <select id="mode" autocomplete="off">
+            <option value="chat" selected>chat</option>
+            <option value="raw">raw completion</option>
+          </select>
+        </label>
+      </section>
+
+      <section>
+        <h3>Diagnostics</h3>
+        <label class="field" title="Closed loop: the peer at the end of the model feeds each token straight back in, so your distance from the mesh no longer costs a round trip per token. Stop may let a token or two already on their way arrive. Round trip: every token comes back to this tab first, as it used to.">
+          <span><span class="name">Decoding</span><span class="desc">Where each next token is sent from</span></span>
+          <select id="loop" autocomplete="off">
+            <option value="closed" selected>closed loop</option>
+            <option value="roundtrip">round trip</option>
+          </select>
+        </label>
+        <label class="field" title="pass = one GPU timestamp pair per hop; kernel = one per dispatch, which slows the token down but shows which kernels the time is in.">
+          <span><span class="name">Profile</span><span class="desc">Time each token on every peer it crosses; shown under the reply</span></span>
+          <select id="prof" autocomplete="off">
+            <option value="0" selected>phases only</option>
+            <option value="1">+ GPU per hop</option>
+            <option value="2">+ GPU per kernel (slow)</option>
+          </select>
+        </label>
+      </section>
+    </div>
+
+    <div class="drawer-foot">
+      <button id="settingsReset">Reset to defaults</button>
+    </div>
+  </aside>
+
+  <!-- The welcome popup, shown on every visit (welcome.js). Its text is edited
+       here: .drawer-body holds free-form HTML (paragraphs, <h3> section
+       titles, lists, links). -->
+  <dialog id="welcome" aria-labelledby="welcomeTitle">
+    <!-- Two pages, one shown at a time (welcome.js): what ChatTorrent is and
+         its warnings, then the agreement and the GPU question. The pager at
+         the bottom moves between them. -->
+    <div class="welcome-scroll" id="welcomePage1">
+      <h2 id="welcomeTitle" tabindex="-1" autofocus>Welcome to ChatTorrent</h2>
+
+      <!-- What the site is: one idea per paragraph. -->
+      <p>ChatTorrent is a chatbot using an AI model distributed across all its users, running entirely on browsers. <a href="/about" target="_blank" rel="noopener">How it works</a></p>
+
+      <!-- The warnings: each <li> is a bold title (<strong>) and its explanation. -->
+      <section class="welcome-warn" aria-labelledby="welcomeWarnTitle">
+        <h3 id="welcomeWarnTitle">Warning</h3>
+        <ul>
+          <li>
+            <strong>Everyone can see and store your messages.</strong>
+            Do not send sensitive information into an untrusted mesh. You can create your own mesh with friends you trust.
+          </li>
+          <li>
+            <strong>Your GPU is being used.</strong>
+            If you opt to contribute some of your GPU to the mesh, other people's requests will be served through you.
+          </li>
+        </ul>
+      </section>
+    </div>
+
+    <div class="welcome-scroll" id="welcomePage2" hidden>
+      <!-- The agreement: both boxes must be ticked before either answer button
+           below works (welcome.js), and the popup cannot be closed any other
+           way. The links open in a new tab, so the popup stays open. -->
+      <section class="welcome-step" aria-labelledby="welcomeAgreeTitle">
+        <h3 id="welcomeAgreeTitle" tabindex="-1">Before you continue</h3>
+        <div class="welcome-agree">
+          <label><input type="checkbox" id="agreeAge" autocomplete="off"> <span>I am 18 or over and agree to follow the <a href="/terms#conduct" target="_blank" rel="noopener">code of conduct</a></span></label>
+          <label><input type="checkbox" id="agreeTerms" autocomplete="off"> <span>I agree to the <a href="/terms" target="_blank" rel="noopener">terms of service</a> and have read the <a href="/privacy" target="_blank" rel="noopener">privacy policy</a></span></label>
+        </div>
+      </section>
+
+      <!-- The GPU question. The GPU is not used until one of these two buttons
+           is pressed. The amounts are <option>s and can be added or removed. A
+           value is anything the VRAM limit field accepts ("512mb", "4gb"),
+           and "" means no limit. -->
+      <section class="welcome-step" aria-labelledby="welcomeGpuTitle">
+        <h3 id="welcomeGpuTitle">Contribute your GPU?</h3>
+        <p>You will download part of the model which will help run other peoples chats on your GPU. You will be able to prompt either way.</p>
+        <div class="welcome-choices">
+          <button id="welcomeNo" autocomplete="off" disabled>Just chat</button>
+          <div class="welcome-yes">
+            <button id="welcomeYes" class="primary" autocomplete="off" disabled>Contribute</button>
+            <select id="welcomeAmount" aria-label="How much GPU memory to contribute" autocomplete="off">
+              <option value="2gb">2 GB</option>
+              <option value="4gb" selected>4 GB</option>
+              <option value="8gb">8 GB</option>
+              <option value="16gb">16 GB</option>
+              <option value="24gb">24 GB</option>
+              <option value="32gb">32 GB</option>
+              <option value="">no limit</option>
+            </select>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- The pager, the same on both pages: ‹ 1/2 ›. An arrow that cannot be
+         used is disabled, not hidden, so the layout does not change. -->
+    <nav class="welcome-pager" aria-label="Pages">
+      <button id="welcomeBack" aria-label="Previous page">&lsaquo;</button>
+      <span id="welcomePageNo" aria-live="polite">1/2</span>
+      <button id="welcomeNext" aria-label="Next page">&rsaquo;</button>
+    </nav>
+  </dialog>
+
+</body>
+</html>

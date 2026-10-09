@@ -1,0 +1,90 @@
+# Production: https://chattorrent.net, reached only through the Cloudflare
+# tunnel, which terminates TLS at the edge. Serves only dist/. `npm run build`
+# (tools/build-site.mjs) builds it from an allowlist, so the repo, its
+# dotfiles and the dev pages are not reachable. Local development uses
+# Caddyfile.dev.
+#
+# Environment (EnvironmentFile= in the chattorrent-caddy unit):
+#   CHAT_GATE        on | off   basic auth on everything but robots.txt, the icon
+#   CHAT_PASS_HASH              bcrypt hash for user `chatbot` (caddy hash-password)
+#   WEIGHTS_ORIGIN              where the weights are fetched from, for the CSP
+
+{
+	auto_https off
+	admin off
+}
+
+(security-headers) {
+	header {
+		-Server
+		Referrer-Policy no-referrer
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Cross-Origin-Opener-Policy same-origin
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()"
+		# Report-only until a full session shows no violations. Then rename it
+		# to Content-Security-Policy. connect-src 'self' covers the same-origin
+		# wss.
+		Content-Security-Policy-Report-Only "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' {$WEIGHTS_ORIGIN:https://weights.chattorrent.net}; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+	}
+}
+
+(gate-on) {
+	@gated not path /robots.txt /favicon.svg /site.webmanifest
+	basic_auth @gated {
+		chatbot {env.CHAT_PASS_HASH}
+	}
+}
+(gate-off) {
+}
+
+:8000 {
+	bind 127.0.0.1 [::1]
+	root * dist
+
+	import gate-{$CHAT_GATE:on}
+
+	import security-headers
+
+	# Until site/index.html exists, the home page is the chat.
+	@nohome {
+		path /
+		not file /index.html
+	}
+	redir @nohome /chat 302
+
+	# The test deploy's addresses, for old bookmarks and invites (the #mesh=
+	# fragment is kept across a redirect).
+	redir /web/peer.html /chat 301
+	redir /peer.html /chat 301
+	redir /chat.html /chat 301
+
+	handle /ws {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	handle {
+		# Clean URLs: /chat serves chat.html, and site/about.html is /about.
+		try_files {path} {path}.html
+
+		# Pages and modules change with every deploy, so they are revalidated
+		# on every load ("no-cache" still caches, and a repeat costs a 304).
+		# A new page is therefore never loaded with stale modules.
+		# /checkpoint.json, which names the checkpoint, is treated the same.
+		@code path *.html *.js *.css *.json *.webmanifest /chat /
+		header @code Cache-Control "no-cache"
+		@static path *.svg *.txt
+		header @static Cache-Control "public, max-age=86400"
+
+		file_server {
+			hide .*
+		}
+	}
+
+	handle_errors 404 {
+		import security-headers
+		rewrite * /404.html
+		header Cache-Control "no-store"
+		file_server
+	}
+}

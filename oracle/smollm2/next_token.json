@@ -1,0 +1,31 @@
+{
+  "next_id": 260,
+  "decoded": " the",
+  "top5": [
+    {
+      "id": 260,
+      "logit": 14.022820472717285,
+      "decoded": " the"
+    },
+    {
+      "id": 7042,
+      "logit": 12.997309684753418,
+      "decoded": " Paris"
+    },
+    {
+      "id": 3807,
+      "logit": 12.747228622436523,
+      "decoded": " located"
+    },
+    {
+      "id": 1217,
+      "logit": 12.236939430236816,
+      "decoded": " called"
+    },
+    {
+      "id": 253,
+      "logit": 12.124650001525879,
+      "decoded": " a"
+    }
+  ]
+}

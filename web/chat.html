@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ChatTorrent chat</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="./app.css" />
+</head>
+<body>
+  <header>
+    <h1 id="title">loading…</h1>
+    <span class="sub">WebGPU · single tab</span>
+    <span class="spacer"></span>
+    <span class="pill" id="ctx">context —</span>
+    <span class="pill" id="speed">—</span>
+    <span class="pill" id="status">booting…</span>
+    <button id="clear" disabled>New chat</button>
+  </header>
+
+  <div id="transcript">
+    <div class="inner" id="messages">
+      <div id="boot">
+        <div>starting WebGPU…</div>
+        <div class="bar"><div id="bootbar"></div></div>
+        <div id="bootnote"></div>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    <div class="composer">
+      <div class="row">
+        <textarea id="input" rows="1" placeholder="Loading the model…" disabled></textarea>
+        <button id="send" class="primary" disabled>Send</button>
+        <button id="stop" hidden>Stop</button>
+      </div>
+      <div class="settings">
+        <label title="How the prompt is fed to the model">
+          mode
+          <select id="mode" autocomplete="off">
+            <option value="chat">chat</option>
+            <option value="raw">raw completion</option>
+          </select>
+        </label>
+        <label id="thinkingLabel" title="Qwen's reasoning mode. Off answers faster, with no &lt;think&gt; text" hidden>
+          <input type="checkbox" id="thinking" autocomplete="off"> thinking
+        </label>
+        <label title="0 = greedy argmax">temp <input id="temp" type="number" min="0" max="2" step="0.05" value="0.7" autocomplete="off"></label>
+        <label title="0 = off">top-k <input id="topk" type="number" min="0" max="200" step="1" value="40" autocomplete="off"></label>
+        <label title="1.0 = off. Multiplicative, and does not count how often a token repeated. freq/pres below do.">rep <input id="rep" type="number" min="1" max="2" step="0.05" value="1" autocomplete="off"></label>
+        <label title="0 = off. Subtracted from a token's logit once per time it already appeared, so a token the model keeps reaching for gets steadily less attractive.">freq <input id="freq" type="number" min="0" max="2" step="0.05" value="0.2" autocomplete="off"></label>
+        <label title="0 = off. Subtracted once from any token already seen, however often.">pres <input id="pres" type="number" min="0" max="2" step="0.05" value="0.1" autocomplete="off"></label>
+        <label title="0 = off. Forbids any token that would repeat an n-gram this chat already contains. This is what stops a repeating loop. 6 rarely triggers on natural prose.">no-rep <input id="ngram" type="number" min="0" max="12" step="1" value="6" autocomplete="off"></label>
+        <label title="0 = no cap: keep going until the reply ends or the context is full.">max tok <input id="maxtok" type="number" min="0" max="8192" step="16" value="0" autocomplete="off"></label>
+        <span class="grow"></span>
+        <span class="hint">Enter sends · Shift+Enter newline</span>
+      </div>
+    </div>
+  </footer>
+
+  <script type="module">
+    import { boot } from "./chat.js";
+
+    boot().catch((err) => {
+      console.error(err);
+      document.getElementById("status").textContent = "failed";
+      document.getElementById("status").className = "pill err";
+      document.getElementById("messages").insertAdjacentHTML(
+        "beforeend",
+        `<div class="msg note err"><div class="body">${(err.stack || err)
+          .toString().replace(/[<&]/g, (c) => ({ "<": "&lt;", "&": "&amp;" }[c]))}</div></div>`
+      );
+    });
+  </script>
+</body>
+</html>

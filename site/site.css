@@ -1,0 +1,93 @@
+/* Shared styles for the site's plain pages (404, about, privacy, terms). The
+   chat app has its own stylesheet, web/app.css, with the same colours. */
+
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --line: #2a2f3a;
+  --text: #e6e8ee;
+  --muted: #8b93a7;
+  --accent: #6ea8fe;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+a { color: var(--accent); }
+
+.site-header {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  padding: .8rem 1.25rem;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+/* The credit ribbon, matching the chat page's (web/app.css .ribbon). */
+.ribbon {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: .1rem .6rem;
+  padding: .3rem 1rem;
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--bg);
+  border-top: 1px solid var(--line);
+}
+/* inline-block, so a link's underline and colour do not extend to the dot. */
+.ribbon > * + *::before { content: "·"; display: inline-block; margin-right: .6rem; color: #4a5162; }
+
+.site-header .brand {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  color: var(--text);
+  font-weight: 600;
+  text-decoration: none;
+}
+.site-header .brand img { width: 22px; height: 22px; }
+.site-header nav { display: flex; gap: 1rem; margin-left: auto; }
+.site-header nav a { color: var(--muted); text-decoration: none; }
+.site-header nav a:hover, .site-header nav a[aria-current="page"] { color: var(--text); }
+
+main {
+  flex: 1;
+  width: 100%;
+  max-width: 44rem;
+  margin: 0 auto;
+  padding: 3rem 1.25rem;
+}
+
+h1 { font-size: 1.6rem; margin: 0 0 .75rem; }
+.muted { color: var(--muted); }
+
+/* The legal pages (privacy.html, terms.html). */
+main h2 { font-size: 1.15rem; margin: 2rem 0 .5rem; }
+main h3 { font-size: 1rem; margin: 1.25rem 0 .4rem; }
+main li + li { margin-top: .3rem; }
+.updated { color: var(--muted); font-size: 14px; margin-top: 0; }
+/* An unwritten placeholder, styled to stand out. Nothing with this class
+   should reach the live site. */
+.todo {
+  color: #1a1206;
+  background: #e0a458;
+  border-radius: 4px;
+  padding: 0 .3rem;
+  font-weight: 600;
+}
+
+/* A diagram on a plain page (about.html): a white drawing on the dark page. */
+.diagram { margin: 1.25rem 0; }
+.diagram img { display: block; width: 100%; height: auto; border-radius: 6px; }
+.diagram figcaption { color: var(--muted); font-size: 14px; margin-top: .4rem; }

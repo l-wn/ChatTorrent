@@ -1,0 +1,30 @@
+{
+  "prompt": "The capital of France is",
+  "prompt_ids": [
+    760,
+    6511,
+    314,
+    9338,
+    369
+  ],
+  "generated_ids": [
+    11751,
+    13,
+    198,
+    760,
+    6511
+  ],
+  "full_ids": [
+    760,
+    6511,
+    314,
+    9338,
+    369,
+    11751,
+    13,
+    198,
+    760,
+    6511
+  ],
+  "full_text": "The capital of France is Paris.\nThe capital"
+}

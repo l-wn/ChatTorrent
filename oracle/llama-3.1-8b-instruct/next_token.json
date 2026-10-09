@@ -1,0 +1,31 @@
+{
+  "next_id": 12366,
+  "decoded": " Paris",
+  "top5": [
+    {
+      "id": 12366,
+      "logit": 15.603429794311523,
+      "decoded": " Paris"
+    },
+    {
+      "id": 264,
+      "logit": 13.628397941589355,
+      "decoded": " a"
+    },
+    {
+      "id": 279,
+      "logit": 13.18330192565918,
+      "decoded": " the"
+    },
+    {
+      "id": 539,
+      "logit": 13.159551620483398,
+      "decoded": " not"
+    },
+    {
+      "id": 7559,
+      "logit": 13.049296379089355,
+      "decoded": " located"
+    }
+  ]
+}
