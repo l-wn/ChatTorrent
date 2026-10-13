@@ -5,9 +5,7 @@
 # Caddyfile.dev.
 #
 # Environment (EnvironmentFile= in the chattorrent-caddy unit):
-#   CHAT_GATE        on | off   basic auth on everything but robots.txt, the icon
-#   CHAT_PASS_HASH              bcrypt hash for user `chatbot` (caddy hash-password)
-#   WEIGHTS_ORIGIN              where the weights are fetched from, for the CSP
+#   WEIGHTS_ORIGIN   where the weights are fetched from, for the CSP
 
 {
 	auto_https off
@@ -29,20 +27,9 @@
 	}
 }
 
-(gate-on) {
-	@gated not path /robots.txt /favicon.svg /site.webmanifest
-	basic_auth @gated {
-		chatbot {env.CHAT_PASS_HASH}
-	}
-}
-(gate-off) {
-}
-
 :8000 {
 	bind 127.0.0.1 [::1]
 	root * dist
-
-	import gate-{$CHAT_GATE:on}
 
 	import security-headers
 

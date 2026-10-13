@@ -163,13 +163,9 @@ IP addresses. Two kinds are supported:
   (`TURN_KEY_ID`, `TURN_API_TOKEN`): credentials minted through Cloudflare's
   API, shared by every peer and re-minted at half their 24-hour TTL. It is
   billed per GB relayed past a free allowance, with no spending cap, and
-  anyone who opens the page can copy the credential, so keep the site gated
-  while using it.
+  anyone who opens the page can copy the credential.
 
 When both are configured, your own server wins.
-
-**Gate it, or not.** `Caddyfile` puts basic auth (user `chatbot`) on the whole
-site unless `CHAT_GATE=off`.
 
 **Replace the demo's pages.** `site/privacy.html`, `site/terms.html`, the
 welcome popup in `web/peer.html` and the credit ribbon describe the demo and
@@ -232,8 +228,7 @@ The deploy reads `~/.config/chattorrent/env` (mode 600, outside the repo),
 plain `KEY=value` lines:
 
 ```bash
-CHAT_GATE=on                        # basic auth on the whole site; off = public
-CHAT_PASS_HASH=<caddy hash-password --plaintext …>
+CHAT_PASS_HASH=<caddy hash-password --plaintext …>   # Caddyfile.dev only
 ALLOWED_ORIGINS=https://<your-domain>
 WEIGHTS_ORIGIN=https://<weights-host>
 TURN_SECRET=<coturn's static-auth-secret>
@@ -258,9 +253,9 @@ Signaling server environment:
 | `TURN_KEY_ID`, `TURN_API_TOKEN` | unset | Cloudflare TURN, used when the two above are unset. Without either kind, the default relay-only links can't open and only `?direct=1` tabs can link |
 | `MAX_ROOMS`, `MAX_PEERS_PER_ROOM` | 1000, 64 | caps on private meshes, and on peers in any one mesh |
 
-Caddy environment: `CHAT_GATE` (`on`/`off`, default on), `CHAT_PASS_HASH`,
-`WEIGHTS_ORIGIN` (default `https://weights.chattorrent.net`), and
-`SIGNAL_PORT` for `Caddyfile.dev` (default 8081).
+Caddy environment: `WEIGHTS_ORIGIN` (default
+`https://weights.chattorrent.net`), and for `Caddyfile.dev`, `CHAT_PASS_HASH`
+and `SIGNAL_PORT` (default 8081).
 
 ## Troubleshooting
 

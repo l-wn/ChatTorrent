@@ -4,8 +4,8 @@
 # Runs beside the production Caddy, with its own signaling server on :8081.
 #
 # If a tunnel maps a public hostname here, the dev site is reachable from
-# anywhere while this runs. A request not addressed to localhost needs the
-# deploy's basic-auth password (CHAT_PASS_HASH). Without that variable Caddy
+# anywhere while this runs. A request not addressed to localhost needs a
+# basic-auth password (user chatbot, CHAT_PASS_HASH). Without that variable Caddy
 # does not start.
 #
 #   ./start.sh dev               # both, in the foreground; Ctrl-C stops them

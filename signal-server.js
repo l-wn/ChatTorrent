@@ -19,8 +19,8 @@ import { Room } from './signal-room.js';
 
 const PORT = Number(process.env.PORT ?? 8080);
 
-// Loopback only by default: in the deploy every socket arrives through Caddy,
-// which does the basic auth. HOST=0.0.0.0 opens it to a LAN for a local mesh.
+// Loopback only by default: in the deploy every socket arrives through Caddy.
+// HOST=0.0.0.0 opens it to a LAN for a local mesh.
 const HOST = process.env.HOST || '127.0.0.1';
 
 // Pages allowed to open a socket, by Origin header, so another site cannot
