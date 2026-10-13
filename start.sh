@@ -11,7 +11,7 @@ UNITS=(chattorrent-signal chattorrent-caddy chattorrent-cloudflared)
 
 usage() {
     cat <<EOF
-Usage: ./start.sh [start|stop|restart|status|logs|dev]
+Usage: ./start.sh [start|stop|restart|status|logs|dev|deploy]
 
   start     enable + start all three services (default)
   stop      stop all three (they stay enabled, so the next boot starts them again)
@@ -20,6 +20,8 @@ Usage: ./start.sh [start|stop|restart|status|logs|dev]
   logs      follow all three logs together (Ctrl-C to stop watching)
   dev       run the dev site (Caddyfile.dev) and its own signaling server in
             the foreground, at http://localhost:8001
+  deploy    copy the tracked files to DEPLOY_HOST (set in the env file) and restart
+            the services there
 EOF
 }
 
@@ -66,6 +68,16 @@ dev() {
     caddy run --config Caddyfile.dev
 }
 
+# Sends the working tree's tracked files, committed or not. DEPLOY_HOST
+# (user@host) comes from the environment or the env file.
+deploy() {
+    cd "$(dirname "$0")"
+    [[ -n ${DEPLOY_HOST:-} ]] || load_env
+    [[ -n ${DEPLOY_HOST:-} ]] || { echo "set DEPLOY_HOST=user@host in ~/.config/chattorrent/env" >&2; exit 1; }
+    git ls-files -z | rsync -a --from0 --files-from=- ./ "$DEPLOY_HOST:Code/ChatTorrent/"
+    ssh "$DEPLOY_HOST" 'cd Code/ChatTorrent && npm ci --omit=dev --no-audit --no-fund > /dev/null && XDG_RUNTIME_DIR=/run/user/$(id -u) ./start.sh restart'
+}
+
 case "${1:-start}" in
     start)   start ;;
     stop)    stop ;;
@@ -73,6 +85,7 @@ case "${1:-start}" in
     status)  status ;;
     logs)    logs ;;
     dev)     dev ;;
+    deploy)  deploy ;;
     -h|--help|help) usage ;;
     *) echo "unknown command: $1" >&2; usage >&2; exit 1 ;;
 esac
