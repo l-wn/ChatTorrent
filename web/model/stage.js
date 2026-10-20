@@ -34,6 +34,10 @@ const LOG_CHUNK = 256;
 // limit bounds the GPU time and payload memory a flood can take.
 export const MAX_QUEUE = 32;
 
+// How recently a session must have run here to count towards `load`. Covers
+// the gap between a reply's tokens and a short pause between turns.
+export const ACTIVE_MS = 5000;
+
 // Thrown by #cacheFor for a job that must wait for a frame. The queue catches
 // it and parks the job. Never leaves this file.
 const WAIT = new Error('waiting for a session frame');
@@ -105,6 +109,9 @@ export class Runner {
         // Jobs run() has accepted and not yet settled, by session. A session
         // with any is not idle, however long its job waits in the queue.
         this.pending = new Map();
+        // Milliseconds per position for one decode token, averaged. Null
+        // until the first decode job. route.js compares peers' speeds with it.
+        this.msPerPos = null;
         // When the last non-warm-up job ran. 0 until the first one.
         this.lastJobAt = 0;
 
@@ -479,6 +486,19 @@ export class Runner {
         if (this.waiting.length) this.#pump();
     }
 
+    // This peer's active work: the positions it runs per token, summed over
+    // sessions with a job here or one within ACTIVE_MS. route.js reports it
+    // in acks, so the peers handing work here can balance new sessions.
+    get load() {
+        const now = performance.now();
+        let n = 0;
+        for (const [s, frame] of this.live) {
+            if (!this.pending.has(s) && now - (frame.lastUse ?? 0) >= ACTIVE_MS) continue;
+            for (const [at, to] of this.cuts.get(s) ?? []) n += to - at;
+        }
+        return n;
+    }
+
     // The first live session idle for at least `idleMs`, or null if none is.
     // A session with a job queued or running here is never idle: under load a
     // job can wait in the queue longer than `idleMs`. `live` is in LRU order,
@@ -791,6 +811,10 @@ export class Runner {
         s.readback.unmap();
         const t4 = performance.now();
         const gpu = prof?.collect();
+        if (T === 1 && !h.replay && h.s !== WARMUP) {
+            const per = (t3 - t0) / (to - at);
+            this.msPerPos = this.msPerPos == null ? per : 0.9 * this.msPerPos + 0.1 * per;
+        }
 
         // Where this job's time went, on this machine's clock. `encode` is the
         // CPU cost of launching the work (cache lookup, uploads, recording

@@ -17,6 +17,13 @@ import { penaltyState } from './model/sampling.js';
 // message too big for one datachannel send.
 export const T_MAX = 64;
 
+// A peer's load, as reported in its acks, is used for this long.
+const LOAD_TTL_MS = 10_000;
+
+// Positions just routed to a peer count towards its load for this long, or
+// until its next ack, so a burst of new sessions does not all go one way.
+const ASSIGN_TTL_MS = 2000;
+
 const ROUTES = 128;        // (session, boundary) pairs a peer pins a hop for
 
 // The enqueuer's timeout for one job, end to end. Per-hop acks detect most
@@ -143,6 +150,12 @@ export function makeRouter({
     const pending = new Map();     // session -> { resolve, reject, timer }
     const links = new Map();       // `${session}|${cursor}` -> { rtt, send }: timing of
                                     // the last hand-off across that boundary
+    const loads = new Map();       // peer -> { w, p, at }: its active work in positions,
+                                    // its ms per position, when it last acked
+    const assigned = new Map();    // peer -> { n, at }: positions routed to it since
+                                    // its last ack
+    const planned = new Map();     // session -> { n, at }: positions I chose to run for
+                                    // it, until its cut exists here
     const senders = new Map();     // session -> Set of peers that handed me a job
                                     // of it. They may `free` it here.
 
@@ -264,14 +277,60 @@ export function makeRouter({
             return net.next(pos).includes(pinned) ? [pinned] : [];
         }
 
-        // Ready holders of `pos`. Prefer an open link (ICE costs a second),
-        // then the peer that reaches furthest. Never me: I either declined
-        // this job in route() or chose to stop here.
-        const rank = (id) => [net.linked(id) ? 0 : 1, -net.reach(id, pos), id];
-        return net.next(pos).filter((id) => id !== net.id).sort((a, b) => {
+        return rankAt(pos);
+    }
+
+    // Ready holders of `pos`, best first: an open link (ICE costs a second),
+    // then the least loaded, then the one that reaches furthest. With no load
+    // reported anywhere, that is reach alone. Never me: I either declined
+    // this job in route() or chose to stop here.
+    function rankAt(pos) {
+        const ids = net.next(pos).filter((id) => id !== net.id);
+        const ls = new Map(ids.map((id) => [id, loadOf(id)]));
+        const timed = ids.every((id) => ls.get(id).p != null);
+        const rank = (id) => [net.linked(id) ? 0 : 1, cost(ls.get(id), 0, timed),
+                              -net.reach(id, pos), id];
+        return ids.sort((a, b) => {
             const [x, y] = [rank(a), rank(b)];
-            return (x[0] - y[0]) || (x[1] - y[1]) || (x[2] - y[2]);
+            return (x[0] - y[0]) || (x[1] - y[1]) || (x[2] - y[2]) || (x[3] - y[3]);
         });
+    }
+
+    // A peer's active work in positions (`w`) and its ms per position (`p`,
+    // null if unknown). Mine from my runner; another's from its last ack,
+    // plus what I routed to it since. A report older than LOAD_TTL_MS, or
+    // none (an older page), counts as idle.
+    function loadOf(id) {
+        if (id === net.id) {
+            const r = runner();
+            // Sessions planned here but not yet run count too, so a burst of
+            // new chats does not all see an idle peer.
+            const now = performance.now();
+            let w = r?.load ?? 0;
+            for (const [s, x] of planned) {
+                if (now - x.at >= ASSIGN_TTL_MS || r?.cuts?.has(s)) planned.delete(s);
+                else w += x.n;
+            }
+            return { w, p: r?.msPerPos ?? null };
+        }
+        const now = performance.now();
+        const l = loads.get(id);
+        const fresh = l && now - l.at < LOAD_TTL_MS;
+        const a = assigned.get(id);
+        const extra = a && now - a.at < ASSIGN_TTL_MS ? a.n : 0;
+        return { w: (fresh ? l.w : 0) + extra, p: fresh ? l.p ?? null : null };
+    }
+
+    // A peer's work per token round, in ms when every peer compared has a
+    // measured speed, otherwise in positions.
+    const cost = (l, more, timed) => (l.w + more) * (timed ? l.p : 1);
+
+    // Count `n` positions as on their way to `id` until it next acks.
+    function assign(id, n) {
+        const now = performance.now();
+        const a = assigned.get(id);
+        const prior = a && now - a.at < ASSIGN_TTL_MS ? a.n : 0;
+        assigned.set(id, { n: prior + n, at: now });
     }
 
     // Every per-boundary map is capped at ROUTES, oldest out first.
@@ -510,12 +569,20 @@ export function makeRouter({
             // Ack before any GPU work. Not for a job this tab handed itself
             // (`from == null`) or a replay; nobody waits on those.
             if (from != null && !h.replay) {
-                net.send(from, { k: 'ack', s: h.s, to: from, at: h.pos });
+                const r = runner();
+                net.send(from, { k: 'ack', s: h.s, to: from, at: h.pos,
+                                 ...(Number.isFinite(r?.load) && { w: r.load }),
+                                 ...(r?.msPerPos != null && { p: Math.round(r.msPerPos * 1000) / 1000 }) });
             }
             return runJob(h, payload, from);
         }
 
         if (h.k === 'ack') {
+            // The receiver's load, which plan() and rankAt() balance on.
+            if (from != null && Number.isFinite(h.w)) {
+                loads.set(from, { w: h.w, p: Number.isFinite(h.p) ? h.p : null, at: performance.now() });
+                assigned.delete(from);
+            }
             const key = `${h.s}|${h.at}`;
             const w = acks.get(key);
             // Ignore an ack from a peer other than the one being waited on
@@ -637,32 +704,67 @@ export function makeRouter({
     // Runner.#exit decides, since a session that ran here before keeps the
     // boundary it started on.
     //
-    // Picks the furthest position I hold that another peer can pick up,
-    // because hop count dominates decode latency. Stopping short of my last
-    // position routes around a hole at my boundary.
-    function plan(pos) {
+    // Where to hand the session on. Decided on its first job here and pinned
+    // (Runner.#exit), so a session keeps its path.
+    //
+    // On an idle mesh: the furthest position I hold that another peer can
+    // pick up, because hop count dominates decode latency. Under load: the
+    // exit that evens out my work and the next peer's, among the exits whose
+    // next peer reaches as far as the furthest one's, so balancing never adds
+    // a hop. Stopping short of my last position also routes around a hole at
+    // my boundary.
+    function plan(h) {
+        const pos = h.pos;
         const r = runner();
 
         // The model ends inside this peer: run to the end and sample. Nobody
         // holds `positions`, so the loop below never returns it.
         if (r.have >= net.positions) return net.positions;
 
+        // A session that ran here before keeps its cut.
+        const cut = r.cuts?.get(h.s)?.get(pos);
+        if (cut !== undefined) return cut;
+
         // Every position I could stop at and who can pick it up there, e.g.
         // `{ 11: [c], 12: [d], 13: [q, f], 15: [] }`. Walk back from the
-        // furthest.
+        // furthest. Only exits with an open link are candidates: the choice
+        // is pinned for the session, and an extra hop is better than a
+        // failed send.
         const exits = net.exits(pos, r.have);
+        const cands = [];              // { at, who }, furthest first
         let reachable = null;
         for (let at = r.have; at > pos; at--) {
             const who = (exits.get(at) ?? []).filter((id) => id !== net.id);
             if (!who.length) continue;
-            // Prefer an open link to a further exit. The choice is pinned for
-            // the session, and an extra hop is better than a failed send.
-            if (who.some((id) => net.linked(id))) return at;
+            if (who.some((id) => net.linked(id))) cands.push({ at, who: rankAt(at)[0] });
             reachable ??= at;
         }
         // Nobody reachable can take it. Run as far as I can; route() reports
         // the failure.
-        return reachable ?? r.have;
+        if (!cands.length) return reachable ?? r.have;
+
+        const far = cands[0];
+        const end = (c) => c.at + net.reach(c.who, c.at);
+        const ok = cands.filter((c) => end(c) >= end(far));
+        const me = loadOf(net.id);
+        const them = ok.map((c) => loadOf(c.who));
+        const take = (c) => {
+            planned.set(h.s, { n: c.at - pos, at: performance.now() });
+            assign(c.who, net.reach(c.who, c.at));
+            return c.at;
+        };
+        if (me.w === 0 && them.every((l) => l.w === 0)) return take(far);
+
+        // The exit after which the busier of the two carries least. Ties go
+        // to the further exit, which `ok` lists first.
+        const timed = me.p != null && them.every((l) => l.p != null);
+        let best = 0, score = Infinity;
+        ok.forEach((c, i) => {
+            const x = Math.max(cost(me, c.at - pos, timed),
+                               cost(them[i], net.reach(c.who, c.at), timed));
+            if (x < score) { best = i; score = x; }
+        });
+        return take(ok[best]);
     }
 
     async function runJob(h, hidden, from = null) {
@@ -681,7 +783,7 @@ export function makeRouter({
         }
         try {
             const t0 = performance.now();
-            const want = plan(h.pos);
+            const want = plan(h);
             const t1 = performance.now();
             const r = await runner().run(h, hidden, want);
             const t2 = performance.now();
@@ -1294,6 +1396,8 @@ export function makeRouter({
         get ctxLen() { return conv.history.length; },
         get history() { return conv.history; },
         get ran() { return ran; },
+        // The last load each peer reported in its acks (see plan()).
+        get loads() { return new Map(loads); },
         get repairs() { return repairs; },
         get repaired() { return repaired; },   // hand-offs fixed for other peers
         get eos() { return eos; },

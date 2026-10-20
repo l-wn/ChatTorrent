@@ -128,6 +128,11 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0) {
         // proxy, so the proxy exposes them.
         get d() { return real.d; },
         get logs() { return real.logs; },
+        // Read by route.js's load-aware routing: the session's pinned cut,
+        // and the load and speed reported in acks.
+        get cuts() { return real.cuts; },
+        get load() { return real.load; },
+        get msPerPos() { return real.msPerPos; },
         resetTrace, takeTrace,
         holds: (p) => real.holds(p),
         append: (w) => real.append(w),
@@ -2534,6 +2539,84 @@ console.log('\nclosed loop: only the loop the enqueuer opened last may feed a se
         const ctl = await generate(chain([0, N], {}, { hybrid }).asker, [...PROMPT, ...one, ...LONG, ...two, ...TURN2], 4);
         eq(`${label}: and the chat carries on untouched`, three, ctl);
         eq(`${label}: no ledger violations`, w.violations, []);
+    }
+}
+
+console.log('\nload-aware routing: sessions spread across peers that overlap');
+{
+    const prompts = [PROMPT, [9, 8, 7, 6], [21, 3], [5, 5, 4, 3]];
+    const controls = [];
+    for (const p of prompts) controls.push(await generate(chain([0, N]).asker, p, 10));
+    // Where a peer handed each session on from position 0, recorded on the
+    // session's first job there (an evicted session's cut is dropped).
+    const recordCuts = (tab) => {
+        const seen = new Map();
+        const run = tab.runner.run.bind(tab.runner);
+        tab.runner.run = (h, hidden, want) => run(h, hidden, want).then((r) => {
+            if (h.pos === 0 && !seen.has(h.s)) seen.set(h.s, r.at);
+            return r;
+        });
+        return () => [...seen.values()];
+    };
+
+    // Idle: one chat takes the furthest exit, as routing always has.
+    {
+        const w = new World({ maxRepairs: 200 });
+        const cutsAt0 = recordCuts(w.join(0, 0, 6));
+        w.join(1, 2, N);
+        const got = await streamed(w.join(100), prompts[0], 10);
+        eq('idle: a lone chat matches its control', got, controls[0]);
+        eq('idle: it runs to the furthest exit, as before', cutsAt0(), [6]);
+        ok('idle: nothing left running', await quiet(w));
+    }
+
+    // Busy: four chats at once. Peer 0 alone holds the embedding, so it would
+    // run 0-5 for all of them. Balanced, later sessions leave it early and
+    // peer 1 takes more of the overlap.
+    {
+        const w = new World({ maxRepairs: 200 });
+        const cutsAt0 = recordCuts(w.join(0, 0, 6, { slots: 4 }));
+        w.join(1, 2, N, { slots: 4 });
+        for (const id of [0, 1]) w.slow(id, 1);
+        const askers = prompts.map((_, i) => w.join(100 + i));
+        const got = await Promise.all(askers.map((a, i) => streamed(a, prompts[i], 10)));
+        eq('busy: every reply is its own', got, controls);
+        const cuts = cutsAt0();
+        ok('busy: sessions were cut at different places', new Set(cuts).size >= 2, JSON.stringify(cuts));
+        ok('busy: and peer 1 took more than the idle share',
+            cuts.reduce((n, c) => n + (N - c), 0) / cuts.length > N - 6, JSON.stringify(cuts));
+        eq('busy: no ledger violations', w.violations, []);
+        ok('busy: nothing left running', await quiet(w));
+    }
+
+    // Never an extra hop. Peer 1 holds a short stretch that would need a
+    // third peer after it; peer 2 reaches the end from 4 or 5. Under load,
+    // sessions may leave peer 0 at 4 or 5, but never go through peer 1.
+    {
+        const w = new World({ maxRepairs: 200 });
+        w.join(0, 0, 5);
+        const p1 = w.join(1, 2, 4);
+        w.join(2, 4, N);
+        for (const id of [0, 1, 2]) w.slow(id, 1);
+        const askers = prompts.map((_, i) => w.join(100 + i));
+        const got = await Promise.all(askers.map((a, i) => streamed(a, prompts[i], 10)));
+        eq('no extra hop: every reply is its own', got, controls);
+        eq('no extra hop: the short peer was never used', p1.runner.cuts.size, 0);
+        ok('no extra hop: nothing left running', await quiet(w));
+    }
+
+    // A peer whose acks carry no load (an older page) counts as idle. Routing
+    // still balances on what was sent to it, and replies stay correct.
+    {
+        const w = new World({ maxRepairs: 200 });
+        w.join(0, 0, 6);
+        const p1 = w.join(1, 2, N);
+        Object.defineProperty(p1.runner, 'load', { get: () => undefined });
+        for (const id of [0, 1]) w.slow(id, 1);
+        const askers = prompts.map((_, i) => w.join(100 + i));
+        const got = await Promise.all(askers.map((a, i) => streamed(a, prompts[i], 10)));
+        eq('older peer: every reply is its own', got, controls);
+        ok('older peer: nothing left running', await quiet(w));
     }
 }
 

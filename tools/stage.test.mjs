@@ -968,5 +968,26 @@ console.log('\nvramBytes: what a Runner counts is what it allocated');
     eq('the whole model: every piece counted once', r.weightBytes, weights);
 }
 
+// What route.js reports in its acks: the positions this peer runs per token
+// for its active chats, and how long a position takes.
+console.log('\nload: the work a peer reports for routing');
+{
+    const r = new Runner(device, D, weightsFor(0, 4),
+        { lo: 0, hi: 4, nMax: 16, tMax: 4, slots: 2, idleMs: 0 });
+    const job = (s, past, want, n = 1) => r.run(
+        { k: 'job', s, pos: 0, past, n, ids: Array(n).fill(1), opts: {} }, null, want);
+    eq('an idle peer has no load', r.load, 0);
+    eq('and no measured speed yet', r.msPerPos, null);
+    await job('a', 0, 3, 2);
+    ok('a prefill does not set the speed', r.msPerPos === null);
+    await job('a', 2, 3);
+    eq('a chat cut at 3 adds three positions', r.load, 3);
+    ok('and a decode token measures the speed', r.msPerPos > 0, `${r.msPerPos}`);
+    await job('b', 0, 2);
+    eq('a second chat adds its own', r.load, 5);
+    await r.release('a');
+    eq('a chat that ended no longer counts', r.load, 2);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

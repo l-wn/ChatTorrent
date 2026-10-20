@@ -294,18 +294,33 @@ Two invariants hold it up:
   holder later would answer from a cold cache, which produces wrong tokens and
   no error.
 
-**Where a job stops** (`plan()`): the furthest position this peer holds that
-someone else can pick up, preferring positions with an open link. Hops dominate
-decode latency, so running further is better, and stopping short lets the mesh
-route around a hole.
+**Where a job stops** (`plan()`): decided on a session's first job at a peer,
+then pinned (see Cuts). On an idle mesh it is the furthest position this peer
+holds that someone else can pick up, preferring positions with an open link.
+Hops dominate decode latency, so running further is better, and stopping short
+lets the mesh route around a hole.
+
+Under load it balances. Among the exits whose next peer reaches as far as the
+furthest exit's would, so balancing never adds a hop, it picks the one where
+the busier of the two peers ends up carrying least:
+`max((w_me + mine) * p_me, (w_next + theirs) * p_next)`. `w` is a peer's
+active work in positions per token (`Runner.load`: the cut widths of sessions
+that ran within `ACTIVE_MS`, 5 s, or have a job queued) and `p` its measured ms
+per position (`Runner.msPerPos`); without a `p` for every peer compared, work
+is counted in positions. Every ack carries the receiver's `w` and `p`, so a
+peer learns the load of exactly the peers it hands work to, once per token. A
+report older than 10 s, or none, counts as idle. Sessions planned but not yet
+run, and work just sent to a peer that has not acked since, count for 2 s, so a
+burst of new chats does not all go one way. With two overlapping peers, new
+chats move the cut within the overlap until their work evens out.
 
 **Cuts** (`Runner.#exit`): `plan()` is a proposal. The first job of a session
 entering a peer at a given cursor pins where that session leaves; later jobs
 of the session leave there too, whatever the peer holds by then.
 
 **Choosing a next hop** (`hops()`): a pinned boundary has exactly its pin. An
-unpinned one ranks ready holders by open link first, then by how far they
-reach.
+unpinned one ranks ready holders by open link first, then by reported load,
+then by how far they reach. With no load reported, that is reach alone.
 
 ## Wire format
 
@@ -546,7 +561,9 @@ Known gaps:
   first hop: every rebuild can be routed straight back into it until the roster
   drops it, so a turn can spend its whole repair budget there.
 - Peers are trusted: nothing checks that a peer computed its range honestly.
-- Routing uses links and reach, not measured latency.
+- Routing balances GPU work, not chats: every chat still needs a frame on the
+  embedding's holder and on the head's, so with one of each the runners'
+  `SESSIONS` caps concurrent chats however the middle is split.
 - Reachability is not in the roster, so depth counted over peers that cannot
   reach each other is optimistic.
 - One job queue per runner, first come first served.
