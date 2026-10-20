@@ -995,6 +995,11 @@ process.env.MIN_BLOCKS = '10';
 process.env.MAX_ROOMS = '3';
 process.env.MAX_PEERS_PER_ROOM = '20';
 process.env.JOIN_TIMEOUT_MS = '400';
+// The limits on replies at once: two in the global mesh, at most three in a
+// private one, and a lease short enough to expire within the test.
+process.env.MAX_CHATS = '2';
+process.env.MAX_PRIVATE_CHATS = '3';
+process.env.CHAT_LEASE_MS = '300';
 // Our own TURN server, so every welcome carries a per-peer credential.
 process.env.TURN_SECRET = 'testsecret';
 process.env.TURN_URLS = 'turn:turn.example:3478?transport=udp, turn:turn.example:3478?transport=tcp';
@@ -1010,7 +1015,8 @@ await new Promise((r) => setTimeout(r, 200));
 
 // `room` is the join token to send first (null: the global mesh), or `false`
 // to send nothing. The server sends nothing to a socket until it has joined.
-function connect(room = null) {
+// `extra` adds fields to the join, e.g. `{ chats: 2 }`.
+function connect(room = null, extra = {}) {
     const ws = new WS('ws://localhost:8099');
     const msgs = [];
     const waiters = [];
@@ -1021,7 +1027,7 @@ function connect(room = null) {
         const t = setTimeout(() => r('open'), 2000);
         ws.on('close', (code) => { clearTimeout(t); r(code); });
     });
-    if (room !== false) ws.on('open', () => ws.send(JSON.stringify({ type: 'join', v: 1, room })));
+    if (room !== false) ws.on('open', () => ws.send(JSON.stringify({ type: 'join', v: 1, room, ...extra })));
     ws.on('message', (d) => {
         const m = JSON.parse(d);
         msgs.push(m);
@@ -1503,6 +1509,64 @@ console.log('\nsignal-server: limits');
         (await existing.next((m) => m.type === 'welcome')).private === false);
     for (const p of [...held, existing]) p.close();
     await new Promise((r) => setTimeout(r, 150));
+}
+
+console.log('\nsignal-server: chats at once');
+{
+    const isChat = (m) => m.type === 'chat';
+    // One chat-start and its answer. Answers are matched in order, so each
+    // call waits for a `chat` it has not seen yet.
+    const ask = async (p) => {
+        const seen = p.msgs.filter(isChat).length;
+        p.send({ type: 'chat-start' });
+        return p.next((m) => isChat(m) && p.msgs.filter(isChat).indexOf(m) === seen);
+    };
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    // MAX_CHATS is 2 in the global mesh.
+    const [a, b, c] = [connect(null), connect(null), connect(null)];
+    const welcome = await a.next((m) => m.type === 'welcome');
+    await Promise.all([b, c].map((p) => p.next((m) => m.type === 'welcome')));
+    eq('the welcome gives the global mesh\'s limit', welcome.maxChats, 2);
+    eq('two replies may start', [(await ask(a)).ok, (await ask(b)).ok], [true, true]);
+    eq('a third is refused, with the limit', await ask(c), { type: 'chat', ok: false, max: 2 });
+    ok('asking again while seated is fine and takes no second seat',
+        (await ask(a)).ok === true && (await ask(c)).ok === false);
+    a.send({ type: 'chat-end' });
+    await sleep(50);
+    ok('a seat given back is free for the next reply', (await ask(c)).ok === true);
+    b.close();
+    await sleep(100);
+    ok('leaving frees a seat too', (await ask(a)).ok === true);
+    await sleep(400);
+    const fresh = connect(null);
+    await fresh.next((m) => m.type === 'welcome');
+    ok('a seat never given back is freed after the lease', (await ask(fresh)).ok === true);
+    for (const p of [a, c, fresh]) p.close();
+    await sleep(150);
+
+    // A private mesh's limit is its creator's, capped at MAX_PRIVATE_CHATS (3).
+    const t1 = (await openRoom(newSecret())).joinToken;
+    const owner = connect(t1, { chats: 1 });
+    eq('a private mesh takes its creator\'s limit',
+        (await owner.next((m) => m.type === 'welcome')).maxChats, 1);
+    const guest = connect(t1, { chats: 5 });
+    eq('and a later join cannot change it', (await guest.next((m) => m.type === 'welcome')).maxChats, 1);
+    eq('which holds it to one reply at once', [(await ask(owner)).ok, (await ask(guest)).ok], [true, false]);
+    for (const p of [owner, guest]) p.close();
+    await sleep(150);
+
+    const over = connect((await openRoom(newSecret())).joinToken, { chats: 9 });
+    eq('a limit above the server\'s cap is clamped to it',
+        (await over.next((m) => m.type === 'welcome')).maxChats, 3);
+    const none = connect((await openRoom(newSecret())).joinToken);
+    eq('no limit asked for gives the server\'s cap',
+        (await none.next((m) => m.type === 'welcome')).maxChats, 3);
+    const global = connect(null, { chats: 9 });
+    eq('and the global mesh ignores a join\'s limit',
+        (await global.next((m) => m.type === 'welcome')).maxChats, 2);
+    for (const p of [over, none, global]) p.close();
+    await sleep(150);
 }
 
 // --- Mesh: which mesh it joins, and what it passes to WebRTC ---

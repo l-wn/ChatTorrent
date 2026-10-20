@@ -346,7 +346,8 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
 
     let manifest;
     try {
-        ({ manifest } = await engine.connect({ room, relayOnly: !directParam() }));
+        ({ manifest } = await engine.connect({ room, relayOnly: !directParam(),
+                                               chats: creatorChats(secret) }));
     } catch (err) {
         console.warn('connect failed:', err);
         ui.title.textContent = 'ChatTorrent';
@@ -356,6 +357,7 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
         refresh();
         return;
     }
+    showChatLimit();
 
     CHAT = chatFormat(manifest);
     TURN_RE = stopRe(CHAT);
@@ -510,6 +512,29 @@ function showMesh(room) {
     ui.leave.href = location.pathname;         // this page with no invite or query
     ui.leave.textContent = priv ? 'Leave' : 'Global mesh';
     ui.chatsMesh.textContent = !room ? 'no mesh' : priv ? `private mesh ${room.tag}` : 'global mesh';
+    // The limit applies when this tab creates a private mesh.
+    ui.meshchatsLabel.hidden = !room || priv;
+}
+
+// Add the mesh's limit on replies at once to its pill, once the welcome has
+// brought it.
+function showChatLimit() {
+    const max = engine?.net?.maxChats;
+    if (max) ui.mesh.title += ` Up to ${max} replies can generate at once.`;
+}
+
+// The limit on replies at once chosen when this tab created its private mesh,
+// kept in sessionStorage so the tab's reload and reconnects send it again.
+// Null for an invitee and in the global mesh.
+const chatsKey = (s) => `chattorrent:chats:${s}`;
+function creatorChats(s) {
+    if (!s) return null;
+    try {
+        const n = Number(sessionStorage.getItem(chatsKey(s)));
+        return Number.isInteger(n) && n >= 1 ? n : null;
+    } catch {
+        return null;
+    }
 }
 
 async function copyInvite() {
@@ -531,7 +556,12 @@ function wireEvents() {
     window.addEventListener('hashchange', () => location.reload());
     ui.newmesh.addEventListener('click', () => {
         if (state.busy && !confirm('A reply is still being generated. Leave it and move to a new private mesh?')) return;
-        location.hash = `mesh=${newSecret()}`;
+        const fresh = newSecret();
+        const n = Number(ui.meshchats.value);
+        if (Number.isInteger(n) && n >= 1) {
+            try { sessionStorage.setItem(chatsKey(fresh), String(n)); } catch { /* no limit then */ }
+        }
+        location.hash = `mesh=${fresh}`;
     });
     ui.invite.addEventListener('click', copyInvite);
 
@@ -903,6 +933,18 @@ async function submitPrompt() {
     if (!text) return;
 
     const opts = options();
+    // A seat under the mesh's limit on replies at once, before the prompt is
+    // shown. A refused prompt stays in the input to send again.
+    setBusy(true);
+    ui.stop.disabled = true;
+    const seat = await engine.net.seat();
+    if (!seat.ok) {
+        setBusy(false);
+        note(`The mesh is at its limit of ${seat.max} replies at once. Try again in a moment.`, true);
+        setStatus('mesh busy', 'busy');
+        return;
+    }
+
     ui.input.value = '';
     ui.input.style.height = 'auto';
     addMessage('you', text, 'user');
@@ -912,7 +954,6 @@ async function submitPrompt() {
     // was displayed.
     const reply = { role: 'assistant', text: '', reasoning: null, meta: '', opts: how };
 
-    setBusy(true);
     ui.stop.disabled = false;
     setStatus('generating…', 'busy');
     const out = addMessage('mesh', '', 'model streaming');
@@ -926,6 +967,7 @@ async function submitPrompt() {
         setStatus('error', 'err');
         reply.meta = `failed: ${err.message}`;
     } finally {
+        engine.net.unseat();
         out.el.classList.remove('streaming');
         // If nothing reached the mesh (the context was full), nothing is saved.
         if (fed) await saveTurn(user, reply.text || reply.reasoning ? reply : null);

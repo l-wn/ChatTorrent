@@ -100,10 +100,12 @@ export class Engine {
     // default.
     //
     // `relayOnly` (default true) sends every link through a TURN relay, so no
-    // peer sees this tab's address (see web/net.js).
-    async connect({ room, relayOnly = true } = {}) {
+    // peer sees this tab's address (see web/net.js). `chats` is the limit on
+    // replies at once to ask for if this join creates a private mesh.
+    async connect({ room, relayOnly = true, chats = null } = {}) {
         const net = new Mesh({
             room,
+            chats,
             relayOnly,
             onMessage: (h, payload, raw, from) => this.#router.route(h, payload, raw, from),
             onChange: () => this.#emit('change'),

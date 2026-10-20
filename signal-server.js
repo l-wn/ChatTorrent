@@ -183,6 +183,16 @@ async function iceServers(id) {
 const MAX_ROOMS = Number(process.env.MAX_ROOMS) || 1000;
 const MAX_PEERS_PER_ROOM = Number(process.env.MAX_PEERS_PER_ROOM) || 64;
 
+// Replies that may generate at once: MAX_CHATS in the global mesh, and in a
+// private mesh the limit its creator chose, capped by MAX_PRIVATE_CHATS (also
+// the limit of a private mesh whose creator chose none). Unset or 0: no limit.
+const limit = (v) => Number(v) > 0 ? Math.floor(Number(v)) : Infinity;
+const MAX_CHATS = limit(process.env.MAX_CHATS);
+const MAX_PRIVATE_CHATS = limit(process.env.MAX_PRIVATE_CHATS);
+// A seat whose `chat-end` never came is freed after this long. Longer than a
+// page waits for any one job (route.js's JOB_TIMEOUT, 300 s).
+const CHAT_LEASE_MS = Number(process.env.CHAT_LEASE_MS) || 600000;
+
 // How long a new socket has to send its `join`.
 const JOIN_TIMEOUT_MS = Number(process.env.JOIN_TIMEOUT_MS) || 10000;
 
@@ -195,12 +205,13 @@ export const CLOSE_FULL = 4002;
 // A join token is HKDF output: 32 bytes, base64url.
 const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 
-const makeRoom = (label) => new Room({
+const makeRoom = (label, maxChats) => new Room({
     label, positions: POSITIONS, head: HEAD, minBlocks: MIN_BLOCKS, maxPeers: MAX_PEERS_PER_ROOM,
+    maxChats, chatLeaseMs: CHAT_LEASE_MS,
 });
 
 const GLOBAL = 'global';
-const rooms = new Map([[GLOBAL, makeRoom('')]]);
+const rooms = new Map([[GLOBAL, makeRoom('', MAX_CHATS)]]);
 
 // One id counter for all rooms: monotonic and never reused. A browser keys
 // links by peer id, so an id must never refer to a later peer, even after a
@@ -247,6 +258,8 @@ console.log(`signaling on ws://${HOST}:${PORT}: ${manifest?.model ?? 'unknown mo
     + `min ${MIN_BLOCKS} per peer`);
 console.log(`  weights: ${WEIGHTS_URL}${process.env.WEIGHTS_URL ? ' (WEIGHTS_URL override)'
     : ` (from ${CHECKPOINT})`}`);
+console.log(`  chats at once: ${Number.isFinite(MAX_CHATS) ? MAX_CHATS : 'no limit'} in the global mesh, `
+    + `${Number.isFinite(MAX_PRIVATE_CHATS) ? `at most ${MAX_PRIVATE_CHATS}` : 'no cap'} in a private one`);
 if (OWN_TURN) console.log(`  TURN: ${TURN_URLS.join(', ')} (a credential per peer)`);
 else if (TURN_SECRET || TURN_URLS.length) console.warn('TURN_SECRET and TURN_URLS go together. '
     + 'With only one set, peers are not given this TURN server.');
@@ -257,16 +270,18 @@ if (!dims) console.warn('no manifest, falling back to a flat 10-block floor. '
     + 'Set MIN_BLOCKS if that is wrong for this model.');
 
 // The room a `join` names, created if new, or a close code if it is refused.
-function roomFor(token) {
+// `chats` is the creator's limit, read only when this join creates the room.
+function roomFor(token, chats) {
     if (token == null) return { key: GLOBAL, room: rooms.get(GLOBAL) };
     if (typeof token !== 'string' || !TOKEN_RE.test(token)) return { refuse: CLOSE_BAD_JOIN };
     const key = createHash('sha256').update(token).digest('hex');
     let room = rooms.get(key);
     if (!room) {
         if (rooms.size - 1 >= MAX_ROOMS) return { refuse: CLOSE_FULL, why: 'too many private meshes' };
-        room = makeRoom(`room ${key.slice(0, 6)} `);
+        const asked = Number.isInteger(chats) && chats >= 1 ? chats : Infinity;
+        room = makeRoom(`room ${key.slice(0, 6)} `, Math.min(asked, MAX_PRIVATE_CHATS));
         rooms.set(key, room);
-        room.log('opened');
+        room.log(`opened, ${room.chatLimit === 1 ? '1 chat' : `${room.chatLimit ?? 'no limit on'} chats`} at once`);
     }
     return { key, room };
 }
@@ -291,7 +306,7 @@ wss.on('connection', (ws, req) => {
 
         if (m.type !== 'join') return ws.close(CLOSE_BAD_JOIN, 'join first');
         clearTimeout(timer);
-        const { key, room, refuse, why } = roomFor(m.room);
+        const { key, room, refuse, why } = roomFor(m.room, m.chats);
         if (refuse) return ws.close(refuse, why ?? 'bad join');
         if (room.full) {
             if (!room.size) rooms.delete(key);
@@ -312,6 +327,8 @@ wss.on('connection', (ws, req) => {
             // The kind of mesh this socket is in. The page compares it with
             // the kind it asked for and stops if they differ.
             private: key !== GLOBAL,
+            // Replies that may generate at once here, or null for no limit.
+            maxChats: room.chatLimit,
             ice, peers: room.roster(),
         });
         room.broadcast();

@@ -257,6 +257,9 @@ const iceDone = (pc) => new Promise((res) => {
 // (see Mesh's #flush()). ICE takes about a second, longer through TURN.
 export const LINK_WAIT_MS = 5000;
 
+// How long seat() waits for the signaling server to answer.
+const SEAT_WAIT_MS = 5000;
+
 export class Mesh {
     // onMessage(header, payload, raw, from). `raw` is the whole reassembled
     // message as bytes, so a forwarder can pass it to send(), which fragments
@@ -267,11 +270,13 @@ export class Mesh {
     // authenticated. route.js uses it to send a failure back one hop.
     //
     // `room` is the mesh to join (web/room.js), the global one by default.
+    // `chats` is the limit on replies at once this tab asks for when its join
+    // creates a private mesh (the server ignores it otherwise).
     // `relayOnly` routes every link through TURN, so no peer learns this tab's
     // address. `rate`, `linkWait`, `readyTimeout`, `linkRetry` and `linkOpen`
     // override RATE, LINK_WAIT_MS, READY_TIMEOUT_MS, LINK_RETRY_MS and
     // LINK_OPEN_MS, for tests.
-    constructor({ onMessage, onChange, rate = RATE, room = GLOBAL, relayOnly = true,
+    constructor({ onMessage, onChange, rate = RATE, room = GLOBAL, chats = null, relayOnly = true,
                   linkWait = LINK_WAIT_MS, readyTimeout = READY_TIMEOUT_MS,
                   linkRetry = LINK_RETRY_MS, linkOpen = LINK_OPEN_MS } = {}) {
         this.id = null;
@@ -287,6 +292,10 @@ export class Mesh {
         this.ice = ICE;             // until the welcome brings the real list
         this.links = new Map();     // id -> { pc, ch, offerer }
         this.room = room;
+        this.chats = chats;
+        // Replies that may generate at once in this mesh, from the welcome.
+        // Null for no limit.
+        this.maxChats = null;
         this.relayOnly = relayOnly;
         this.linkWait = linkWait;
         this.readyTimeout = readyTimeout;
@@ -354,7 +363,8 @@ export class Mesh {
             if (gone || ws !== this.ws) return;
             this.#kick();
             // `join` is the first message on every socket: it names the mesh.
-            this.#ws({ type: 'join', v: 1, room: this.room.joinToken });
+            this.#ws({ type: 'join', v: 1, room: this.room.joinToken,
+                       ...(this.chats && { chats: this.chats }) });
         });
         ws.addEventListener('message', (e) => {
             if (gone || ws !== this.ws) return;
@@ -727,6 +737,27 @@ export class Mesh {
 
     #live(id) { return this.links.get(id)?.ch?.readyState === 'open'; }
 
+    // Ask the signaling server for a seat before a reply generates. Resolves
+    // { ok, max }: ok false means the mesh already has `max` replies
+    // generating. With no answer within SEAT_WAIT_MS, or no open socket, it
+    // resolves ok, so a signaling hiccup never blocks chatting. One request
+    // at a time: the page sends one prompt at a time.
+    seat() {
+        return new Promise((resolve) => {
+            if (!this.#ws({ type: 'chat-start' })) return resolve({ ok: true, max: this.maxChats });
+            const timer = setTimeout(() => {
+                this.#seating = null;
+                resolve({ ok: true, max: this.maxChats });
+            }, SEAT_WAIT_MS);
+            this.#seating = { resolve, timer };
+        });
+    }
+
+    // The reply has ended: give the seat back.
+    unseat() { this.#ws({ type: 'chat-end' }); }
+
+    #seating = null;
+
     // Messages are dropped, not queued, when the socket is down. Each one
     // describes the roster at the time it was sent and would be stale later.
     // The reconnect re-sends the claim and readiness.
@@ -760,6 +791,7 @@ export class Mesh {
                 // Null if the server does not send one. The loader then uses
                 // /checkpoint.json.
                 weightsUrl: m.weightsUrl ?? null,
+                maxChats: m.maxChats ?? null,
             });
             this.#welcomed();
 
@@ -792,6 +824,11 @@ export class Mesh {
             this.#sync();
             this.#flush();
             this.onChange?.();
+        }
+        if (m.type === 'chat') {
+            const wait = this.#seating;
+            this.#seating = null;
+            if (wait) { clearTimeout(wait.timer); wait.resolve({ ok: m.ok !== false, max: m.max ?? null }); }
         }
         if (m.type === 'offer') this.#answer(m).catch((e) => console.warn(e.message));
         if (m.type === 'answer') this.#answered(m).catch((e) => console.warn(e.message));

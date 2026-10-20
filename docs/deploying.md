@@ -252,6 +252,9 @@ Signaling server environment:
 | `TURN_SECRET`, `TURN_URLS` | unset | your own TURN server: coturn's `static-auth-secret`, and its comma-separated `turn:` URLs. Each peer gets its own 24-hour credential |
 | `TURN_KEY_ID`, `TURN_API_TOKEN` | unset | Cloudflare TURN, used when the two above are unset. Without either kind, the default relay-only links can't open and only `?direct=1` tabs can link |
 | `MAX_ROOMS`, `MAX_PEERS_PER_ROOM` | 1000, 64 | caps on private meshes, and on peers in any one mesh |
+| `MAX_CHATS` | unset (no limit) | replies that may generate at once in the global mesh |
+| `MAX_PRIVATE_CHATS` | unset (no limit) | cap on a private mesh's own limit, and its limit when the creator set none |
+| `CHAT_LEASE_MS` | 600000 | a seat whose `chat-end` never arrives is freed after this long |
 
 Caddy environment: `WEIGHTS_ORIGIN` (default
 `https://weights.chattorrent.net`), and for `Caddyfile.dev`, `CHAT_PASS_HASH`

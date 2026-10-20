@@ -13,12 +13,19 @@ const send = (ws, msg) => ws.readyState === 1 && ws.send(JSON.stringify(msg));
 export class Room {
     // `label` prefixes this room's log lines: '' for the global mesh and
     // `room <tag> ` for a private one. The tag is a hash prefix, not the token.
-    constructor({ label = '', positions, head, minBlocks, maxPeers = Infinity, log = console.log }) {
+    // `maxChats` caps the replies generating at once in this room (Infinity:
+    // no cap). `chatLeaseMs` frees a seat whose `chat-end` never came.
+    constructor({ label = '', positions, head, minBlocks, maxPeers = Infinity,
+                  maxChats = Infinity, chatLeaseMs = 600000, log = console.log }) {
         this.label = label;
         this.positions = positions;
         this.head = head;
         this.minBlocks = minBlocks;
         this.maxPeers = maxPeers;
+        this.maxChats = maxChats;
+        this.chatLeaseMs = chatLeaseMs;
+        // Peers with a reply generating: id -> the lease timer.
+        this.chats = new Map();
         this.log = (line) => log(`${this.label}${line}`);
         // id -> { ws, cap, lo, hi, have, ready, alive }. `lo`/`hi` are null
         // until the peer states a capacity and is placed. A peer with null
@@ -40,6 +47,7 @@ export class Room {
     remove(id) {
         const me = this.peers.get(id);
         if (!this.peers.delete(id)) return;
+        this.#unseat(id);
         this.log(`- peer ${id} ${me ? this.where(me) : ''} (${this.peers.size} online): ${this.health()}`);
         this.broadcast();
     }
@@ -80,7 +88,8 @@ export class Room {
         const now = held.map(served);
         const r = minDepth(now, this.positions);
         const claimed = minDepth(held, this.positions);
-        const tail = claimed === r ? '' : `, claimed r=${claimed}`;
+        const tail = (claimed === r ? '' : `, claimed r=${claimed}`)
+            + (Number.isFinite(this.maxChats) ? `, chats ${this.chats.size}/${this.maxChats}` : '');
         if (covers(now, this.positions)) return `covered, r=${r}${tail}`;
         return `NOT covered, unheld ${gaps(now, this.positions)
             .map(([a, b]) => this.where({ lo: a, hi: b })).join(', ')}${tail}`;
@@ -96,6 +105,15 @@ export class Room {
         if (bHi > bLo) parts.push(bHi - bLo === 1 ? `block ${bLo - 1}` : `blocks ${bLo - 1}–${bHi - 2}`);
         if (p.hi === this.positions) parts.push('head');
         return parts.join(' + ');
+    }
+
+    // The room's limit as sent to pages: a number, or null for none.
+    get chatLimit() { return Number.isFinite(this.maxChats) ? this.maxChats : null; }
+
+    // Free a peer's seat, if it holds one.
+    #unseat(id) {
+        clearTimeout(this.chats.get(id));
+        this.chats.delete(id);
     }
 
     // A requested range (reconnect or `?at=`), or null if it is invalid for
@@ -205,6 +223,26 @@ export class Room {
             }
             return;
         }
+
+        // chat-start: a reply is about to generate. Answered with `chat`,
+        // refused once `maxChats` replies are generating. A peer holds at most
+        // one seat, so asking again while holding one only renews its lease.
+        // chat-end frees it, as does leaving.
+        if (m.type === 'chat-start') {
+            const max = this.chatLimit;
+            if (!this.chats.has(id) && this.chats.size >= this.maxChats) {
+                this.log(`  peer ${id} refused a chat: ${this.chats.size}/${max} running`);
+                send(ws, { type: 'chat', ok: false, max });
+                return;
+            }
+            clearTimeout(this.chats.get(id));
+            const timer = setTimeout(() => this.chats.delete(id), this.chatLeaseMs);
+            timer.unref?.();
+            this.chats.set(id, timer);
+            send(ws, { type: 'chat', ok: true, max });
+            return;
+        }
+        if (m.type === 'chat-end') { this.#unseat(id); return; }
 
         // signal: deliver this SDP to a peer in this room. `mac` is relayed
         // unchanged. It is the sender's seal over the SDP and both ids

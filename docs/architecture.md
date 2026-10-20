@@ -56,8 +56,8 @@ web/profile.js        per-hop timing summary for the mesh page
 The handshake (`signal-server.js`, `net.js`):
 
 ```
-peer   -> join     { v, room }              first, always: a join token, or null (global)
-server -> welcome  { id, blocks, positions, minBlocks, weightsUrl, private, ice, peers }
+peer   -> join     { v, room, chats? }      first, always: a join token, or null (global)
+server -> welcome  { id, blocks, positions, minBlocks, weightsUrl, private, maxChats, ice, peers }
 peer   -> capacity { cap, lo?, hi? }
 server -> assign   { lo, hi }               null/null for a peer holding nothing
 peer   -> have     { have }                 downloaded and warmed up to here
@@ -67,7 +67,23 @@ peer   -> grow     { lo, hi }               widened by one servable position
 peer   -> signal   { to, kind, sdp, mac? }  relayed to `to`, in the same mesh only
 server -> roster   { peers }                broadcast on every change
 server -> ping  /  peer -> pong             every 30 s; two misses drop the peer
+peer   -> chat-start {}                     before a reply generates
+server -> chat     { ok, max }              refused once `max` replies are generating
+peer   -> chat-end {}                       the reply ended
 ```
+
+**Replies at once.** Each mesh caps the replies generating at once. A page asks
+for a seat (`chat-start`) before it shows a prompt and gives it back
+(`chat-end`) when the reply ends. A refused prompt stays in the input with
+"try again in a moment"; nothing reaches a GPU. A peer holds at most one seat,
+and a seat is also freed when its socket closes or after `CHAT_LEASE_MS` (10
+min). The global mesh's cap is `MAX_CHATS`. A private mesh's is chosen by its
+creator (the page's "Private mesh limit", sent as `chats` in the join that
+creates the room, ignored in any other join) and capped by
+`MAX_PRIVATE_CHATS`, which is also the cap when the creator chose none. With no
+answer to `chat-start` within 5 s the page goes ahead, so a signaling hiccup
+never blocks a chat. This is the mesh-level gate; each runner still admits
+sessions by its own frames (see KV cache and admission).
 
 Nothing is sent to a socket until its `join`; one that sends anything else, or
 nothing for 10 s, is closed with code 4001, and a full mesh with 4002. The page

@@ -92,6 +92,7 @@
           <input type="checkbox" id="thinking" autocomplete="off"> thinking
         </label>
         <label title="Stop this tab's background growth once its own VRAM use would exceed this. Blank = no limit: it keeps growing until the GPU is full or this tab holds the whole model. Raising it later lets growth carry on from what this tab already holds.">VRAM limit <input id="vramlimit" type="text" placeholder="e.g. 4gb" autocomplete="off"></label>
+        <label id="meshchatsLabel" title="Replies that can generate at once in a private mesh you create with Create private mesh. Blank = no limit (the server may still cap it).">Private mesh limit <input id="meshchats" type="number" min="1" step="1" placeholder="no limit" autocomplete="off"></label>
         <span class="grow"></span>
         <span class="hint">Enter sends · Shift+Enter newline</span>
       </div>

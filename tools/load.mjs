@@ -195,6 +195,9 @@ const turn = async ({ text, tokens, timeout }) => {
 
     const failed = errs.find((e) => /generation failed/.test(e)) ?? errs[0] ?? null;
     const outcome = timedOut ? 'timeout'
+        // The mesh's limit on replies at once (signal-room.js): refused
+        // before anything reached a GPU.
+        : failed && /limit of \d+ replies/.test(failed) ? 'full'
         // A peer with no free frame, page or queue slot (stage.js's
         // #atCapacity). The page reports it and the visitor must ask again.
         : failed && /try again in a moment/.test(failed) ? 'busy'
