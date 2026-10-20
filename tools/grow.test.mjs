@@ -9,7 +9,7 @@
 // The Runner is the real one from web/model/stage.js on tools/stub-gpu.mjs.
 
 import { Runner } from '../web/model/stage.js';
-import { makeGpu, D, L, N, weightsFor } from './stub-gpu.mjs';
+import { makeGpu, D, L, N, weightsFor, pieceFor } from './stub-gpu.mjs';
 import { Mesh } from '../web/net.js';
 import { N_MAX, SLOTS, positions } from '../web/split.js';
 
@@ -41,7 +41,7 @@ const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
 // below land synchronously inside forTest(). A real peer is idle like this by
 // the time it has downloaded a claim; in a fresh Node process performance.now()
 // is only a few hundred ms, so the default 0 would not be idle enough.
-function grower({ vramLimit, grow = true }) {
+function grower({ vramLimit, grow = true, load = null, growRetryMs }) {
     const net = new Mesh({});
     net.ready.catch(() => {});
     Object.assign(net, {
@@ -57,7 +57,7 @@ function grower({ vramLimit, grow = true }) {
 
     const events = [];
     const engine = Engine.forTest({
-        net, router: null, runner, dims: D, device, vramLimit, grow,
+        net, router: null, runner, dims: D, device, vramLimit, grow, load, growRetryMs,
         onEvent: (type, detail) => events.push({ type, detail }),
     });
     const notes = () => events.filter((e) => e.type === 'status').map((e) => e.detail.text);
@@ -143,6 +143,38 @@ console.log('\nclearing the limit wakes the parked loop, which takes a step');
     await settle();
     ok('a later raise does not restart a loop that failed', notes().length === after,
         JSON.stringify(notes().slice(after)));
+}
+
+console.log('\na download that stalls is retried, and growth carries on');
+{
+    // The first two attempts at each position stall, as block_43.bin did on a
+    // rented peer; the third succeeds.
+    const tries = new Map();
+    const load = async (p) => {
+        const n = (tries.get(p) ?? 0) + 1;
+        tries.set(p, n);
+        if (n <= 2) throw new Error(`block_${p - 1}.bin: no data for 20000ms`);
+        return pieceFor(p);
+    };
+    const { runner, notes, events } = grower({ vramLimit: Infinity, load, growRetryMs: [10, 20] });
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    ok('the stall is reported as a retry, not a stop',
+        notes().some((t) => /^Downloading .* failed .*Trying again in/.test(t))
+        && !notes().some((t) => /^Stopped growing/.test(t)), JSON.stringify(notes()));
+    ok('and growth went on past it', events.some((e) => e.type === 'grow'),
+        JSON.stringify(events.map((e) => e.type)));
+    ok('to positions it had to retry', runner.lo < 2 || runner.hi > 4,
+        `holds ${runner.lo}-${runner.hi}`);
+}
+
+console.log('\na GPU out of memory still ends growth');
+{
+    const load = async () => { throw new Error('w.bin: GPU ran out of memory uploading its tensors'); };
+    const { notes, events } = grower({ vramLimit: Infinity, load, growRetryMs: [10, 20] });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    ok('it stops, once', notes().filter((t) => /^Stopped growing/.test(t)).length === 1, JSON.stringify(notes()));
+    ok('without a retry', !notes().some((t) => /Trying again/.test(t)), JSON.stringify(notes()));
+    ok('and nothing grown', !events.some((e) => e.type === 'grow'));
 }
 
 console.log('\na tab pinned by ?at=/?blocks=/?gb= has no loop to wake');

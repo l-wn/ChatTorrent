@@ -25,6 +25,11 @@ import { blockBytes, endBytes, floorBlocks, positions, describeRange, N_MAX, SLO
 // downloads and warm-ups do not compete with live chats.
 const GROWTH_QUIET_MS = 2000;
 
+// A growth step whose download fails is retried after this long, doubling up
+// to the second value, while the tab keeps serving what it has. Only a GPU out
+// of memory or a permanent failure (a 4xx) ends growth.
+const GROW_RETRY_MS = [15_000, 300_000];
+
 // Bytes formatted as the VRAM pill shows them (web/peer.js's refresh), so a
 // status note and the pill print the same number the same way.
 const gib = (b) => `${(b / 2 ** 30).toFixed(2)} GiB`;
@@ -60,6 +65,8 @@ export class Engine {
     #lastProfile = null;     // { level, samples }: one sample per job of the last generate()
     #gpuLabel = null;        // this tab's adapter name, reported on a profiled hop
     #onEvent;
+    #growRetryMs = GROW_RETRY_MS;
+    #loadOverride = null;    // test-only replacement for #load
 
     constructor({ onEvent = () => {} } = {}) {
         this.#onEvent = onEvent;
@@ -71,10 +78,15 @@ export class Engine {
     //
     // `grow` starts the background growth loop that serve() starts once a
     // claim is downloaded, on `device`/`dims`. `vramLimit` is applied first, so
-    // the limit decides the first step.
+    // the limit decides the first step. `load` replaces the download of one
+    // position and `growRetryMs` the retry delays, so a test can make a
+    // growth download fail and then succeed.
     static forTest({ net, router, runner = null, dims = null, device = null,
-                     vramLimit = Infinity, grow = false, onEvent = () => {} } = {}) {
+                     vramLimit = Infinity, grow = false, onEvent = () => {},
+                     load = null, growRetryMs = GROW_RETRY_MS } = {}) {
         const engine = new Engine({ onEvent });
+        engine.#loadOverride = load;
+        engine.#growRetryMs = growRetryMs;
         engine.#net = net;
         engine.#router = router;
         engine.#runner = runner;
@@ -337,7 +349,9 @@ export class Engine {
 
     // After the initial claim is downloaded, add one position at a time toward
     // the less-covered neighbour (alternating on a tie) whenever the runner
-    // has been idle. Stops when an allocation fails or the whole model is held.
+    // has been idle. Stops when an allocation fails, a download fails for good
+    // (a 4xx), or the whole model is held. A download that fails for any
+    // other reason is retried (#loadForGrowth).
     // At the VRAM limit it pauses instead, and setVramLimit() wakes it, so a
     // raised limit resumes growth from the holding already in VRAM.
     async #growClaim(device, d) {
@@ -349,7 +363,7 @@ export class Engine {
             if (!r) return;
             if (r.lo === 0 && r.hi === N) {
                 this.#emit('status', {
-                    text: `Holding the whole of ${manifest.model}. Nothing left to grow into.`,
+                    text: `Holding the whole of ${manifest?.model ?? 'the model'}. Nothing left to grow into.`,
                 });
                 return;
             }
@@ -412,7 +426,7 @@ export class Engine {
                         `${p} (${(oom ?? validation).message || 'out of memory'})`);
                 }
 
-                const weights = await this.#load(device, d, p);
+                const weights = await this.#loadForGrowth(device, d, p, r);
 
                 if (dir === 'left') {
                     r.prepend(weights, reserved);
@@ -441,11 +455,36 @@ export class Engine {
         }
     }
 
+    // Download one position for a growth step. A failed download (a stall, a
+    // dropped connection, a 5xx) is retried with backoff, keeping the KV
+    // already reserved for it, while the tab serves what it has. A GPU out of
+    // memory, a permanent failure, or a replaced runner ends the step.
+    async #loadForGrowth(device, d, p, r) {
+        const L = d.n_layer;
+        let wait = this.#growRetryMs[0];
+        for (;;) {
+            try {
+                return await this.#load(device, d, p);
+            } catch (err) {
+                if (err.permanent || /ran out of memory/.test(err.message) || this.#runner !== r) throw err;
+                this.#emit('status', {
+                    text: `Downloading ${describeRange(p, p + 1, L)} failed (${err.message}). ` +
+                        `Trying again in ${Math.round(wait / 1000)}s; this tab keeps serving ` +
+                        `${describeRange(r.lo, r.have, L)}.`,
+                });
+                await new Promise((resolve) => setTimeout(resolve, wait));
+                if (this.#runner !== r) throw err;
+                wait = Math.min(wait * 2, this.#growRetryMs[1]);
+            }
+        }
+    }
+
     // Upload one position's weights. An end loads only what it needs: `wte`
     // for the embedding, the final norm and LM head for the head. It reuses
     // tensors the runner already holds, so a peer holding both ends stores a
     // tied table once.
     #load(device, d, p, onBytes) {
+        if (this.#loadOverride) return this.#loadOverride(p);
         const { manifest, baseUrl } = this;
         const have = this.#runner?.w;
         if (p === 0) return loadEmbed(device, { baseUrl, manifest, d, onBytes, have });

@@ -109,9 +109,18 @@ export class Runner {
         // Jobs run() has accepted and not yet settled, by session. A session
         // with any is not idle, however long its job waits in the queue.
         this.pending = new Map();
-        // Milliseconds per position for one decode token, averaged. Null
-        // until the first decode job. route.js compares peers' speeds with it.
+        // Milliseconds per position for one token, averaged. Seeded from the
+        // warm-up passes, then measured on real decode tokens. Null until
+        // either has run. route.js compares peers' speeds with it.
         this.msPerPos = null;
+        this.warmups = 0;           // warm-up passes run; the first compiles shaders
+        this.decoded = false;       // whether msPerPos comes from decode tokens
+        // The part of a decode job that does not scale with positions:
+        // reading back, sampling at the head, logging the hand-off. Averaged,
+        // null until the first decode. With msPerPos it gives a job's cost.
+        this.overheadMs = null;
+        // How long jobs have waited in this runner's queue lately, averaged.
+        this.waitMs = 0;
         // When the last non-warm-up job ran. 0 until the first one.
         this.lastJobAt = 0;
 
@@ -424,6 +433,12 @@ export class Runner {
 
             const ms = performance.now() - t0;
             const blocks = r.at - from;
+            // A speed estimate for routing before any real token. The first
+            // pass compiles the shaders, so it is skipped.
+            if (this.warmups++ > 0 && !this.decoded && blocks > 0) {
+                const per = ms / blocks;
+                this.msPerPos = this.msPerPos == null ? per : 0.8 * this.msPerPos + 0.2 * per;
+            }
             return { blocks, ms, blocksPerSec: ms > 0 ? (blocks * 1000) / ms : 0 };
         } finally {
             this.cuts.delete(s);
@@ -489,14 +504,25 @@ export class Runner {
     // This peer's active work: the positions it runs per token, summed over
     // sessions with a job here or one within ACTIVE_MS. route.js reports it
     // in acks, so the peers handing work here can balance new sessions.
-    get load() {
+    get load() { return this.#activity().w; }
+
+    // How many sessions `load` counts: each costs one job's overhead per
+    // token, whatever its width.
+    get active() { return this.#activity().n; }
+
+    // How long a job arriving now would wait, by recent jobs. Zero once the
+    // runner has been quiet for ACTIVE_MS.
+    get queueMs() { return performance.now() - this.lastJobAt < ACTIVE_MS ? this.waitMs : 0; }
+
+    #activity() {
         const now = performance.now();
-        let n = 0;
+        let n = 0, w = 0;
         for (const [s, frame] of this.live) {
             if (!this.pending.has(s) && now - (frame.lastUse ?? 0) >= ACTIVE_MS) continue;
-            for (const [at, to] of this.cuts.get(s) ?? []) n += to - at;
+            n++;
+            for (const [at, to] of this.cuts.get(s) ?? []) w += to - at;
         }
-        return n;
+        return { n, w };
     }
 
     // The first live session idle for at least `idleMs`, or null if none is.
@@ -811,10 +837,6 @@ export class Runner {
         s.readback.unmap();
         const t4 = performance.now();
         const gpu = prof?.collect();
-        if (T === 1 && !h.replay && h.s !== WARMUP) {
-            const per = (t3 - t0) / (to - at);
-            this.msPerPos = this.msPerPos == null ? per : 0.9 * this.msPerPos + 0.1 * per;
-        }
 
         // Where this job's time went, on this machine's clock. `encode` is the
         // CPU cost of launching the work (cache lookup, uploads, recording
@@ -836,10 +858,27 @@ export class Runner {
             // (route.js's jobOpts()).
             const token = sampleFromLogitsRow(out, h.opts);
             phases.sample = ms(t4, performance.now());
+            this.#timed(h, queuedAt, t0, t3, to - at);
             return { at: to, token, phases, ...(gpu && { gpu }) };
         }
         this.#log(h.s, to, h.past, out);
         phases.log = ms(t4, performance.now());
+        this.#timed(h, queuedAt, t0, t3, to - at);
         return { at: to, hidden: out, phases, ...(gpu && { gpu }) };
+    }
+
+    // Update the timings route.js balances on, after a job. `t0` is when it
+    // left the queue and `t3` when its readback mapped; what follows is the
+    // part that does not scale with positions.
+    #timed(h, queuedAt, t0, t3, positions) {
+        if (h.s === WARMUP || h.replay) return;
+        this.waitMs = 0.8 * this.waitMs + 0.2 * (t0 - queuedAt);
+        if (h.n !== 1 || positions < 1) return;
+        const per = (t3 - t0) / positions;
+        const over = performance.now() - t3;
+        // The first decode token replaces the warm-up estimate.
+        this.msPerPos = this.decoded ? 0.9 * this.msPerPos + 0.1 * per : per;
+        this.overheadMs = this.overheadMs == null ? over : 0.9 * this.overheadMs + 0.1 * over;
+        this.decoded = true;
     }
 }

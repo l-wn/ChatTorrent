@@ -156,6 +156,8 @@ const turn = async ({ text, tokens, timeout }) => {
     const errors = () => [...document.querySelectorAll('#messages .msg.note.err')];
     const notes = () => [...document.querySelectorAll('#messages .msg.note:not(.err)')];
     const errsBefore = errors().length, notesBefore = notes().length;
+    const replies = () => [...document.querySelectorAll('#messages .msg.model')];
+    const repliesBefore = replies().length;
 
     // The composer can be disabled between turns (a peer left and the model is
     // not covered, or the signaling socket is reconnecting). Wait for it, as a
@@ -172,7 +174,6 @@ const turn = async ({ text, tokens, timeout }) => {
     $('send').click();
     if ($('stop').hidden) return { outcome: 'not-sent', error: $('status').textContent };
 
-    const reply = [...document.querySelectorAll('#messages .msg.model')].pop();
     let first = null, last = null, n = 0, timedOut = false;
     while (!$('stop').hidden) {
         const now = performance.now();
@@ -186,6 +187,9 @@ const turn = async ({ text, tokens, timeout }) => {
         await new Promise((r) => setTimeout(r, 25));
     }
     const end = performance.now();
+    // This turn's reply, if one was shown. Read after the turn, since the page
+    // first asks the signaling server for a seat and adds the bubble after.
+    const reply = replies().length > repliesBefore ? replies().at(-1) : null;
 
     const errs = errors().slice(errsBefore).map((e) => e.textContent.trim());
     const told = notes().slice(notesBefore).map((e) => e.textContent);

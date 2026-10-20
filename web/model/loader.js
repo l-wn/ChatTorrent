@@ -57,9 +57,12 @@ export function activeWeights() {
                 `it names the checkpoint this deploy runs`);
         }
         if (!r.ok) {
-            throw new Error(`${CHECKPOINT_URL}: ${r.status}. This file names the ` +
+            const err = new Error(`${CHECKPOINT_URL}: ${r.status}. This file names the ` +
                 `checkpoint every page loads. It is at the repo root, next to ` +
                 `signal-server.js, and is committed (weights/ is not).`);
+            // The rejection is cached above, so this page never asks again.
+            err.permanent = true;
+            throw err;
         }
         const cfg = await r.json();
         if (typeof cfg.url !== 'string' || !cfg.url) {
@@ -357,7 +360,7 @@ async function fetchRange(url, from, to, { retries = 4, stallMs } = {}) {
         } catch (err) {
             lastErr = err;
         }
-        if (permanent) throw lastErr;
+        if (permanent) { lastErr.permanent = true; throw lastErr; }
         // A longer backoff than fetchRetry's 500ms base: these failures are
         // usually a saturated uplink.
         if (attempt < retries) {

@@ -302,17 +302,27 @@ lets the mesh route around a hole.
 
 Under load it balances. Among the exits whose next peer reaches as far as the
 furthest exit's would, so balancing never adds a hop, it picks the one where
-the busier of the two peers ends up carrying least:
-`max((w_me + mine) * p_me, (w_next + theirs) * p_next)`. `w` is a peer's
-active work in positions per token (`Runner.load`: the cut widths of sessions
-that ran within `ACTIVE_MS`, 5 s, or have a job queued) and `p` its measured ms
-per position (`Runner.msPerPos`); without a `p` for every peer compared, work
-is counted in positions. Every ack carries the receiver's `w` and `p`, so a
-peer learns the load of exactly the peers it hands work to, once per token. A
-report older than 10 s, or none, counts as idle. Sessions planned but not yet
-run, and work just sent to a peer that has not acked since, count for 2 s, so a
-burst of new chats does not all go one way. With two overlapping peers, new
-chats move the cut within the overlap until their work evens out.
+the busier of the two peers ends up carrying least. A peer's busy time per
+token round is `n * o + w * p`: `n` active sessions (`Runner.active`: those
+that ran within `ACTIVE_MS`, 5 s, or have a job queued), `w` the positions they
+run there (`Runner.load`), `p` its ms per position (`Runner.msPerPos`), and `o`
+its fixed ms per job (`Runner.overheadMs`: reading back, sampling at the head,
+logging the hand-off). The fixed part is why a path through fewer, larger
+holders is cheaper. `p` is seeded from the warm-up pass each loaded position
+gets (the first, which compiles shaders, is skipped); real decode tokens
+replace it and measure `o`. Until every peer compared has a `p`, the idle path
+is taken: counted in positions, a slow peer would look as fast as a quick one.
+An earlier exit, which hands the next peer more, is skipped when that peer's
+measured queue wait (`Runner.queueMs`) is more than 20 ms longer than mine:
+the queue is measured, the model is an estimate.
+
+Every ack carries the receiver's `w`, `n`, `p`, `o` and `q` (its queue wait),
+so a peer learns the load of exactly the peers it hands work to, once per
+token. A report older than 10 s, or none, counts as idle. Sessions planned
+but not yet run, and sessions just sent to a peer, count for 2 s, since the
+ack is sent before the job runs and does not include them yet. When several
+peers hold the next position, `hops()` ranks them by the same cost plus each
+link's measured ack round trip.
 
 **Cuts** (`Runner.#exit`): `plan()` is a proposal. The first job of a session
 entering a peer at a given cursor pins where that session leaves; later jobs

@@ -24,6 +24,11 @@ const LOAD_TTL_MS = 10_000;
 // until its next ack, so a burst of new sessions does not all go one way.
 const ASSIGN_TTL_MS = 2000;
 
+// plan() never hands more work to a peer whose queue is this much longer than
+// its own, whatever the cost model says. The queue is what is measured; the
+// model is an estimate.
+const QUEUE_SLACK_MS = 20;
+
 const ROUTES = 128;        // (session, boundary) pairs a peer pins a hop for
 
 // The enqueuer's timeout for one job, end to end. Per-hop acks detect most
@@ -154,6 +159,7 @@ export function makeRouter({
                                     // its ms per position, when it last acked
     const assigned = new Map();    // peer -> { n, at }: positions routed to it since
                                     // its last ack
+    const rtts = new Map();        // peer -> averaged ack round trip, ms
     const planned = new Map();     // session -> { n, at }: positions I chose to run for
                                     // it, until its cut exists here
     const senders = new Map();     // session -> Set of peers that handed me a job
@@ -281,56 +287,69 @@ export function makeRouter({
     }
 
     // Ready holders of `pos`, best first: an open link (ICE costs a second),
-    // then the least loaded, then the one that reaches furthest. With no load
-    // reported anywhere, that is reach alone. Never me: I either declined
-    // this job in route() or chose to stop here.
+    // then the least loaded, then the one that reaches furthest. With every
+    // speed known, "least loaded" is in ms and includes the link's measured
+    // round trip, which a token pays on every hop. With no load reported
+    // anywhere, that is reach alone. Never me: I either declined this job in
+    // route() or chose to stop here.
     function rankAt(pos) {
         const ids = net.next(pos).filter((id) => id !== net.id);
         const ls = new Map(ids.map((id) => [id, loadOf(id)]));
         const timed = ids.every((id) => ls.get(id).p != null);
-        const rank = (id) => [net.linked(id) ? 0 : 1, cost(ls.get(id), 0, timed),
-                              -net.reach(id, pos), id];
+        const busy = (id) => cost(ls.get(id), 0, 0, timed) + (timed ? rtts.get(id) ?? 0 : 0);
+        const rank = (id) => [net.linked(id) ? 0 : 1, busy(id), -net.reach(id, pos), id];
         return ids.sort((a, b) => {
             const [x, y] = [rank(a), rank(b)];
             return (x[0] - y[0]) || (x[1] - y[1]) || (x[2] - y[2]) || (x[3] - y[3]);
         });
     }
 
-    // A peer's active work in positions (`w`) and its ms per position (`p`,
-    // null if unknown). Mine from my runner; another's from its last ack,
-    // plus what I routed to it since. A report older than LOAD_TTL_MS, or
-    // none (an older page), counts as idle.
+    // A peer's load: active sessions (`n`) and the positions they run there
+    // (`w`), its ms per position (`p`, null if unknown), its fixed ms per job
+    // (`o`) and how long jobs wait in its queue (`q`). Mine from my runner;
+    // another's from its last ack, plus what I routed to it in the last
+    // ASSIGN_TTL_MS, which its report may not include yet. A report older
+    // than LOAD_TTL_MS, or none (an older page), counts as idle.
     function loadOf(id) {
+        const now = performance.now();
         if (id === net.id) {
             const r = runner();
             // Sessions planned here but not yet run count too, so a burst of
             // new chats does not all see an idle peer.
-            const now = performance.now();
-            let w = r?.load ?? 0;
+            let n = r?.active ?? 0, w = r?.load ?? 0;
             for (const [s, x] of planned) {
                 if (now - x.at >= ASSIGN_TTL_MS || r?.cuts?.has(s)) planned.delete(s);
-                else w += x.n;
+                else { n++; w += x.n; }
             }
-            return { w, p: r?.msPerPos ?? null };
+            return { n, w, p: r?.msPerPos ?? null, o: r?.overheadMs ?? 0, q: r?.queueMs ?? 0 };
         }
-        const now = performance.now();
         const l = loads.get(id);
         const fresh = l && now - l.at < LOAD_TTL_MS;
         const a = assigned.get(id);
-        const extra = a && now - a.at < ASSIGN_TTL_MS ? a.n : 0;
-        return { w: (fresh ? l.w : 0) + extra, p: fresh ? l.p ?? null : null };
+        const recent = a && now - a.at < ASSIGN_TTL_MS;
+        return {
+            n: (fresh ? l.n : 0) + (recent ? a.n : 0),
+            w: (fresh ? l.w : 0) + (recent ? a.w : 0),
+            p: fresh ? l.p : null, o: fresh ? l.o : 0, q: fresh ? l.q : 0,
+        };
     }
 
-    // A peer's work per token round, in ms when every peer compared has a
-    // measured speed, otherwise in positions.
-    const cost = (l, more, timed) => (l.w + more) * (timed ? l.p : 1);
+    // A peer's busy time per token round if it takes `more` positions in
+    // `extra` more sessions: each session costs the fixed per-job part, and
+    // each position the per-position part. So a path through fewer peers
+    // pays fewer fixed parts. In positions when a speed is unknown.
+    const cost = (l, more, extra, timed) => timed
+        ? (l.n + extra) * l.o + (l.w + more) * l.p
+        : l.w + more;
 
-    // Count `n` positions as on their way to `id` until it next acks.
-    function assign(id, n) {
+    // Count a session of `w` positions as on its way to `id`. Kept for
+    // ASSIGN_TTL_MS, past its next ack: the ack is sent before the job runs,
+    // so it does not include the new session yet.
+    function assign(id, w) {
         const now = performance.now();
         const a = assigned.get(id);
-        const prior = a && now - a.at < ASSIGN_TTL_MS ? a.n : 0;
-        assigned.set(id, { n: prior + n, at: now });
+        const prior = a && now - a.at < ASSIGN_TTL_MS ? a : { n: 0, w: 0 };
+        assigned.set(id, { n: prior.n + 1, w: prior.w + w, at: now });
     }
 
     // Every per-boundary map is capped at ROUTES, oldest out first.
@@ -570,9 +589,13 @@ export function makeRouter({
             // (`from == null`) or a replay; nobody waits on those.
             if (from != null && !h.replay) {
                 const r = runner();
+                const round = (x) => Math.round(x * 100) / 100;
                 net.send(from, { k: 'ack', s: h.s, to: from, at: h.pos,
-                                 ...(Number.isFinite(r?.load) && { w: r.load }),
-                                 ...(r?.msPerPos != null && { p: Math.round(r.msPerPos * 1000) / 1000 }) });
+                                 ...(Number.isFinite(r?.load) && {
+                                     w: r.load, n: r.active, q: round(r.queueMs),
+                                     ...(r.msPerPos != null && { p: round(r.msPerPos) }),
+                                     ...(r.overheadMs != null && { o: round(r.overheadMs) }),
+                                 }) });
             }
             return runJob(h, payload, from);
         }
@@ -580,8 +603,9 @@ export function makeRouter({
         if (h.k === 'ack') {
             // The receiver's load, which plan() and rankAt() balance on.
             if (from != null && Number.isFinite(h.w)) {
-                loads.set(from, { w: h.w, p: Number.isFinite(h.p) ? h.p : null, at: performance.now() });
-                assigned.delete(from);
+                const num = (x, d) => Number.isFinite(x) ? x : d;
+                loads.set(from, { w: h.w, n: num(h.n, 0), p: num(h.p, null), o: num(h.o, 0),
+                                  q: num(h.q, 0), at: performance.now() });
             }
             const key = `${h.s}|${h.at}`;
             const w = acks.get(key);
@@ -593,6 +617,8 @@ export function makeRouter({
                 // this boundary (runJob), since this job's trace has left.
                 const rtt = Math.round((performance.now() - w.sentAt) * 100) / 100;
                 put(links, key, { ...links.get(key), rtt });
+                const prev = rtts.get(from);
+                rtts.set(from, prev == null ? rtt : 0.8 * prev + 0.2 * rtt);
                 clearAck(key);
             }
             return;
@@ -755,13 +781,21 @@ export function makeRouter({
         };
         if (me.w === 0 && them.every((l) => l.w === 0)) return take(far);
 
-        // The exit after which the busier of the two carries least. Ties go
-        // to the further exit, which `ok` lists first.
+        // Balancing needs every peer's measured speed. Counted in positions,
+        // a slow peer looks as fast as a quick one, so until then the path is
+        // the idle one.
         const timed = me.p != null && them.every((l) => l.p != null);
+        if (!timed) return take(far);
+
+        // The exit after which the busier of the two carries least. Ties go
+        // to the further exit, which `ok` lists first. An earlier exit hands
+        // the next peer more, so it is skipped when that peer's queue is
+        // already longer than mine.
         let best = 0, score = Infinity;
         ok.forEach((c, i) => {
-            const x = Math.max(cost(me, c.at - pos, timed),
-                               cost(them[i], net.reach(c.who, c.at), timed));
+            if (c !== far && them[i].q > me.q + QUEUE_SLACK_MS) return;
+            const x = Math.max(cost(me, c.at - pos, 1, true),
+                               cost(them[i], net.reach(c.who, c.at), 1, true));
             if (x < score) { best = i; score = x; }
         });
         return take(ok[best]);

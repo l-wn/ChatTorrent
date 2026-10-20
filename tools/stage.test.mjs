@@ -988,6 +988,17 @@ console.log('\nload: the work a peer reports for routing');
     await r.release('a');
     eq('a chat that ended no longer counts', r.load, 2);
 }
+{
+    const r = new Runner(device, D, weightsFor(0, 4),
+        { lo: 0, hi: 4, nMax: 16, tMax: 4, slots: 2, idleMs: 0 });
+    await r.warmup(0, 1);
+    eq('the first warm-up compiles shaders and sets no speed', r.msPerPos, null);
+    await r.warmup(1, 2);
+    ok('later warm-ups give a first estimate', r.msPerPos > 0, `${r.msPerPos}`);
+    r.msPerPos = 1000;                     // so the replacement below is visible
+    await r.run({ k: 'job', s: 'a', pos: 0, past: 0, n: 1, ids: [1], opts: {} }, null, 2);
+    ok('and the first decode token replaces it', r.msPerPos < 1000, `${r.msPerPos}`);
+}
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

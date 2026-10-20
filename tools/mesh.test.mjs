@@ -133,6 +133,9 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0) {
         get cuts() { return real.cuts; },
         get load() { return real.load; },
         get msPerPos() { return real.msPerPos; },
+        get overheadMs() { return real.overheadMs; },
+        get active() { return real.active; },
+        get queueMs() { return real.queueMs; },
         resetTrace, takeTrace,
         holds: (p) => real.holds(p),
         append: (w) => real.append(w),
@@ -2570,14 +2573,20 @@ console.log('\nload-aware routing: sessions spread across peers that overlap');
         ok('idle: nothing left running', await quiet(w));
     }
 
-    // Busy: four chats at once. Peer 0 alone holds the embedding, so it would
-    // run 0-5 for all of them. Balanced, later sessions leave it early and
-    // peer 1 takes more of the overlap.
+    // Busy: four chats at once on a mesh already in use. Peer 0 alone holds
+    // the embedding, so it would run 0-5 for all of them. Balanced, later
+    // sessions leave it early and peer 1 takes more of the overlap. The peers
+    // warm up as loading does, which gives each a speed, and one chat runs
+    // first, whose acks tell peer 0 peer 1's speed and load.
     {
         const w = new World({ maxRepairs: 200 });
-        const cutsAt0 = recordCuts(w.join(0, 0, 6, { slots: 4 }));
-        w.join(1, 2, N, { slots: 4 });
+        const p0 = w.join(0, 0, 6, { slots: 5 });
+        const p1 = w.join(1, 2, N, { slots: 5 });
+        for (const t of [p0, p1]) for (let i = 0; i < 2; i++) await t.runner.real.warmup(t.runner.lo, t.runner.lo + 1);
+        ok('busy: warm-ups gave both peers a speed', p0.runner.msPerPos > 0 && p1.runner.msPerPos > 0);
         for (const id of [0, 1]) w.slow(id, 1);
+        await streamed(w.join(99), prompts[0], 10);
+        const cutsAt0 = recordCuts(p0);
         const askers = prompts.map((_, i) => w.join(100 + i));
         const got = await Promise.all(askers.map((a, i) => streamed(a, prompts[i], 10)));
         eq('busy: every reply is its own', got, controls);
@@ -2587,6 +2596,32 @@ console.log('\nload-aware routing: sessions spread across peers that overlap');
             cuts.reduce((n, c) => n + (N - c), 0) / cuts.length > N - 6, JSON.stringify(cuts));
         eq('busy: no ledger violations', w.violations, []);
         ok('busy: nothing left running', await quiet(w));
+    }
+
+    // A busy mesh where the next peer only looks cheaper per position. Peer 1
+    // holds the head, whose fixed cost per job (readback, sampling) dwarfs
+    // its share of positions, as on the 3090 + 4000 Ada mesh. Moving the cut
+    // earlier would hand it more, so every session keeps the furthest exit.
+    // Then the same mesh with the model made to favour peer 1 but its queue
+    // already long: the queue guard keeps the furthest exit too.
+    for (const [label, fixed] of [['a heavy head', { 0: [1, 0, 0], 1: [0.5, 50, 0] }],
+                                  ['a long queue', { 0: [1, 0, 0], 1: [0.01, 0, 100] }]]) {
+        const w = new World({ maxRepairs: 200 });
+        const p0 = w.join(0, 0, 6, { slots: 5 });
+        const p1 = w.join(1, 2, N, { slots: 5 });
+        for (const [t, [p, o, q]] of [[p0, fixed[0]], [p1, fixed[1]]]) {
+            Object.defineProperty(t.runner, 'msPerPos', { get: () => p });
+            Object.defineProperty(t.runner, 'overheadMs', { get: () => o });
+            Object.defineProperty(t.runner, 'queueMs', { get: () => q });
+        }
+        for (const id of [0, 1]) w.slow(id, 1);
+        await streamed(w.join(99), prompts[0], 10);
+        const cutsAt0 = recordCuts(p0);
+        const askers = prompts.map((_, i) => w.join(100 + i));
+        const got = await Promise.all(askers.map((a, i) => streamed(a, prompts[i], 10)));
+        eq(`${label}: every reply is its own`, got, controls);
+        eq(`${label}: no session is moved onto the busier peer`, [...new Set(cutsAt0())], [6]);
+        ok(`${label}: nothing left running`, await quiet(w));
     }
 
     // Never an extra hop. Peer 1 holds a short stretch that would need a
