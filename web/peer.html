@@ -91,7 +91,7 @@
         <label id="thinkingLabel" title="Qwen's reasoning mode - off answers faster with no &lt;think&gt; text" hidden>
           <input type="checkbox" id="thinking" autocomplete="off"> thinking
         </label>
-        <label title="Stop this tab's background growth once its own VRAM use would exceed this. Blank = no limit: it keeps growing until the GPU is full or this tab holds the whole model.">VRAM limit <input id="vramlimit" type="text" placeholder="e.g. 4gb" autocomplete="off"></label>
+        <label title="Stop this tab's background growth once its own VRAM use would exceed this. Blank = no limit: it keeps growing until the GPU is full or this tab holds the whole model. Raising it later lets growth carry on from what this tab already holds.">VRAM limit <input id="vramlimit" type="text" placeholder="e.g. 4gb" autocomplete="off"></label>
         <span class="grow"></span>
         <span class="hint">Enter sends · Shift+Enter newline</span>
       </div>

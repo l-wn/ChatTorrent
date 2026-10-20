@@ -66,7 +66,7 @@ export function groupByDay(recs, now = Date.now()) {
 export function memoryBackend() {
     const recs = new Map();
     return {
-        async list(mesh) { return [...recs.values()].filter((r) => r.mesh === mesh).map(structuredClone); },
+        async list(mesh) { return [...recs.values()].filter((r) => r.mesh === mesh).map((r) => structuredClone(r)); },
         async get(id) { return recs.has(id) ? structuredClone(recs.get(id)) : null; },
         async put(rec) { recs.set(rec.id, structuredClone(rec)); },
         async delete(id) { recs.delete(id); },

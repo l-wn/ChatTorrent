@@ -15,6 +15,10 @@
 //                           peer.html exposes as ?at=). Fixed placement makes
 //                           a topology reproducible.
 //   blocks=N                offer this capacity and let the server place it
+//   vramlimit=bytes         set the VRAM limit before serving, as the welcome
+//                           popup does on peer.html. 0 pauses background growth
+//                           at its first step whatever the model's size. Raise
+//                           it again with harness.setVramLimit.
 //   wire=bc                 use a BroadcastChannel in place of the datachannel
 //   label=name              this peer's name in the report
 //   mesh=<secret>           join this private mesh (web/room.js). Passed in
@@ -136,6 +140,11 @@ export async function boot() {
         // refused (split.js's WAIT_MS). Set to 0 by the scenarios that test
         // the refusal.
         const waitMs = q.has('wait') ? Number(q.get('wait')) : undefined;
+        // Set before serve(), as peer.js does with the welcome popup's answer.
+        // It has to be in place before #growClaim starts: a Runner that has run
+        // no job counts as idle, so the first growth step is taken with no
+        // GROWTH_QUIET_MS wait, and a limit set after boot() resolves races it.
+        if (q.has('vramlimit')) engine.setVramLimit(Number(q.get('vramlimit')));
         const r = await engine.serve({ at: placement(), blocks, sessions, pageTokens, floor, waitMs });
         Object.assign(out, { role: r.role, held: r.held, note: r.note, error: r.error });
         // The adapter this tab got. A headless Chrome without the Vulkan flags
@@ -297,6 +306,14 @@ export const api = {
     // Polled by the driver during a long run, so a stalled soak is noticed
     // before the timeout.
     progress: () => ({ ...progress, label: LABEL, id: engine.net?.id ?? null }),
+
+    // The VRAM limit, as peer.html's field sets it. `null` is the blank field:
+    // no limit. JSON has no Infinity, so the driver sends null. Returns what
+    // this peer holds, in MiB, so a caller can compare it against a later read.
+    setVramLimit(bytes = null) {
+        engine.setVramLimit(bytes ?? Infinity);
+        return Math.round(engine.vramBytes / 2 ** 20);
+    },
 
     // This peer's state at the end. The runner numbers show whether there was
     // KV pressure: `live` is how many sessions hold frames and `slots` is how

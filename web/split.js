@@ -114,22 +114,36 @@ export const costDims = (m) => ({
     stored: m.stored ?? storedBytes(m),
 });
 
+// Sums tensor entries, including a q8 tensor's scales.
+const sumEntries = (entries) =>
+    (entries ?? []).reduce((n, e) => n + e.size + (e.scales_size ?? 0), 0);
+
+// Stored bytes of one file, from the manifest's tensor entries. Undefined when
+// the manifest does not list the file, so a caller can tell "not listed" from
+// "empty". loader.js uses it to pick between a cacheable whole-file GET and the
+// resumable ranged path.
+export function fileBytes(m, fn) {
+    const entries = m?.files?.[fn];
+    return entries ? sumEntries(entries) : undefined;
+}
+
 // Stored bytes of every block and of the embedding and head tables, summed
 // from the manifest's tensor entries (including a q8 tensor's scales). This is
 // what loader.js uploads, so a claim is charged its real size. Undefined for a
 // manifest with no file listing; the formulas below are used then.
 export function storedBytes(m) {
     if (!m?.files || !(m.n_layer > 0)) return undefined;
-    const sum = (entries) => (entries ?? []).reduce((n, e) => n + e.size + (e.scales_size ?? 0), 0);
-    const tensor = (fn, name) => sum((m.files[fn] ?? []).filter((e) => e.name === name));
+    const tensor = (fn, name) =>
+        sumEntries((m.files[fn] ?? []).filter((e) => e.name === name));
     const blocks = Array.from({ length: m.n_layer },
-        (_, i) => sum(m.files[`block_${String(i).padStart(2, '0')}.bin`]));
+        (_, i) => fileBytes(m, `block_${String(i).padStart(2, '0')}.bin`));
     if (blocks.some((b) => !b)) return undefined;
     return {
         blocks,
         wte:     tensor('client.bin', 'wte'),
         norm:    tensor('client.bin', 'norm'),
-        lm_head: sum(m.files['lm_head.bin']),
+        // 0, not undefined: a tied checkpoint has no lm_head.bin.
+        lm_head: fileBytes(m, 'lm_head.bin') ?? 0,
     };
 }
 

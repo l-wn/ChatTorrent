@@ -25,6 +25,10 @@ import { blockBytes, endBytes, floorBlocks, positions, describeRange, N_MAX, SLO
 // downloads and warm-ups do not compete with live chats.
 const GROWTH_QUIET_MS = 2000;
 
+// Bytes formatted as the VRAM pill shows them (web/peer.js's refresh), so a
+// status note and the pill print the same number the same way.
+const gib = (b) => `${(b / 2 ** 30).toFixed(2)} GiB`;
+
 export class ContextFullError extends Error {
     constructor(needed, room) {
         super(`this prompt needs ${needed} tokens and only ${room} are left in the ` +
@@ -46,6 +50,8 @@ export class Engine {
     #stopRequested = false;
     #generating = false;     // a generate() is running; chats cannot be switched
     #vramLimit = Infinity;
+    #growWake = null;        // resolve() of the promise a paused #growClaim() awaits
+    #growPausedUnder = null; // the limit the pause note was emitted for; null while growing
     #sp = 0;                 // blocks/sec measured by warmup() in #fill()
     #lastStopReason = null;  // 'length' | 'context' | 'eos' | 'stopped', set by generate()
     #lastPromptTokens = 0;
@@ -60,15 +66,23 @@ export class Engine {
     }
 
     // Test-only: build an Engine around an existing net/router/runner,
-    // skipping connect()/serve(). Used by tools/engine.test.mjs.
-    static forTest({ net, router, runner = null, dims = null } = {}) {
-        const engine = new Engine();
+    // skipping connect()/serve(). Used by tools/engine.test.mjs and
+    // tools/grow.test.mjs.
+    //
+    // `grow` starts the background growth loop that serve() starts once a
+    // claim is downloaded, on `device`/`dims`. `vramLimit` is applied first, so
+    // the limit decides the first step.
+    static forTest({ net, router, runner = null, dims = null, device = null,
+                     vramLimit = Infinity, grow = false, onEvent = () => {} } = {}) {
+        const engine = new Engine({ onEvent });
         engine.#net = net;
         engine.#router = router;
         engine.#runner = runner;
         engine.#dims = dims;
         engine.#canPrompt = true;
         engine.#role = runner ? 'worker' : 'spectator';
+        engine.#vramLimit = vramLimit;
+        if (grow) engine.#growClaim(device, dims).catch((err) => console.error('growClaim:', err));
         return engine;
     }
 
@@ -228,9 +242,17 @@ export class Engine {
         }
     }
 
-    // #growClaim() reads the limit on every step, so it can be changed while
-    // growth is running.
-    setVramLimit(bytes) { this.#vramLimit = bytes; }
+    // The limit background growth pauses under. #growClaim() re-reads it on
+    // every step, so a lower limit takes effect at the next one; a higher one
+    // also wakes a loop parked at the limit, which grows on from the holding
+    // already in VRAM. A tab pinned with ?at=/?blocks=/?gb= has no loop to
+    // wake, so its holding stays fixed.
+    setVramLimit(bytes) {
+        this.#vramLimit = bytes;
+        const wake = this.#growWake;
+        this.#growWake = null;
+        wake?.();
+    }
 
     get manifest() { return this.#manifest; }
     get baseUrl() { return this.#baseUrl; }
@@ -313,8 +335,9 @@ export class Engine {
 
     // After the initial claim is downloaded, add one position at a time toward
     // the less-covered neighbour (alternating on a tie) whenever the runner
-    // has been idle. Stops when an allocation fails, the VRAM limit would be
-    // exceeded, or the whole model is held.
+    // has been idle. Stops when an allocation fails or the whole model is held.
+    // At the VRAM limit it pauses instead, and setVramLimit() wakes it, so a
+    // raised limit resumes growth from the holding already in VRAM.
     async #growClaim(device, d) {
         const { manifest, net } = this;
         const L = d.n_layer, N = positions(L);
@@ -344,18 +367,36 @@ export class Engine {
                 : leftDepth < rightDepth ? 'left'
                 : rightDepth < leftDepth ? 'right'
                 : side;
-            side = dir === 'left' ? 'right' : 'left';
 
             try {
                 // The cost of the position being added: that block's weights
                 // and its KV or recurrent state, or an end's table.
                 const next = dir === 'left' ? r.lo - 1 : r.hi;
-                if (r.vramBytes + this.#cost(d, r, next) > this.#vramLimit) {
+                const needed = r.vramBytes + this.#cost(d, r, next);
+                if (needed > this.#vramLimit) {
+                    // The loop parks until setVramLimit() wakes it, so a
+                    // raised limit grows on from what is already in VRAM. One
+                    // note per limit value, so a visitor trying several values
+                    // gets one note each rather than one per step.
+                    if (this.#growPausedUnder !== this.#vramLimit) {
+                        this.#growPausedUnder = this.#vramLimit;
+                        this.#emit('status', {
+                            text: `Paused growing at ${describeRange(r.lo, r.have, L)}: the next ` +
+                                `position would take this tab to ${gib(needed)}, past its ` +
+                                `${gib(this.#vramLimit)} VRAM limit. Raise the limit, or clear it, ` +
+                                `and growth carries on from here — nothing already held is ` +
+                                `dropped or downloaded again.`,
+                        });
+                    }
+                    await new Promise((resolve) => { this.#growWake = resolve; });
+                    continue;
+                }
+                if (this.#growPausedUnder !== null) {
+                    this.#growPausedUnder = null;
                     this.#emit('status', {
-                        text: `Stopped growing at ${describeRange(r.lo, r.have, L)}: the VRAM limit ` +
-                            `would be exceeded. Raise it, or clear it, to grow further.`,
+                        text: `The VRAM limit has room again: growing on from ` +
+                            `${describeRange(r.lo, r.have, L)}.`,
                     });
-                    return;
                 }
 
                 const p = dir === 'left' ? r.lo - 1 : r.hi;
@@ -382,6 +423,11 @@ export class Engine {
                 // Announced only once the position is downloaded and warmed up.
                 net.grow(r.lo, r.hi);
                 this.#emit('grow', { lo: r.lo, hi: r.hi });
+                // Flipped only by a step that happened, so the tie-break
+                // alternates between growth steps. A paused iteration must not
+                // consume it, or the direction after a resume would not follow
+                // the last step taken.
+                side = dir === 'left' ? 'right' : 'left';
             } catch (err) {
                 const r2 = this.#runner;
                 this.#emit('status', {
@@ -684,6 +730,7 @@ export class Engine {
     get history() { return Uint32Array.from(this.#router?.history ?? []); }
     get ran() { return this.#router?.ran ?? 0; }
     get blocksPerSec() { return this.#sp; }
+    get vramLimit() { return this.#vramLimit; }
     get lastStopReason() { return this.#lastStopReason; }
     get lastPromptTokens() { return this.#lastPromptTokens; }
     get lastFed() { return this.#lastFed; }

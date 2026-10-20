@@ -16,7 +16,7 @@
 // memory is one file plus the embedding table.
 
 import { uploadF32, uploadF16, uploadQ8, isQ8, q8Of, DIMS } from './kernels.js';
-import { DTYPE_BYTES, storedBytes } from '../split.js';
+import { DTYPE_BYTES, storedBytes, fileBytes } from '../split.js';
 
 // Weight formats the kernels can read. f16 and q8 reduce the download and the
 // VRAM a range costs. The shaders convert to f32 on read, so all accumulation
@@ -50,7 +50,7 @@ export function activeWeights() {
     active ??= (async () => {
         let r;
         try {
-            r = await fetch(CHECKPOINT_URL);
+            r = await fetchBounded(CHECKPOINT_URL);
         } catch (e) {
             active = null;    // may be transient: let the next caller retry
             throw new Error(`${CHECKPOINT_URL} could not be fetched (${e.message}); ` +
@@ -79,13 +79,35 @@ export function activeWeights() {
     return active;
 }
 
+// No bytes for this long means the connection is dead rather than slow: even a
+// 50 KB/s link delivers stream chunks continuously. A connection that sends no
+// more data and no RST or FIN leaves `fetch` neither settling nor rejecting, so
+// every request below is given this deadline.
+const STALL_MS = 20000;
+
+// A fetch whose request is bounded by a deadline. The body is not: a caller
+// that needs both bounded uses loadFile(). This is for the small JSON files,
+// whose body arrives in one packet.
+async function fetchBounded(url, stallMs = STALL_MS) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), stallMs);
+    try {
+        return await fetch(url, { signal: ac.signal });
+    } catch (err) {
+        throw ac.signal.aborted ? new Error(`${url}: no response for ${stallMs}ms`) : err;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 // Retries a thrown fetch or a 5xx with backoff. A 4xx means the request is
-// wrong and is not retried.
-export async function fetchRetry(url, { retries = 3, delayMs = 500 } = {}) {
+// wrong and is not retried. Each request is bounded by a deadline, so a hung
+// one reaches the retry below.
+export async function fetchRetry(url, { retries = 3, delayMs = 500, stallMs } = {}) {
     let lastErr;
     for (let attempt = 0; attempt <= retries; attempt++) {
         try {
-            const r = await fetch(url);
+            const r = await fetchBounded(url, stallMs);
             if (r.ok || r.status < 500) return r;
             lastErr = new Error(`${url}: ${r.status}`);
         } catch (err) {
@@ -98,12 +120,21 @@ export async function fetchRetry(url, { retries = 3, delayMs = 500 } = {}) {
 
 export async function loadManifest(baseUrl) {
     baseUrl ??= await activeWeights();
-    const r = await fetchRetry(`${baseUrl}/manifest.json`);
-    if (!r.ok) {
+    // Through loadFile(), so the manifest gets the same deadline, retries and
+    // resumption as a weight file: it comes from the same host, and no block
+    // can be fetched until it has parsed.
+    let buf;
+    try {
+        buf = await loadFile(baseUrl, 'manifest.json');
+    } catch (err) {
         throw new Error(
-            `${baseUrl}/manifest.json: ${r.status}. Run:  python tools/convert_hf.py`);
+            `${baseUrl}/manifest.json: ${err.message}. Run:  python tools/convert_hf.py`);
     }
-    return r.json();
+    try {
+        return JSON.parse(new TextDecoder().decode(buf));
+    } catch (err) {
+        throw new Error(`${baseUrl}/manifest.json is not valid JSON (${err.message})`);
+    }
 }
 
 // The manifest is the source of truth for a loaded model, not the DIMS
@@ -206,23 +237,119 @@ export function checkManifest(manifest, d = dimsFromManifest(manifest)) {
 // Fetching a whole file, with retries per chunk.
 //
 // A large download usually fails in the streamed body, not the request, so the
-// body read is inside the retry. After a failed whole-file GET the file is
-// fetched in 8 MiB ranges, so a failure costs one chunk.
+// body read is inside the retry and under the same deadline. A file is fetched
+// in 8 MiB ranges after a failed whole-file GET, or from the start when it is
+// large enough that an attempt that cannot resume is not worth making, so a
+// failure costs one chunk.
 const CHUNK = 8 * 1024 * 1024;
 
+// A whole-file GET cannot resume, so a stall on one discards every byte it had
+// downloaded. Files above this size take the ranged path from the start; the
+// browser cache the whole-file path exists for does not reliably store a body
+// this big.
+const WHOLE_MAX = 64 * 1024 * 1024;
+
+// One request, read through a watchdog that aborts it when no bytes have
+// arrived for `stallMs`. The timer covers the headers too: a static file whose
+// response has not started by then is just as dead.
+//
+// The body is read with a reader rather than arrayBuffer() so that every chunk
+// can re-arm the watchdog and drive `onBytes`. `buf` is exactly as long as the
+// response declared, because the loader builds typed-array views over it.
+//
+// A timed-out request throws without `permanent`, so its caller retries it:
+// loadFile() rethrows a permanent error without falling back, so marking a
+// timeout permanent would abort a download a retry would have finished.
+async function fetchStalling(url, { headers, stallMs = STALL_MS, onBytes } = {}) {
+    const ac = new AbortController();
+    let timedOut = false;
+    let timer = null;
+    // Armed before the fetch and re-armed on every chunk. The signal is given
+    // to fetch() itself, so an abort tears the connection down rather than
+    // merely ending the read and leaving the request in flight.
+    const arm = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => { timedOut = true; ac.abort(); }, stallMs);
+    };
+
+    arm();
+    try {
+        const r = await fetch(url, { ...(headers && { headers }), signal: ac.signal });
+        const range = r.headers.get('content-range');
+        if (!r.ok) {
+            // Free the connection: nobody reads this body.
+            r.body?.cancel().catch(() => {});
+            return { ok: false, status: r.status, buf: null, range };
+        }
+
+        // content-length counts the bytes on the wire, so it is the decoded
+        // length only when nothing re-encoded the body. A chunked response has
+        // no content-length at all, and `null` must not be read as 0.
+        const len = r.headers.get('content-length');
+        const declared = (len == null || len === '' || r.headers.get('content-encoding'))
+            ? NaN : Number(len);
+        const total = Number.isInteger(declared) && declared >= 0 ? declared : null;
+
+        // No stream to read from: take the body in one piece, still under the
+        // same abort signal.
+        if (!r.body) {
+            const buf = await r.arrayBuffer();
+            onBytes?.(buf.byteLength, total ?? 0);
+            return { ok: true, status: r.status, buf, range };
+        }
+
+        // A declared length is filled in place, so the result is exactly that
+        // many bytes. Without one the chunks are concatenated at the end.
+        const out = total == null ? [] : new Uint8Array(total);
+        const reader = r.body.getReader();
+        let read = 0;
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            arm();
+            if (total == null) {
+                out.push(value);
+            } else {
+                if (read + value.byteLength > total) {
+                    throw new Error(`${url}: sent more than the ${total} bytes it declared`);
+                }
+                out.set(value, read);
+            }
+            read += value.byteLength;
+            onBytes?.(read, total ?? 0);
+        }
+        // A body that ends early must not become a short buffer: every tensor
+        // is a view over it, and a truncated one reads as corrupt weights.
+        if (total != null && read !== total) {
+            throw new Error(`${url}: body ended at ${read} of ${total} bytes`);
+        }
+        return { ok: true, status: r.status, range,
+                 buf: total == null ? concatChunks(out, read) : out.buffer };
+    } catch (err) {
+        throw timedOut ? new Error(`${url}: no data for ${stallMs}ms`) : err;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+function concatChunks(chunks, total) {
+    const out = new Uint8Array(total);
+    let at = 0;
+    for (const c of chunks) { out.set(c, at); at += c.byteLength; }
+    return out.buffer;
+}
+
 // Fetch one range, request and body, retried as a unit.
-async function fetchRange(url, from, to, retries = 4) {
+async function fetchRange(url, from, to, { retries = 4, stallMs } = {}) {
     let lastErr;
     for (let attempt = 0; attempt <= retries; attempt++) {
         // Set inside the try and checked after it, so the catch below does not
         // retry a 4xx.
         let permanent = false;
         try {
-            const r = await fetch(url, { headers: { Range: `bytes=${from}-${to}` } });
-            if (r.ok) {
-                return { status: r.status, buf: await r.arrayBuffer(),
-                         range: r.headers.get('content-range') };
-            }
+            const r = await fetchStalling(url, { stallMs,
+                headers: { Range: `bytes=${from}-${to}` } });
+            if (r.ok) return { status: r.status, buf: r.buf, range: r.range };
             lastErr = new Error(`${url}: ${r.status}`);
             // A 4xx (missing file, bad range, expired auth) will not change on
             // retry.
@@ -240,32 +367,42 @@ async function fetchRange(url, from, to, retries = 4) {
     throw lastErr;
 }
 
-// One plain GET with no Range header, body included. Tried first because the
-// browser cache and Cloudflare's edge store a 200, and do not cache 206
-// responses the same way.
-async function fetchWhole(url) {
-    const r = await fetch(url);
-    if (r.ok) return r.arrayBuffer();
+// One plain GET with no Range header, body included. Tried first for a file
+// small enough that losing the attempt is cheap, because the browser cache and
+// Cloudflare's edge store a 200 and do not cache 206 responses the same way.
+async function fetchWhole(url, { stallMs, onBytes } = {}) {
+    const r = await fetchStalling(url, { stallMs, onBytes });
+    if (r.ok) return r.buf;
     const err = new Error(`${url}: ${r.status}`);
     err.permanent = r.status < 500;
     throw err;
 }
 
-export async function loadFile(baseUrl, filename, onBytes) {
+// `bytes` is the file's size from the manifest (split.js's fileBytes()), used
+// only to choose between the two paths. `stallMs` and `retries` override the
+// watchdog and the per-range attempt count; both are for tests.
+export async function loadFile(baseUrl, filename, onBytes,
+                               { bytes, stallMs, retries } = {}) {
     const url = `${baseUrl}/${filename}`;
 
     // Whole file first, so a cached copy is used and a new one can be cached.
-    // Ranges are used only after a failure.
-    try {
-        return await fetchWhole(url);
-    } catch (err) {
-        if (err.permanent) throw err;
-        // Continue with the ranged path, which retries and resumes.
+    // Ranges are used after a failure, or from the start for a file above
+    // WHOLE_MAX. An unknown size takes the whole-file path; the watchdog bounds
+    // either one.
+    if (!(bytes > WHOLE_MAX)) {
+        try {
+            return await fetchWhole(url, { stallMs, onBytes });
+        } catch (err) {
+            if (err.permanent) throw err;
+            // Continue with the ranged path, which retries and resumes. Its
+            // progress restarts from 0, so a UI counter can step backwards
+            // once here.
+        }
     }
 
     // The first range is also the probe. A server that ignores Range answers
     // 200 with the whole body, which is returned as-is.
-    const first = await fetchRange(url, 0, CHUNK - 1);
+    const first = await fetchRange(url, 0, CHUNK - 1, { stallMs, retries });
     if (first.status !== 206) return first.buf;
 
     const total = Number(first.range?.match(/\/(\d+)$/)?.[1]);
@@ -282,7 +419,7 @@ export async function loadFile(baseUrl, filename, onBytes) {
 
     while (done < total) {
         const to = Math.min(done + CHUNK, total) - 1;
-        const { buf } = await fetchRange(url, done, to);
+        const { buf } = await fetchRange(url, done, to, { stallMs, retries });
         if (!buf.byteLength) throw new Error(`${filename}: empty range at ${done}`);
         out.set(new Uint8Array(buf), done);
         done += buf.byteLength;
@@ -464,7 +601,7 @@ export async function loadBlock(device, { baseUrl, manifest, d, index,
                                           onBytes } = {}) {
     baseUrl ??= await activeWeights();
     const fn = `block_${String(index).padStart(2, '0')}.bin`;
-    const blob = await loadFile(baseUrl, fn, onBytes);
+    const blob = await loadFile(baseUrl, fn, onBytes, { bytes: fileBytes(manifest, fn) });
     // The kind comes from the manifest's layer_types ('full_attention' when
     // absent). It is attached to the weights, and model.js's block()
     // dispatches on it.
@@ -483,14 +620,16 @@ export async function loadClient(device, { baseUrl, manifest, d,
     baseUrl ??= await activeWeights();
     const dtype = dtypeOf(device, manifest, baseUrl);
 
-    const blob = await loadFile(baseUrl, 'client.bin', onBytes);
+    const blob = await loadFile(baseUrl, 'client.bin', onBytes,
+        { bytes: fileBytes(manifest, 'client.bin') });
     const out = await uploadTensors(device, blob, manifest.files['client.bin'], 'client.bin',
         { wte: [d.vocab, d.hidden], norm: [d.hidden] }, dtype);   // read as [N, K]
 
     if (!d.tied_lm_head) {
         // Uses the same onBytes as client.bin: loadWeights() counts both
         // files as one unit of progress.
-        const lmBlob = await loadFile(baseUrl, 'lm_head.bin', onBytes);
+        const lmBlob = await loadFile(baseUrl, 'lm_head.bin', onBytes,
+            { bytes: fileBytes(manifest, 'lm_head.bin') });
         const head = await uploadTensors(device, lmBlob, manifest.files['lm_head.bin'],
             'lm_head.bin', { lm_head: [d.vocab, d.hidden] }, dtype);
         out.lm_head = head.lm_head;
@@ -513,7 +652,8 @@ export async function loadEmbed(device, { baseUrl, manifest, d, onBytes, have } 
         return Object.defineProperty({ wte: have.lm_head, norm: have.norm }, 'bytes',
             { value: 0, writable: true });
     }
-    const blob = await loadFile(baseUrl, 'client.bin', onBytes);
+    const blob = await loadFile(baseUrl, 'client.bin', onBytes,
+        { bytes: fileBytes(manifest, 'client.bin') });
     const out = await uploadTensors(device, blob, manifest.files['client.bin'], 'client.bin',
         { wte: [d.vocab, d.hidden], ...(have?.norm ? {} : { norm: [d.hidden] }) }, dtype,
         { strict: false });
@@ -545,7 +685,8 @@ export async function loadHead(device, { baseUrl, manifest, d, onBytes, have } =
         out.norm = norm.norm;
         out.bytes += norm.bytes;
     }
-    const blob = await loadFile(baseUrl, 'lm_head.bin', onBytes);
+    const blob = await loadFile(baseUrl, 'lm_head.bin', onBytes,
+        { bytes: fileBytes(manifest, 'lm_head.bin') });
     const head = await uploadTensors(device, blob, manifest.files['lm_head.bin'],
         'lm_head.bin', { lm_head: [d.vocab, d.hidden] }, dtype);
     out.lm_head = head.lm_head;
@@ -575,7 +716,8 @@ async function loadNorm(device, { baseUrl, manifest, d, dtype }) {
         console.warn(`client.bin: could not fetch norm as a range (${err.message}); `
             + `fetching the whole file`);
     }
-    const blob = await loadFile(baseUrl, 'client.bin');
+    const blob = await loadFile(baseUrl, 'client.bin', undefined,
+        { bytes: fileBytes(manifest, 'client.bin') });
     return uploadTensors(device, blob, entries, 'client.bin', expected, dtype, { strict: false });
 }
 

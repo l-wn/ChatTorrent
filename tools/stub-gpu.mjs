@@ -95,6 +95,11 @@ export function makeGpu({ timestamps = false } = {}) {
             __tags: entries.map((e) => e.resource?.buffer?.__tag).filter(Boolean),
         }),
         createQuerySet: ({ count }) => ({ count, destroy() {} }),
+        // A growth step wraps its allocation in error scopes (engine.js's
+        // #growClaim). No error is reported, so growth proceeds as it does on a
+        // GPU with VRAM to spare.
+        pushErrorScope() {},
+        popErrorScope: async () => null,
         createCommandEncoder: () => ({
             beginComputePass: (desc) => {
                 passes.opened++;

@@ -192,8 +192,10 @@ client (`capacity 0`).
 one position at a time, toward whichever neighbouring position is less covered
 (alternating on a tie), whenever its runner has been idle for 2 s. Each new
 position is reserved, downloaded, warmed and only then announced with `grow`.
-Growth stops at a GPU allocation failure, at the VRAM limit set in the page, or
-when the peer holds the whole model.
+Growth stops at a GPU allocation failure or when the peer holds the whole model.
+At the VRAM limit set in the page it *pauses* instead: the loop parks, and
+`setVramLimit` wakes it, so raising or clearing the limit carries growth on from
+the holding already in VRAM.
 
 **What a position costs.** The VRAM limit is held to bytes, so the two sides of
 the comparison have to be real. What a peer *holds* is `Runner.vramBytes`: the

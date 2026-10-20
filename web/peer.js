@@ -418,7 +418,7 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
     ui.bootwhat.textContent = 'joining the mesh…';
     ui.vramlimit.value = limit;
 
-    engine.setVramLimit(parseByteLimit(ui.vramlimit.value));
+    applyVramLimit();
     // Not awaited. serve() reports its own failures; the catch is for bugs.
     engine.serve({ blocks: blocksParam(), vram: vramParam(), at, slowMs: slowMs() })
         .then(({ note: msg, error }) => {
@@ -429,14 +429,29 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
         .catch((err) => console.error('serve:', err));
 }
 
-// Parse the VRAM-limit input, freeform ("4gb", "512mb", "2 GiB"). Blank or
-// unparseable means no limit: growth stops only at a GPU allocation failure
-// or when the whole model is held.
+// Parse the VRAM-limit input, freeform ("4gb", "512mb", "2 GiB"). Blank means
+// no limit: growth then stops only at a GPU allocation failure or when the
+// whole model is held. Anything else that does not parse returns null, which
+// the caller reads as "leave the limit alone": the field fires on every
+// keystroke, so "22gb" is typed through "22g".
 function parseByteLimit(str) {
-    const m = /^\s*(\d+(?:\.\d+)?)\s*(gb|gib|mb|mib)?\s*$/i.exec(str ?? '');
-    if (!m) return Infinity;
+    const s = (str ?? '').trim();
+    if (!s) return Infinity;
+    const m = /^(\d+(?:\.\d+)?)\s*(gb|gib|mb|mib)?$/i.exec(s);
+    if (!m) return null;
     const unit = (m[2] ?? 'gb').toLowerCase();
     return Number(m[1]) * (unit.startsWith('m') ? 2 ** 20 : 2 ** 30);
+}
+
+// How long the VRAM-limit field must be quiet before its value is applied.
+const LIMIT_SETTLE_MS = 750;
+
+// The field's value to the engine, skipping a value that does not parse. A
+// limit that reaches the engine takes effect at the next growth step, and a
+// raised one wakes a paused loop (engine.js's setVramLimit).
+function applyVramLimit() {
+    const bytes = parseByteLimit(ui.vramlimit.value);
+    if (bytes != null) engine?.setVramLimit(bytes);
 }
 
 // `?blocks=N`: hold exactly this many positions, with no growth.
@@ -529,8 +544,15 @@ function wireEvents() {
         ui.input.style.height = 'auto';
         ui.input.style.height = `${ui.input.scrollHeight}px`;
     });
+    // Applied once typing has settled. Clearing the field to retype a smaller
+    // value passes through blank, which means "no limit" and would resume
+    // growth, so an intermediate value must not reach the engine. A growth step
+    // is gated by GROWTH_QUIET_MS (2 s), so the delay costs a lowered limit
+    // nothing.
+    let limitTimer = 0;
     ui.vramlimit.addEventListener('input', () => {
-        engine?.setVramLimit(parseByteLimit(ui.vramlimit.value));
+        clearTimeout(limitTimer);
+        limitTimer = setTimeout(applyVramLimit, LIMIT_SETTLE_MS);
     });
     wireSettings();
     wireChats();
@@ -574,6 +596,10 @@ function wireSettings() {
             else el.value = el.defaultValue;
         }
         markChanged();
+        // #vramlimit has no `value` attribute, so Reset blanks it, and
+        // assigning `value` fires no `input` event. The engine is told
+        // explicitly, so it does not stay limited while the field reads blank.
+        applyVramLimit();
     });
 }
 

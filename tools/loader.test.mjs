@@ -4,7 +4,8 @@
 //
 // A download usually fails in the streamed body, not the request, so the retry
 // must cover the body. The cases: a server that cuts a response short, one
-// that ignores Range, and one that fails intermittently.
+// that ignores Range, one that fails intermittently, and one that goes silent,
+// which needs a deadline because `fetch` then neither settles nor rejects.
 
 import { createServer } from 'node:http';
 import { loadFile } from '../web/model/loader.js';
@@ -25,6 +26,18 @@ for (let i = 0; i < SIZE; i++) BODY[i] = (i * 2654435761) >>> 24;
 function serve(behave) {
     const server = createServer((req, res) => {
         const verdict = behave(req);
+        if (verdict === 'silent') {
+            // Correct headers, a few bytes, then nothing: no more data, no
+            // FIN, no RST. The status is always 200 because nothing reads past
+            // the stall. The socket is left open; closeAllConnections() ends it.
+            res.writeHead(200, { 'content-length': String(SIZE) });
+            res.write(BODY.subarray(0, 1024));
+            return;
+        }
+        if (verdict === 'deaf') {
+            // No headers either: the request is accepted and never answered.
+            return;
+        }
         if (verdict === 'cut') {
             // Correct headers, a short body, then the connection is dropped.
             res.writeHead(206, { 'content-range': `bytes 0-${SIZE - 1}/${SIZE}`,
@@ -118,6 +131,122 @@ console.log('\nloadFile: a 404 is not retried');
     ok('a 404 throws', threw !== null);
     ok('and does so immediately, without backing off', Date.now() - t0 < 700,
         `took ${Date.now() - t0}ms`);
+    server.close();
+}
+
+// A connection that goes silent mid-body leaves `fetch` neither settling nor
+// rejecting, so without a deadline the whole-file GET never throws and the
+// resumable ranged path in its `catch` is never reached.
+console.log('\nloadFile: a connection that goes silent');
+{
+    // Silent on the whole-file GET, answering ranges normally.
+    let silenced = 0;
+    const { server, url } = await serve((req) => {
+        if (req.headers.range) return 'ok';
+        silenced++;
+        return 'silent';
+    });
+    const t0 = Date.now();
+    const buf = await loadFile(url, 'w.bin', undefined, { stallMs: 150 });
+    ok('the stalled whole-file GET is abandoned rather than awaited forever',
+        Date.now() - t0 < 5000, `took ${Date.now() - t0}ms`);
+    ok('and it really did go silent first', silenced > 0);
+    ok('the ranged path then reassembles the file byte-for-byte', identical(buf));
+    server.closeAllConnections();
+    server.close();
+}
+{
+    // Every range goes silent on its first attempt and answers on its second,
+    // so this finishes only if the deadline covers the ranged path too: an
+    // 8 MiB chunk stalls the same way a whole file does.
+    const seen = new Map();
+    const { server, url } = await serve((req) => {
+        const n = (seen.get(req.headers.range) ?? 0) + 1;
+        seen.set(req.headers.range, n);
+        return n === 1 ? 'silent' : 'ok';
+    });
+    const buf = await loadFile(url, 'w.bin', undefined,
+        { bytes: 100 * 1024 * 1024, stallMs: 150 });
+    ok('a stalled range aborts, retries and resumes', identical(buf));
+    ok('and every range really did stall once',
+        seen.size === 3 && [...seen.values()].every((n) => n === 2), `${[...seen]}`);
+    server.closeAllConnections();
+    server.close();
+}
+{
+    // A timeout must not be marked permanent: loadFile rethrows a permanent
+    // error without falling back, so the download would be abandoned instead of
+    // retried. The retries happening at all, and the error being the timeout
+    // rather than a 4xx, is what shows it is not marked permanent.
+    const { server, url } = await serve(() => 'silent');
+    let threw = null;
+    try { await loadFile(url, 'w.bin', undefined, { stallMs: 100, retries: 1 }); }
+    catch (e) { threw = e; }
+    ok('a server silent on everything gives up rather than hanging', threw !== null);
+    ok('and says why', /no data for 100ms/.test(threw?.message ?? ''), `${threw?.message}`);
+    server.closeAllConnections();
+    server.close();
+}
+{
+    // The deadline covers the headers too: a static file whose response has
+    // not started is as dead as one that stops mid-body.
+    const { server, url } = await serve(() => 'deaf');
+    let threw = null;
+    try { await loadFile(url, 'w.bin', undefined, { stallMs: 100, retries: 0 }); }
+    catch (e) { threw = e; }
+    ok('a request that is never answered at all also times out',
+        /no data for 100ms/.test(threw?.message ?? ''), `${threw?.message}`);
+    server.closeAllConnections();
+    server.close();
+}
+
+// A whole-file GET cannot resume, so a stall on one discards every byte it had
+// downloaded. Above loader.js's WHOLE_MAX the ranged path is taken from the
+// start, and the browser cache the whole-file path exists for does not reliably
+// store a body that big.
+console.log('\nloadFile: a file too big to risk a non-resumable attempt on');
+{
+    let bare = 0, ranged = 0;
+    const { server, url } = await serve((req) => {
+        if (req.headers.range) ranged++; else bare++;
+        return 'ok';
+    });
+    const buf = await loadFile(url, 'w.bin', undefined, { bytes: 100 * 1024 * 1024 });
+    ok('is fetched correctly', identical(buf));
+    ok('without one request that could not have resumed', bare === 0, `${bare} bare GETs`);
+    ok('in 8 MiB ranges', ranged === 3, `${ranged} ranged requests`);
+    server.close();
+}
+{
+    // Below that threshold, and when the manifest gives no size, the file is
+    // taken in one cacheable 200.
+    for (const opts of [{ bytes: SIZE }, {}, undefined]) {
+        let requests = 0, ranged = 0;
+        const { server, url } = await serve((req) => {
+            requests++;
+            if (req.headers.range) ranged++;
+            return 'ok';
+        });
+        const buf = await loadFile(url, 'w.bin', undefined, opts);
+        ok(`bytes=${opts?.bytes ?? 'unknown'} still takes one cacheable request`,
+            identical(buf) && requests === 1 && ranged === 0,
+            `${requests} requests, ${ranged} ranged`);
+        server.close();
+    }
+}
+
+// The whole-file path reads its body chunk by chunk, so it drives the progress
+// callback as the ranged path does.
+console.log('\nloadFile: progress while the whole file streams in');
+{
+    const { server, url } = await serve(() => 'ok');
+    const seen = [];
+    const buf = await loadFile(url, 'w.bin', (b, t) => seen.push([b, t]));
+    ok('the whole-file GET reports progress too', seen.length > 0, `${seen.length} callbacks`);
+    ok('against the real total, ending at the file length',
+        seen.at(-1)?.[0] === SIZE && seen.every(([, t]) => t === SIZE), `${seen.at(-1)}`);
+    ok('never past it, and the buffer is still exact',
+        seen.every(([b]) => b <= SIZE) && identical(buf));
     server.close();
 }
 

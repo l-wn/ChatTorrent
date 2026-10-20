@@ -209,6 +209,14 @@ const SCENARIOS = [
     // fail with "unreachable" on real WebRTC.
     { name: 'join', workers: chain(3), askers: 1, sessions: 4, joinRow: true },
 
+    // Raising the VRAM limit after growth has paused on it. One worker starts
+    // at floor 1 with a limit of 0, so its first growth step is refused and the
+    // line stays uncovered: the asker cannot prompt. Clearing the limit must
+    // cover the line without a reload, growing from the holding already in
+    // VRAM.
+    { name: 'vramgrow', workers: 'capacity1', askers: 1, sessions: 4, floor: 1,
+      vramLimit: true },
+
     // Rows specific to the closed loop. Every row above already decodes with
     // it (the engine's default). These test what only the loop does, and keep
     // the round trip tested on real hardware.
@@ -513,6 +521,7 @@ async function runScenario(browser, base, scenario, reference) {
     try {
         if (scenario.rooms) return await rooms(open, scenario, reference);
         if (scenario.joinRow) return await joinRow(open, scenario, reference);
+        if (scenario.vramLimit) return await vramLimitRow(open, scenario, reference);
 
         // Workers first, each awaited: serve() resolves once the range is
         // downloaded, warmed up and announced, so the line is covered when the
@@ -846,6 +855,82 @@ async function joinRow(open, scenario, reference) {
     const stats = await Promise.all(tabs.map(({ tab }) => tab.eval('window.harness.stats()')));
     const row = { name: 'join', workers: 3, askers: 1, runs: [[...before, ...after]], stats, wall,
                   probe: null, killed: null, scenario, filled: null, after: null, chain: null, grew: [] };
+    check(row, reference);
+    return row;
+}
+
+// Growth paused on the VRAM limit, then resumed by raising it. `?vramlimit=0`
+// refuses the first growth step whatever the model's size, so the worker sits
+// on its floor and the line stays uncovered. Clearing the limit must cover it
+// from the weights already in VRAM: the peer keeps its id and its Runner
+// throughout, so it cannot have re-downloaded.
+async function vramLimitRow(open, scenario, reference) {
+    const boot = async (query, label) => {
+        const tab = await open(query, label);
+        const info = await tab.eval('window.harness.boot()');
+        if (info.error) throw new Error(`${label} failed to boot: ${info.note}`);
+        return { tab, info };
+    };
+    const sessions = scenario.sessions ?? 4;
+    const t0 = Date.now();
+    const w0 = await boot(`role=worker&floor=${scenario.floor ?? 1}&vramlimit=0&sessions=${sessions}`,
+                          'w0');
+    const asker = await boot('role=spectator', 'a0');
+    await rosterSettled([w0, asker], 2);
+
+    const notes = async () => (await w0.tab.eval('window.harness.lines()'))
+        .filter((l) => l.startsWith('status: '));
+    const paused = (ls) => ls.filter((l) => /Paused growing at /.test(l));
+
+    const held = await w0.tab.eval('window.harness.stats()');
+    const seen = await asker.tab.eval('window.harness.stats()');
+    console.log(`    peer ${w0.info.id} holds ${held.runner?.lo}-${held.runner?.hi - 1} ` +
+        `(${held.runner?.vramMiB} MiB), covered ${seen.covered}, holes ` +
+        `${JSON.stringify(seen.holes)}`);
+    ok('vramgrow: the limit stopped growth short of covering the line',
+        seen.holes.length > 0 && !seen.connected,
+        `covered ${seen.covered}, connected ${seen.connected}`);
+    // Long enough for several quiet periods to pass with the holding not
+    // moving, which separates a parked loop from a slow one. It also covers the
+    // first step's GROWTH_QUIET_MS, during which the pause note is emitted:
+    // serve() can resolve before a freshly loaded page has been idle that long.
+    await new Promise((r) => setTimeout(r, 3000));
+    const still = await w0.tab.eval('window.harness.stats()');
+    ok('vramgrow: the holding does not creep while the limit stands',
+        still.runner?.lo === held.runner?.lo && still.runner?.hi === held.runner?.hi,
+        `${held.runner?.lo}-${held.runner?.hi} became ${still.runner?.lo}-${still.runner?.hi}`);
+    ok('vramgrow: and it said so once, as a pause rather than a stop',
+        paused(await notes()).length === 1, JSON.stringify(await notes()));
+
+    // Clear it, as a visitor blanking the field does.
+    console.log(`    clearing the VRAM limit on peer ${w0.info.id}`);
+    await w0.tab.eval('window.harness.setVramLimit(null)');
+    await meshReady([asker], 2);
+
+    const grown = await w0.tab.eval('window.harness.stats()');
+    const ls = await notes();
+    ok('vramgrow: growth resumed and covered the line', grown.runner?.lo === 0
+        && grown.runner?.hi === N && grown.runner?.have === grown.runner?.hi,
+        `holds ${grown.runner?.lo}-${grown.runner?.hi}, have ${grown.runner?.have}`);
+    ok('vramgrow: it is the same peer, so nothing was re-downloaded',
+        grown.id === w0.info.id, `peer ${w0.info.id} became ${grown.id}`);
+    ok('vramgrow: and it is holding more VRAM than when it paused',
+        grown.runner?.vramMiB > held.runner?.vramMiB,
+        `${held.runner?.vramMiB} MiB became ${grown.runner?.vramMiB} MiB`);
+    ok('vramgrow: the resume was announced once', ls.filter((l) =>
+        /The VRAM limit has room again/.test(l)).length === 1, JSON.stringify(ls));
+    ok('vramgrow: and the pause was never repeated', paused(ls).length === 1, JSON.stringify(ls));
+
+    // One real turn, so the row compares tokens like every other row and the
+    // latency summary has something to report.
+    const spec = { prompts: PROMPT_LIST.slice(0, 1), opts: { maxTokens: TOKENS }, fresh: true };
+    const runs = [await asker.tab.eval(`window.harness.run(${JSON.stringify(spec)})`)];
+    const wall = Date.now() - t0;
+
+    const stats = await Promise.all([w0, asker].map(({ tab }) => tab.eval('window.harness.stats()')));
+    const row = { name: 'vramgrow', workers: 1, askers: 1, runs, stats, wall, probe: null,
+                  killed: null, scenario, filled: null, after: null, chain: null,
+                  grew: grewDuring([held], stats) };
     check(row, reference);
     return row;
 }
