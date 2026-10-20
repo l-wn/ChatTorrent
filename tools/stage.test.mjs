@@ -722,6 +722,22 @@ console.log('\na chat with no frame waits in line for one, first come first serv
         eq('and the newcomer is served once it stops', order.at(-1), 'b@0');
     }
 
+    // A chat whose next job waits in the queue longer than `idleMs` is not
+    // idle. Under load the queue gets that long, and a newcomer ahead of it in
+    // the queue must not take its frame, or its job fails cold at the front.
+    {
+        const { r, job, order } = make({ idleMs: 40, waitMs: 2000 });
+        await job('a', 0);
+        r.queue = r.queue.then(() => sleep(80));     // a busy GPU, longer than idleMs
+        const b = job('b', 0);                        // the newcomer, first in line
+        let err = null;
+        await job('a', 1).catch((e) => { err = e; });
+        ok('a chat queued past idleMs keeps its frame', err === null, `got ${err?.message}`);
+        eq('nothing cold and nothing evicted while it waited', [r.counts.cold, r.counts.evicted], [0, 0]);
+        await b;
+        eq('the newcomer waits and is served once the chat goes quiet', order, ['a@0', 'a@1', 'b@0']);
+    }
+
     // Jobs of one waiting session stay in order. A replay sends its chunks
     // without waiting for answers, and the later chunks must not be rejected
     // as uncached.

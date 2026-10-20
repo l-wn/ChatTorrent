@@ -102,11 +102,15 @@ export class Runner {
         this.logs = new Map();
         this.queue = Promise.resolve();
         this.backlog = 0;                                   // jobs queued or running
+        // Jobs run() has accepted and not yet settled, by session. A session
+        // with any is not idle, however long its job waits in the queue.
+        this.pending = new Map();
         // When the last non-warm-up job ran. 0 until the first one.
         this.lastJobAt = 0;
 
-        // How long a session must be idle before it can be evicted (0: always
-        // evictable). See split.js's IDLE_MS.
+        // How long a session must be idle before it can be evicted, counted
+        // from the end of its last job (0: evictable as soon as none of its
+        // jobs is queued or running). See split.js's IDLE_MS.
         this.idleMs = idleMs;
         // How long a new session waits for a frame before it is refused (0:
         // refused immediately). See split.js's WAIT_MS.
@@ -310,9 +314,19 @@ export class Runner {
     run(h, hidden, want) {
         if (this.backlog >= MAX_QUEUE) return Promise.reject(this.#atCapacity('queue slot'));
         this.backlog++;
+        const s = h.s;
+        this.pending.set(s, (this.pending.get(s) ?? 0) + 1);
         return new Promise((resolve, reject) => {
             this.#submit({ h, hidden, want, queuedAt: performance.now(), resolve, reject });
-        }).finally(() => { this.backlog--; });
+        }).finally(() => {
+            this.backlog--;
+            const n = this.pending.get(s) - 1;
+            if (n > 0) this.pending.set(s, n);
+            else this.pending.delete(s);
+            // Idle time counts from the end of the session's last job.
+            const frame = this.live.get(s);
+            if (frame) frame.lastUse = performance.now();
+        });
     }
 
     // Queue one job. A job that finds no frame for its session is parked, so
@@ -466,10 +480,13 @@ export class Runner {
     }
 
     // The first live session idle for at least `idleMs`, or null if none is.
-    // `live` is in LRU order, so the first match is the least recently used.
+    // A session with a job queued or running here is never idle: under load a
+    // job can wait in the queue longer than `idleMs`. `live` is in LRU order,
+    // so the first match is the least recently used.
     #evictable() {
         const now = performance.now();
         for (const [id, frame] of this.live) {
+            if (this.pending.has(id)) continue;
             if (now - (frame.lastUse ?? 0) >= this.idleMs) return id;
         }
         return null;

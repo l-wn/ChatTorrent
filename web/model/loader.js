@@ -405,7 +405,11 @@ export async function loadFile(baseUrl, filename, onBytes,
     const first = await fetchRange(url, 0, CHUNK - 1, { stallMs, retries });
     if (first.status !== 206) return first.buf;
 
-    const total = Number(first.range?.match(/\/(\d+)$/)?.[1]);
+    // A cross-origin page sees Content-Range only if the server's CORS policy
+    // exposes it, and the weights bucket's does not. The manifest's size is
+    // used then.
+    const fromRange = Number(first.range?.match(/\/(\d+)$/)?.[1]);
+    const total = fromRange > 0 ? fromRange : bytes;
     if (!Number.isFinite(total) || total <= 0) {
         throw new Error(`${filename}: 206 without a usable Content-Range `
             + `(${first.range ?? 'absent'})`);

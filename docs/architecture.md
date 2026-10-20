@@ -425,7 +425,9 @@ the eight frames share the two contexts' worth of pages rather than each
 reserving a full one.
 
 A session's frame or pages may only be taken from a session that has been idle
-for `IDLE_MS` (2 s). If every frame belongs to an active session, a new session
+for `IDLE_MS` (2 s), counted from the end of its last job here. A session with a
+job queued or running at a peer is never idle there, however long the queue. If
+every frame belongs to an active session, a new session
 waits in line at that peer (`Runner.waiting`), first come first served, and
 takes the first frame to go idle or be released; the jobs of the chats already
 running are not held up behind it. One that has waited `WAIT_MS` (30 s) is

@@ -46,6 +46,11 @@ function serve(behave) {
             res.socket.destroy();
             return;
         }
+        if (verdict === 'fail') {
+            res.writeHead(503);
+            res.end();
+            return;
+        }
         const range = verdict === 'ignore-range' ? null : req.headers.range;
         if (!range) {
             res.writeHead(200, { 'content-length': String(SIZE) });
@@ -56,7 +61,9 @@ function serve(behave) {
         const end = Math.min(to, SIZE - 1);
         const slice = BODY.subarray(from, end + 1);
         res.writeHead(206, {
-            'content-range': `bytes ${from}-${end}/${SIZE}`,
+            // 'hidden': what a browser shows a page when the server's CORS
+            // policy does not expose Content-Range.
+            ...(verdict !== 'hidden' && { 'content-range': `bytes ${from}-${end}/${SIZE}` }),
             'content-length': String(slice.length),
         });
         res.end(slice);
@@ -107,6 +114,20 @@ console.log('\nloadFile: a body that dies mid-stream (the QUIC failure)');
     const buf = await loadFile(url, 'w.bin');
     ok('falls back to ranges and still reassembles correctly', identical(buf));
     ok('and it really did fail first', [...seen.values()].some((n) => n > 2));
+    server.close();
+}
+
+console.log('\nloadFile: Content-Range not exposed by CORS');
+{
+    // The whole-file GET fails, so the ranged path runs, and no range shows
+    // its Content-Range. The manifest's size stands in for it.
+    const { server, url } = await serve((req) => req.headers.range ? 'hidden' : 'fail');
+    const buf = await loadFile(url, 'w.bin', undefined, { bytes: SIZE });
+    ok('the manifest size is used and the file reassembles', identical(buf));
+    let threw = null;
+    try { await loadFile(url, 'w.bin'); } catch (e) { threw = e; }
+    ok('without a manifest size it still says why',
+        /usable Content-Range/.test(threw?.message ?? ''), `${threw?.message}`);
     server.close();
 }
 
