@@ -468,6 +468,16 @@ it for the jobs it sends. Under the closed loop the head builds it for the jobs
 it feeds, from the whole context, which the loop's first job carries once and
 the head then keeps up to date.
 
+The head selects each sampled row's raw top M logits on the GPU
+(`kernels.js` `topkRows`, in the same submit as the LM head) and reads back
+only those (value, index) pairs. M is the top-k plus the number of penalized
+and banned ids (`sampling.js` `candidatesFor()`; 1 for greedy with no
+penalties). Every penalty only lowers a logit, so those M hold every token the
+whole row could give, and `sampleFromCandidates()` runs the sampler's own
+arithmetic on them and returns the same token for the same random draw. A row
+that needs the whole vocabulary (temp > 0 with no top-k, or M above 256) is
+read back and sampled whole.
+
 ## Speculative decoding
 
 With the page's Speculative decoding setting on (closed loop only), the head

@@ -15,7 +15,7 @@
 
 import { readFileSync, existsSync } from 'node:fs';
 import { Runner } from '../web/model/stage.js';
-import { makeGpu, D, L, N, weightsFor } from './stub-gpu.mjs';
+import { makeGpu, D, L, N, weightsFor, zeroTopk } from './stub-gpu.mjs';
 import { Mesh } from '../web/net.js';
 import { makeRouter, T_MAX } from '../web/route.js';
 import { N_MAX, SLOTS } from '../web/split.js';
@@ -61,7 +61,9 @@ function soloEngine({ eos = -1 } = {}) {
     });
     net.send = () => false;   // not called: a solo peer runs every job itself
 
-    const { device } = makeGpu();
+    // The head reads back candidate pairs (GPU sampling); the stub answers
+    // them as the GPU would for its all-zero logits.
+    const { device } = makeGpu({ fallback: zeroTopk });
     const runner = new Runner(device, D, weightsFor(0, N),
         { lo: 0, hi: N, have: N, nMax: N_MAX, tMax: T_MAX, slots: SLOTS, idleMs: 0 });
     const router = makeRouter({ net, runner: () => runner });

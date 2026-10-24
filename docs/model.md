@@ -220,7 +220,9 @@ dispatch shape:
 | `silu_mul`, `sigmoid_mul`, `add_inplace` | elementwise |
 | `causal_conv1d`, `update_conv_history` | Gated DeltaNet convolution |
 | `l2norm_heads`, `gated_delta_net_step` | Gated DeltaNet recurrence |
-| `copy_f32` | a buffer copy inside a compute pass (speculative snapshots) |
+| `copy_f32` | a buffer copy inside a compute pass (speculative snapshots, the MTP head's inputs) |
+| `argmax_rows` | each row's argmax as an f32 token id (the MTP draft chain) |
+| `topk_stage` | per-row top M (value, index), bitonic sort of 1024 per workgroup, staged (GPU sampling) |
 
 ## Verification
 

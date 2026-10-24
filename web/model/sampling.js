@@ -106,17 +106,69 @@ export function clampSampling(opts = {}, vocab = Infinity) {
 //
 // With every penalty off this is exact argmax / top-k.
 export function sampleFromLogitsRow(row, opts = {}) {
-    const { temp, topK, rep, freq, pres, pen, ban } = clampSampling(opts, row.length);
-    const adjusted = Float32Array.from(row);
+    return sampleCore(row, null, opts, row.length);
+}
 
-    if (ban) for (const id of ban) adjusted[id] = -Infinity;
+// The same sampler over a candidate set: the raw top-M logits of a row
+// (`ids`, `vals`, any order), as the GPU selects them (kernels.js topkRows).
+// With M from candidatesFor() the candidates hold every token the full row
+// could return, and the arithmetic, the order of the sums and the one call to
+// Math.random are the full row's, so the token is the same. The exception is
+// an exact tie at the top-k cutoff with a token outside the candidates.
+export function sampleFromCandidates(ids, vals, opts, vocab) {
+    const order = Array.from(ids.keys()).sort((a, b) => ids[a] - ids[b]);
+    return sampleCore(Float32Array.from(order, (i) => vals[i]), order.map((i) => ids[i]), opts, vocab);
+}
+
+// The most tokens the GPU selects per row (kernels.js topkRows keeps M of
+// every 1024 per stage).
+export const TOPK_MAX = 256;
+
+// How many raw top logits sampleFromCandidates() needs for `opts`, or null
+// when it needs the whole row (temp > 0 with no top-k, or more than TOPK_MAX).
+// Every penalty only lowers a logit (rep >= 1 divides positive and multiplies
+// negative ones, pres and freq subtract, a ban is -Infinity), so a token in
+// the post-penalty top k has at most k - 1 unpenalized and P penalized tokens
+// above it in raw order: the raw top k + P hold it.
+export function candidatesFor(opts, vocab) {
+    const { temp, topK, rep, freq, pres, pen, ban } = clampSampling(opts, vocab);
+    let k;
+    if (temp <= 0) k = 1;
+    else if (topK > 0 && topK < vocab) k = topK;
+    else return null;
+    const hit = new Set(ban ?? []);
+    if (pen && (rep !== 1.0 || freq !== 0 || pres !== 0)) for (const [id] of pen) hit.add(id);
+    const m = k + hit.size;
+    return m > TOPK_MAX ? null : Math.min(m, vocab);
+}
+
+// The sampler. `vals` are the logits of the tokens `ids` (null: of every
+// token, `vals` is the whole row), in ascending token order.
+function sampleCore(vals, ids, opts, vocab) {
+    const { temp, topK, rep, freq, pres, pen, ban } = clampSampling(opts, vocab);
+    const adjusted = Float32Array.from(vals);
+    let slot = (id) => id;
+    if (ids) {
+        const at = new Map(ids.map((id, i) => [id, i]));
+        slot = (id) => at.get(id);
+    }
+    const token = (i) => (ids ? ids[i] : i);
+
+    if (ban) {
+        for (const id of ban) {
+            const i = slot(id);
+            if (i !== undefined) adjusted[i] = -Infinity;
+        }
+    }
 
     if (pen && (rep !== 1.0 || freq !== 0 || pres !== 0)) {
         for (const [id, count] of pen) {
-            let v = adjusted[id];
+            const i = slot(id);
+            if (i === undefined) continue;
+            let v = adjusted[i];
             if (rep !== 1.0) v = v > 0 ? v / rep : v * rep;
             v -= pres + Math.min(freq * count, PEN_CAP);
-            adjusted[id] = v;
+            adjusted[i] = v;
         }
     }
 
@@ -125,13 +177,13 @@ export function sampleFromLogitsRow(row, opts = {}) {
         for (let i = 0; i < adjusted.length; i++) {
             if (adjusted[i] > bestV) { bestV = adjusted[i]; bestI = i; }
         }
-        return bestI;
+        return token(bestI);
     }
 
     const scaled = adjusted.map((v) => v / temp);
-    if (topK > 0 && topK < scaled.length) {
+    if (topK > 0 && topK < vocab) {
         // The cutoff is the k-th largest logit, found with an insertion-sorted
-        // window of the k best: one pass, O(V·k). Most tokens are rejected
+        // window of the k best: one pass, O(n·k). Most tokens are rejected
         // with one comparison.
         const best = new Float32Array(topK).fill(-Infinity);
         for (let i = 0; i < scaled.length; i++) {
@@ -157,7 +209,7 @@ export function sampleFromLogitsRow(row, opts = {}) {
     let cum = 0;
     for (let i = 0; i < scaled.length; i++) {
         cum += scaled[i];
-        if (r < cum) return i;
+        if (r < cum) return token(i);
     }
-    return scaled.length - 1;
+    return token(scaled.length - 1);
 }

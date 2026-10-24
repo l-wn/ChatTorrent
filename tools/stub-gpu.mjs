@@ -52,7 +52,10 @@ export const marker = (tag) => ({ __tag: tag, ...mappable(1 << 16) });
 // nothing (a resolved query reads back as zeros), but it counts the passes
 // opened and the passes with timestamp writes, which is enough to check for
 // one timed pass per dispatch.
-export function makeGpu({ timestamps = false } = {}) {
+//
+// `fallback(bytes)` fills a readback when no one-shot fill is set (null:
+// zeros).
+export function makeGpu({ timestamps = false, fallback = null } = {}) {
     let trace = [];
     const passes = { opened: 0, timed: 0, resolved: 0, cleared: 0 };
     // The contents of the next readback. The stub does no arithmetic, so a
@@ -70,7 +73,7 @@ export function makeGpu({ timestamps = false } = {}) {
         ...mappable(size),
         getMappedRange(offset = 0, length) {
             const n = length ?? size - offset;
-            const f = fill?.(n);
+            const f = fill ? fill(n) : fallback?.(n);
             fill = null;
             return f ? f.buffer : new ArrayBuffer(n);
         },
@@ -129,6 +132,18 @@ export function makeGpu({ timestamps = false } = {}) {
         passes,
     };
 }
+
+// What kernels.js topkRows reads back for an all-zero logits row: M (value,
+// index) pairs, value 0, ids 0..M-1 (ties go to the lower index). For a
+// fallback that answers a head's candidate readback (8 bytes a pair) as the
+// GPU would.
+export const zeroTopk = (bytes) => {
+    if (bytes % 8 !== 0) return null;
+    const out = new Float32Array(bytes / 4);
+    const ids = new Uint32Array(out.buffer);
+    for (let m = 0; m < bytes / 8; m++) ids[m * 2 + 1] = m;
+    return out;
+};
 
 // A shared instance, for suites that drive one Runner at a time.
 export const { device, setFill, resetTrace, getTrace, takeTrace } = makeGpu();

@@ -16,10 +16,11 @@
 
 import {
     F32, DIMS, uploadF32, uploadF16, uploadQ8, makeStorage, readF32,
-    matmulNobias, GEMV_ROWS_MAX, gatherEmbedNoPos, rmsnorm, reshapeHeads, scatterKV, rope,
+    matmulNobias, GEMV_ROWS_MAX, topkRows, topkPairs, argmaxRows, gatherEmbedNoPos, rmsnorm, reshapeHeads, scatterKV, rope,
     qkScoresGQA, causalSoftmax, attnAVGQA, mergeHeads, addInplace, siluMul, withPass,
     sigmoidMul, causalConv1d, l2NormalizeHeads, gatedDeltaNetStep, updateConvHistory,
 } from '../model/kernels.js';
+import { sampleFromLogitsRow, sampleFromCandidates, candidatesFor } from '../model/sampling.js';
 
 // --- Harness ---
 
@@ -963,6 +964,90 @@ async function testAttentionRowsBitwise(device, r) {
         bitwise ? 'bitwise' : `not bitwise, max diff ${worst.toExponential(2)}`);
 }
 
+// The head samples from the raw top-M logits of each row (sampling.js
+// candidatesFor). topkRows must return exactly the CPU's top M: the same ids
+// in the same order, larger value first, ties to the lower index.
+async function testTopkRows(device, r) {
+    const rng = makeRng(41);
+    for (const [V, T, Ms] of [[3001, 3, [1, 40, 200]], [248320, 8, [40, 104, 256]]]) {
+        const X = new Float32Array(T * V);
+        for (let i = 0; i < X.length; i++) X[i] = Math.round((rng() - 0.5) * 2000) / 64;   // many ties
+        for (let t = 0; t < T; t++) X[t * V + 5] = -Infinity;
+        const xb = uploadF32(device, X);
+        // Each row's ids, best first, sorted once for every M.
+        const sorted = Array.from({ length: T }, (_, t) => {
+            const row = X.subarray(t * V, (t + 1) * V);
+            return Array.from(row.keys()).sort((p, q) => row[q] - row[p] || p - q);
+        });
+        for (const M of Ms) {
+            const n = topkPairs(T, V, M) * 8;
+            const a = makeStorage(device, n), b = makeStorage(device, n);
+            let out;
+            submit(device, 'topk', (pass) => { out = topkRows(device, pass, xb, T, V, M, a, b); });
+            const pairs = await readF32(device, out, T * M * 8);
+            const ids = new Uint32Array(pairs.buffer);
+            let ok = true, detail = '';
+            for (let t = 0; t < T && ok; t++) {
+                const row = X.subarray(t * V, (t + 1) * V);
+                const want = sorted[t];
+                for (let m = 0; m < M; m++) {
+                    const id = ids[(t * M + m) * 2 + 1], v = pairs[(t * M + m) * 2];
+                    if (id !== want[m] || !Object.is(v, row[want[m]])) {
+                        ok = false; detail = `row ${t} slot ${m}: got ${id} (${v}), want ${want[m]} (${row[want[m]]})`;
+                        break;
+                    }
+                }
+            }
+            r.assert(`topk_rows V=${V} T=${T} M=${M}: the CPU's top M, in order`, ok, detail);
+        }
+    }
+}
+
+// GPU sampling end to end: the GPU's top M and sampleFromCandidates pick the
+// token sampleFromLogitsRow picks from the whole row, with the same random
+// draw.
+async function testGpuSampling(device, r) {
+    const rng = makeRng(43);
+    const V = 248320, T = 4;
+    const X = new Float32Array(T * V);
+    for (let i = 0; i < X.length; i++) X[i] = (rng() - 0.5) * 6;
+    for (let j = 0; j < 200; j++) X[Math.floor(rng() * X.length)] += rng() * 14;
+    const xb = uploadF32(device, X);
+    let same = 0, n = 0, detail = '';
+    const real = Math.random;
+    for (const opts of [
+        { temp: 0 }, { temp: 0.7, topK: 40 }, { temp: 1, topK: 200 },
+        { temp: 0.7, topK: 40, rep: 1.3, freq: 0.5, pres: 0.4, pen: [[7, 3], [11, 1]], ban: [13, 17] },
+    ]) {
+        const M = candidatesFor(opts, V);
+        const size = topkPairs(T, V, M) * 8;
+        const a = makeStorage(device, size), b = makeStorage(device, size);
+        let out;
+        submit(device, 'gpu sampling', (pass) => { out = topkRows(device, pass, xb, T, V, M, a, b); });
+        const pairs = await readF32(device, out, T * M * 8);
+        const ids = new Uint32Array(pairs.buffer);
+        for (let t = 0; t < T; t++) {
+            // Penalize and ban the row's actual top ids, so the penalties bite.
+            const row = X.subarray(t * V, (t + 1) * V);
+            const top = Array.from({ length: M }, (_, m) => ids[(t * M + m) * 2 + 1]);
+            const o = opts.pen ? { ...opts, pen: [[top[0], 3], [top[2], 1]], ban: [top[1]] } : opts;
+            const Mo = candidatesFor(o, V);
+            const seed = Math.floor(rng() * 1e9);
+            let st = seed;
+            const draw = () => { st = (Math.imul(st, 1664525) + 1013904223) >>> 0; return st / 4294967296; };
+            Math.random = draw;
+            const want = sampleFromLogitsRow(row, o);
+            st = seed;
+            const got = sampleFromCandidates(top.slice(0, Mo), Array.from({ length: Mo }, (_, m) => pairs[(t * M + m) * 2]), o, V);
+            Math.random = real;
+            n++;
+            if (got === want) same++;
+            else detail ||= `opts ${JSON.stringify(o)} row ${t}: got ${got}, want ${want}`;
+        }
+    }
+    r.assert(`GPU top-M + candidates == the whole row's token (${same}/${n})`, same === n, detail);
+}
+
 async function testAddInplace(device, r) {
     const N = 1000;                                 // not a multiple of 256
     const rng = makeRng(8);
@@ -1190,6 +1275,8 @@ export async function runAllTests(device) {
     await testRope(device, r);
     await testAttention(device, r);
     await testAttentionRowsBitwise(device, r);
+    await testTopkRows(device, r);
+    await testGpuSampling(device, r);
     await testSigmoidMul(device, r);
     await testCausalConv1d(device, r);
     await testUpdateConvHistory(device, r);

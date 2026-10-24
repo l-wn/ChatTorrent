@@ -985,8 +985,9 @@ console.log('\nspeculative verify: the next job keeps a prefix of the verify, pe
     ok('which the next verify takes',
         (await refusal(r.run(verify('c', 3, [0]), null))) === null && r.specLive.has('c'));
     const bytes = r.vramBytes;
-    ok('replay slots and the verify readback are counted in vramBytes',
-        r.specFree.length + r.specLive.size === 2 && bytes > 0 && r.specReadback !== null);
+    ok('replay slots and the GPU sampling buffers are counted in vramBytes',
+        r.specFree.length + r.specLive.size === 2 && bytes > 0 && r.topk !== null
+        && r.specReadback === null);
 
     // Full attention needs no replay, but takes the same window.
     const full = hy(2, 3);
@@ -1016,6 +1017,34 @@ console.log('\nspeculative verify: the next job keeps a prefix of the verify, pe
     const bad = await refusal(r.run({ ...verify('c', 4, [0]), drafts: [0, 0] }, null));
     ok('a verify whose drafts do not fit its ids is refused', /draft ids/.test(bad?.message ?? ''),
         `got ${bad?.message}`);
+}
+
+console.log('\nGPU sampling: the head reads back candidates, not logits rows');
+{
+    // The stub's readback hook sees each readback's size. A head job reads
+    // back M (value, index) pairs per sampled row (sampling.js candidatesFor),
+    // except when a row needs the whole logits row.
+    const gpu = makeGpu();
+    const r = new Runner(gpu.device, D, weightsFor(0, N), { lo: 0, hi: N, nMax: 64, tMax: 8, slots: 2, idleMs: 0 });
+    const sizes = [];
+    const watch = () => gpu.setFill((n) => { sizes.push(n); return null; });
+    const job = (past, n, opts, extra = {}) =>
+        ({ k: 'job', s: 'a', pos: 0, past, n, ids: Array(n).fill(1), opts, ...extra });
+
+    watch(); await r.run(job(0, 4, { temp: 0 }), null);
+    eq('greedy, no penalties: one pair (8 bytes)', sizes.pop(), 8);
+    // The stub's vocabulary is 33, so top-k needs k < 33.
+    watch(); await r.run(job(4, 1, { temp: 0.7, topK: 10, pres: 0.1, pen: [[3, 2], [5, 1]] }), null);
+    eq('top-k 10 with 2 penalized ids: 12 pairs', sizes.pop(), 12 * 8);
+    watch(); await r.run(job(5, 1, { temp: 0.7, topK: 40 }), null);
+    eq('a top-k at or above the vocabulary is no top-k: the whole row', sizes.pop(), D.vocab * 4);
+    watch(); await r.run(job(6, 1, { temp: 0.7, topK: 0 }), null);
+    eq('temp > 0 with no top-k: the whole logits row', sizes.pop(), D.vocab * 4);
+    // A verify job: every row, at the largest M any row needs.
+    watch(); await r.run(job(7, 3, { temp: 0.7, topK: 5 }, { drafts: [0, 0], auto: true,
+        rowOpts: [{ temp: 0.7, topK: 5, ban: [1, 2, 3] }, { temp: 0.7, topK: 5 }] }), null);
+    eq('a verify of 3 rows, one with 3 banned ids: 3 rows of 8 pairs', sizes.pop(), 3 * 8 * 8);
+    ok('the head made its sampling buffers once', r.topk !== null && r.specReadback === null);
 }
 
 console.log('\nthe MTP draft head: a head holding it drafts after the sample');

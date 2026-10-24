@@ -1227,6 +1227,70 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 }
 `;
 
+// --- topk_stage ---
+// One stage of the per-row top-M selection (topkRows). Each workgroup loads
+// 1024 (value, index) pairs of one row, bitonic-sorts them best first (larger
+// value, then lower index) and writes its top M. The first stage reads a
+// logits row (index = position); later stages read the pairs the stage before
+// wrote. Pairs are vec2<f32> with the index bitcast. Rows are on dispatch y,
+// from source row `row0`.
+// bindings: src, dst, u{n, M, srcStride, dstStride, row0}   dispatch: ceil(n/1024), rows
+export const TOPK_CHUNK = 1024;
+export const topkStageSrc = (first) => memoSrc(`topk_stage:${first}`, () => /* wgsl */ `
+struct U { n: u32, M: u32, srcStride: u32, dstStride: u32, row0: u32, _a: u32, _b: u32, _c: u32 }
+@group(0) @binding(0) var<storage, read>       src: array<${first ? 'f32' : 'vec2<f32>'}>;
+@group(0) @binding(1) var<storage, read_write> dst: array<vec2<f32>>;
+@group(0) @binding(2) var<uniform>             u: U;
+
+var<workgroup> sv: array<f32, 1024>;
+var<workgroup> si: array<u32, 1024>;
+
+fn better(av: f32, ai: u32, bv: f32, bi: u32) -> bool {
+  return av > bv || (av == bv && ai < bi);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let row = wg.y;
+  let base = wg.x * 1024u;
+  for (var t = 0u; t < 4u; t++) {
+    let k = lid.x + t * 256u;
+    let i = base + k;
+    if (i < u.n) {
+${first ? `      sv[k] = src[(u.row0 + row) * u.srcStride + i];
+      si[k] = i;` : `      let p = src[row * u.srcStride + i];
+      sv[k] = p.x;
+      si[k] = bitcast<u32>(p.y);`}
+    } else {
+      // -inf, below every logit. The u.n & 0u term keeps it out of
+      // constant evaluation, which rejects an infinite f32.
+      sv[k] = bitcast<f32>(0xff800000u | (u.n & 0u));
+      si[k] = 0xffffffffu;
+    }
+  }
+  workgroupBarrier();
+  for (var size = 2u; size <= 1024u; size <<= 1u) {
+    for (var stride = size >> 1u; stride > 0u; stride >>= 1u) {
+      for (var t = 0u; t < 4u; t++) {
+        let i = lid.x + t * 256u;
+        let l = i ^ stride;
+        if (l > i) {
+          let up = (i & size) == 0u;
+          if (up == better(sv[l], si[l], sv[i], si[i])) {
+            let tv = sv[i]; sv[i] = sv[l]; sv[l] = tv;
+            let ti = si[i]; si[i] = si[l]; si[l] = ti;
+          }
+        }
+      }
+      workgroupBarrier();
+    }
+  }
+  for (var m = lid.x; m < u.M; m += 256u) {
+    dst[row * u.dstStride + wg.x * u.M + m] = vec2<f32>(sv[m], bitcast<f32>(si[m]));
+  }
+}
+`);
+
 // --- silu_mul ---
 // out[i] = silu(gate[i]) * up[i], silu(z) = z / (1 + exp(-z)).
 // Two input buffers and a separate output.
@@ -1801,6 +1865,31 @@ export function copyF32(device, pass, src, dst, N, srcOff = 0, dstOff = 0) {
     const bg = bind(device, p, [src, dst, u]);
     dispatch(pass, p, bg, wgX, Math.ceil(N / rowLen), 1, 'copy_f32');
 }
+
+// The top M (value, index) pairs of each of T rows of `logits` [., V] from row
+// `row0`, best first, ties to the lower index. Runs topk_stage until one workgroup's
+// output is left, ping-ponging between `a` and `b`, each at least
+// T * ceil(V / 1024) * M pairs. Returns the buffer holding the result, M
+// pairs per row.
+export function topkRows(device, pass, logits, T, V, M, a, b, row0 = 0) {
+    // Each stage keeps M of every 1024, so M must be well below 1024 for the
+    // stages to converge.
+    if (!(M >= 1 && M <= TOPK_CHUNK / 4)) throw new Error(`topkRows: M ${M} is outside 1–${TOPK_CHUNK / 4}`);
+    let src = logits, n = V, first = true, out = a, other = b;
+    for (;;) {
+        const groups = Math.ceil(n / TOPK_CHUNK);
+        const p  = getPipeline(device, topkStageSrc(first));
+        const u  = uniform(device, new Uint32Array([n, M, first ? V : n, groups * M, first ? row0 : 0, 0, 0, 0]));
+        const bg = bind(device, p, [src, out, u]);
+        dispatch(pass, p, bg, groups, T, 1, 'topk_stage');
+        if (groups === 1) return out;
+        src = out; n = groups * M; first = false;
+        [out, other] = [other, out];
+    }
+}
+
+// Pairs topkRows() needs in each of its two buffers.
+export const topkPairs = (T, V, M) => T * Math.ceil(V / TOPK_CHUNK) * M;
 
 // ids[idOff + r] = argmax of row r of x[T, N], as an f32 token id.
 export function argmaxRows(device, pass, x, ids, T, N, idOff = 0) {

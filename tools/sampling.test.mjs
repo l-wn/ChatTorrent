@@ -6,7 +6,8 @@
 //
 //   node tools/sampling.test.mjs
 
-import { penaltyState, sampleFromLogitsRow, clampSampling, LIMITS } from '../web/model/sampling.js';
+import { penaltyState, sampleFromLogitsRow, sampleFromCandidates, candidatesFor, clampSampling, LIMITS,
+         TOPK_MAX } from '../web/model/sampling.js';
 
 let pass = 0, fail = 0;
 const ok = (name, cond, detail = '') => {
@@ -129,6 +130,70 @@ console.log('\nclampSampling: a job cannot ask for more than LIMITS');
     sampleFromLogitsRow(big, { temp: 1, topK: 99999 });
     const ms = performance.now() - t0;
     ok(`topK 99999 on a ${V}-token row is cheap (${ms.toFixed(0)} ms)`, ms < 1000);
+}
+
+console.log('\nsampleFromCandidates: the raw top-M give the full row\'s token');
+{
+    // The GPU hands the head only the raw top-M logits (candidatesFor), and
+    // the head must pick the token the full row would. Math.random is
+    // replaced by a seeded sequence, replayed for both paths.
+    let seed = 12345;
+    const next = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; };
+    const real = Math.random;
+    const V = 3001;                                 // not a multiple of 1024
+    let cases = 0, same = 0, fellBack = 0, first = null, wrongShort = 0;
+    for (let c = 0; c < 3000; c++) {
+        const row = new Float32Array(V);
+        // Peaky logits, like a real head: a few tall values over noise.
+        for (let i = 0; i < V; i++) row[i] = (next() - 0.5) * 4;
+        for (let j = 0; j < 30; j++) row[Math.floor(next() * V)] += next() * 12;
+        const byValue = Array.from(row.keys()).sort((a, b) => row[b] - row[a] || a - b);
+        const pick = (n, from) => Array.from({ length: n }, () => byValue[Math.floor(next() * from)]);
+        const kind = c % 6;
+        const opts = {
+            temp: kind === 0 ? 0 : [0.3, 0.7, 1, 1.5][c % 4],
+            topK: [1, 5, 40, 200][c % 4],
+            rep: kind >= 2 ? 1 + next() : 1,
+            freq: kind >= 3 ? next() * 2 : 0,
+            pres: kind >= 3 ? next() * 2 : 0,
+            // Penalized and banned ids from inside and around the top.
+            pen: kind >= 2 ? pick(1 + (c % 30), 120).map((id) => [id, 1 + (c % 5)]) : undefined,
+            ban: kind >= 4 ? pick(1 + (c % 8), 60) : undefined,
+        };
+        const M = candidatesFor(opts, V);
+        if (M == null) { fellBack++; continue; }
+        const top = byValue.slice(0, M);
+        // The control: k candidates only, ignoring the penalized ones.
+        const k = opts.temp <= 0 ? 1 : opts.topK;
+        const short = byValue.slice(0, k);
+        const s0 = next() * 4294967296 >>> 0;
+        seed = s0; Math.random = next;
+        const want = sampleFromLogitsRow(row, opts);
+        seed = s0;
+        const got = sampleFromCandidates(top, top.map((i) => row[i]), opts, V);
+        seed = s0;
+        const tooFew = sampleFromCandidates(short, short.map((i) => row[i]), opts, V);
+        Math.random = real;
+        cases++;
+        if (got === want) same++;
+        else first ??= { c, opts, got, want, M };
+        if (tooFew !== want) wrongShort++;
+    }
+    ok(`control: with only k candidates, ${wrongShort} of ${cases} tokens differ`, wrongShort > 0);
+    ok(`every one of ${cases} random rows and settings gives the same token`, same === cases,
+        JSON.stringify(first));
+    eq('none needed the whole row (each has a top-k or is greedy)', fellBack, 0);
+    // Greedy with no penalties needs one candidate: the GPU's argmax.
+    eq('greedy, no penalties: one candidate', candidatesFor({ temp: 0 }, V), 1);
+    eq('top-k 40 with 3 penalized ids and 2 banned: 45',
+        candidatesFor({ temp: 0.7, topK: 40, pres: 0.1, pen: [[1, 1], [2, 1], [3, 1]], ban: [4, 5] }, V), 45);
+    eq('a banned id that is also penalized counts once',
+        candidatesFor({ temp: 0.7, topK: 40, pres: 0.1, pen: [[1, 1]], ban: [1] }, V), 41);
+    eq('penalties that are off add nothing',
+        candidatesFor({ temp: 0.7, topK: 40, pen: [[1, 1], [2, 1]] }, V), 40);
+    eq('temp > 0 with no top-k needs the whole row', candidatesFor({ temp: 0.7, topK: 0 }, V), null);
+    eq('more than TOPK_MAX candidates needs the whole row',
+        candidatesFor({ temp: 0.7, topK: 40, ban: Array.from({ length: TOPK_MAX }, (_, i) => i) }, 1e6), null);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

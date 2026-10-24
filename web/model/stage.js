@@ -15,12 +15,13 @@
 // See docs/architecture.md (KV cache and admission, Routing, Failures).
 
 import { F32, makeStorage, makeReadback, readF32, gatherEmbedNoPos, rmsnorm, matmulNobias,
-         withPass, counters, copyF32 } from './kernels.js';
+         withPass, counters, copyF32, topkRows, topkPairs } from './kernels.js';
 import { block, makeCache, makeScratch, makeRecurrentState, recurrentStateBytes,
          makePagePool, makeSessionFrame, ensurePages, freePages, makeReplayLayer,
          replayLayerBytes, mtpBlock, mtpChain, makeMtpScratch } from './model.js';
 import { makeGpuProf } from './gpuprof.js';
 import { sampleFromLogitsRow } from './generate.js';
+import { sampleFromCandidates, candidatesFor, TOPK_MAX } from './sampling.js';
 import { positions, blockRange, PAGE_TOKENS, IDLE_MS, WAIT_MS, SPEC_COLS } from '../split.js';
 
 // The session id a warm-up pass runs under. Peer-minted ids are
@@ -151,6 +152,7 @@ export class Runner {
         this.specFree = [];
         this.specLive = new Map();                           // session -> slot
         this.specReadback = null;                            // the head's verify rows
+        this.topk = null;                                    // GPU sampling's buffers
     }
 
     // `embed` needs `w.wte`. `head` needs `w.norm` and `w.lm_head` (or `w.wte`
@@ -169,6 +171,7 @@ export class Runner {
         if (this.warm) bytes += this.warm.bytes;
         for (const slot of [...this.specFree, ...this.specLive.values()]) bytes += slot.bytes;
         if (this.specReadback) bytes += this.specReadback.size;
+        if (this.topk) bytes += this.topk.bytes;
         return bytes + (this.mtpBytes ?? 0);
     }
 
@@ -314,6 +317,19 @@ export class Runner {
         for (const slot of this.specLive.values()) {
             if (atStart) slot.layers.unshift(null); else slot.layers.push(null);
         }
+    }
+
+    // GPU sampling's buffers (kernels.js topkRows): the two it ping-pongs
+    // between, and the readback of the candidates, sized for SPEC_COLS rows of
+    // TOPK_MAX. Made the first time this Runner samples.
+    #topkBuffers() {
+        if (this.topk) return this.topk;
+        const pairs = topkPairs(SPEC_COLS, this.d.vocab, TOPK_MAX) * 8;
+        const readback = SPEC_COLS * TOPK_MAX * 8;
+        return this.topk = {
+            a: makeStorage(this.device, pairs), b: makeStorage(this.device, pairs),
+            readback: makeReadback(this.device, readback), bytes: 2 * pairs + readback,
+        };
     }
 
     // The buffer the head reads verify rows back into: SPEC_COLS logits rows,
@@ -1004,6 +1020,20 @@ export class Runner {
             this.#pagesFor(h.s, cache, mtp ? Math.min(this.nMax, h.past + T + SPEC_COLS) : h.past + T);
         }
         const fill = mtp && Array.isArray(h.ids) && h.ids.length === T;
+
+        // The rows the head samples (the last, or every row of a verify) and
+        // the sampler settings of each. The GPU selects each row's raw top M
+        // logits (sampling.js candidatesFor), and only those are read back.
+        // null M: some row needs the whole row (temp > 0 with no top-k).
+        const sampled = head && !spent ? (verify ? T : 1) : 0;
+        const optsOf = (i) => (i === 0 ? h.opts : (h.rowOpts?.[i - 1] ?? h.opts));
+        let M = sampled ? 0 : null;
+        for (let i = 0; i < sampled && M !== null; i++) {
+            const m = candidatesFor(optsOf(i), d.vocab);
+            M = m === null ? null : Math.max(M, m);
+        }
+        const topk = M ? this.#topkBuffers() : null;
+        let picked = null;
         if (fill) device.queue.writeBuffer(this.mtpScratch.mtpIds, 0, Float32Array.from(h.ids));
 
         // writeBuffer is ordered on the queue, so these are applied before the
@@ -1041,6 +1071,8 @@ export class Runner {
                 rmsnorm(device, pass, s.x, this.w.norm, s.h, T, H, d.rms_eps);
                 matmulNobias(device, pass, s.h, this.w.lm_head ?? this.w.wte,
                              s.logits, T, H, d.vocab);
+                if (topk) picked = topkRows(device, pass, s.logits, sampled, d.vocab, M,
+                                            topk.a, topk.b, verify ? 0 : T - 1);
             }
             // The MTP layer's KV for this job's positions. Row r pairs the
             // token at past + r with the trunk's hidden state at past + r - 1:
@@ -1061,9 +1093,11 @@ export class Runner {
         // enqueuer keeps only the last chunk's token.
         const rowBytes = d.vocab * F32;
         const rows = head && verify;
-        const bytes = rows ? T * rowBytes : head ? rowBytes : T * H * F32;
-        const readback = rows ? this.#verifyReadback() : s.readback;
-        if (!spent) {
+        const bytes = topk ? sampled * M * 8 : rows ? T * rowBytes : head ? rowBytes : T * H * F32;
+        const readback = topk ? topk.readback : rows ? this.#verifyReadback() : s.readback;
+        if (topk) {
+            enc.copyBufferToBuffer(picked, 0, readback, 0, bytes);
+        } else if (!spent) {
             enc.copyBufferToBuffer(head ? s.logits : s.x, head && !rows ? (T - 1) * rowBytes : 0,
                                    readback, 0, bytes);
         }
@@ -1106,6 +1140,16 @@ export class Runner {
             bindGroups: c1.bindGroupsBuilt - c0.bindGroupsBuilt,
         };
 
+        // Sample row i of those read back: from its candidates, or from the
+        // whole logits row.
+        const ids = topk ? new Uint32Array(out.buffer, out.byteOffset, out.length) : null;
+        const sampleRow = (i) => {
+            if (!topk) return sampleFromLogitsRow(out.subarray(i * d.vocab, (i + 1) * d.vocab), optsOf(i));
+            const c = [], v = [];
+            for (let m = 0; m < M; m++) { v.push(out[(i * M + m) * 2]); c.push(ids[(i * M + m) * 2 + 1]); }
+            return sampleFromCandidates(c, v, optsOf(i), d.vocab);
+        };
+
         // `at` is the cursor's new position. The caller routes on it.
         if (head && rows) {
             // Row i predicts the token after ids[i]. Each is sampled exactly as
@@ -1114,10 +1158,9 @@ export class Runner {
             // before it were accepted). The draft is accepted while the sample
             // matches it. The first mismatch is the next token, and so is the
             // sample after the last draft when every draft is accepted.
-            const V = d.vocab, tokens = [];
+            const tokens = [];
             for (let i = 0; i < T; i++) {
-                const opts = i === 0 ? h.opts : (h.rowOpts?.[i - 1] ?? h.opts);
-                const t = sampleFromLogitsRow(out.subarray(i * V, (i + 1) * V), opts);
+                const t = sampleRow(i);
                 tokens.push(t);
                 if (i === T - 1 || t !== drafts[i]) break;
             }
@@ -1132,7 +1175,7 @@ export class Runner {
             // h.opts already holds the repetition summary, computed from the
             // token history by the enqueuer or by the head in a closed loop
             // (route.js's jobOpts()).
-            const token = sampleFromLogitsRow(out, h.opts);
+            const token = sampleRow(0);
             phases.sample = ms(t4, performance.now());
             const next = mtp ? await this.#mtpAfter(h, cache, T - 1, token) : null;
             if (mtp) phases.mtp = ms(t4, performance.now()) - phases.sample;
