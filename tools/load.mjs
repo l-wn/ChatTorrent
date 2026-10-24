@@ -20,6 +20,11 @@
 //   --turns N          prompts each visitor sends (default 2; 0 = join only)
 //   --think S          pause before each prompt, 0.5x to 1.5x this (default 10)
 //   --tokens N         the page's "Max tokens" setting for every reply (default 64)
+//   --spec             turn the page's Speculative decoding setting on
+//   --greedy           temperature 0 and every repetition penalty off
+//   --prompts SET      chat (default): short questions; copy: replies that
+//                      repeat text (lists, code twice, tables), where
+//                      speculative decoding's prompt lookup finds drafts
 //   --leave P          chance, per turn, that the visitor closes the tab part
 //                      way into the reply (default 0)
 //   --leave-after S    when: 0.3x to 1.7x this many seconds after Send
@@ -28,6 +33,11 @@
 //                      not closing each as it finishes
 //   --contributors N   tabs that answer "yes" and serve on this machine's GPU,
 //                      opened first; visitors arrive once the model is covered
+//   --hold             keep the contributors serving after the visitors are
+//                      done, until the process is stopped (SIGINT or SIGTERM).
+//                      Waits for the model to be covered with no time limit
+//   --vram LIMIT       the contributors' VRAM limit setting (e.g. 22gb; the
+//                      page's default applies without it)
 //   --ready S          how long a visitor waits to be able to prompt (default 120)
 //   --timeout S        how long a visitor waits for one reply (default 600)
 //   --seed N           seeds arrivals, pauses, prompts and departures
@@ -61,10 +71,15 @@ const RAMP       = Number(opt('ramp', 30));
 const TURNS      = Number(opt('turns', 2));
 const THINK      = Number(opt('think', 10));
 const TOKENS     = Number(opt('tokens', 64));
+const SPEC       = has('spec');
+const GREEDY     = has('greedy');
+const PROMPT_SET = opt('prompts', 'chat');
 const LEAVE      = Number(opt('leave', 0));
 const LEAVE_S    = Number(opt('leave-after', 6));
 const STAY       = has('stay');
 const CONTRIB    = Number(opt('contributors', 0));
+const HOLD       = has('hold');
+const VRAM       = opt('vram', null);
 const READY_S    = Number(opt('ready', 120));
 const TIMEOUT_S  = Number(opt('timeout', 600));
 const SEED       = Number(opt('seed', 1));
@@ -88,7 +103,7 @@ function rng(seed) {
 
 // Short questions with short answers. The load is the number of visitors; a
 // long prompt would measure prefill.
-const PROMPTS = [
+const CHAT_PROMPTS = [
     'What is the capital of Australia?',
     'Explain what a hash table is in two sentences.',
     'Give me three names for a grey cat.',
@@ -100,6 +115,17 @@ const PROMPTS = [
     'Tell me one fact about octopuses.',
     'Translate "good morning" into French and Spanish.',
 ];
+
+// Replies that repeat text the model has already written or been given.
+const COPY_PROMPTS = [
+    'Write a Python function that checks whether a number is prime. Then write the same function again, with type hints and a docstring.',
+    'List the numbers from 1 to 60, separated by commas.',
+    'Write an HTML table with one row per planet of the solar system, with columns for name, diameter and number of moons.',
+    'Repeat this sentence five times, numbered: The quick brown fox jumps over the lazy dog.',
+    'Write a JSON array of six users, each with id, name, email and active fields.',
+];
+
+const PROMPTS = PROMPT_SET === 'copy' ? COPY_PROMPTS : CHAT_PROMPTS;
 
 // --- What runs in the page ---
 //
@@ -138,6 +164,20 @@ const waitReady = async ({ timeout }) => {
     }
 };
 
+// For a contributor: the page's VRAM limit field, as typed into it. The page
+// applies it to its engine, which exists once the tab holds a range, so it
+// waits for that first.
+const setVram = async (limit) => {
+    const until = performance.now() + 300000;
+    while (!/ · blocks /.test(document.getElementById('role').textContent) && performance.now() < until) {
+        await new Promise((r) => setTimeout(r, 500));
+    }
+    const el = document.getElementById('vramlimit');
+    el.value = limit;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+};
+
 // For a contributor: wait until the roster shows every position held.
 const waitCovered = async ({ timeout }) => {
     for (;;) {
@@ -151,7 +191,7 @@ const waitCovered = async ({ timeout }) => {
 
 // Send one prompt and wait from the click on Send until the composer is
 // enabled again.
-const turn = async ({ text, tokens, timeout }) => {
+const turn = async ({ text, tokens, timeout, spec, greedy }) => {
     const $ = (id) => document.getElementById(id);
     const errors = () => [...document.querySelectorAll('#messages .msg.note.err')];
     const notes = () => [...document.querySelectorAll('#messages .msg.note:not(.err)')];
@@ -169,6 +209,8 @@ const turn = async ({ text, tokens, timeout }) => {
     if ($('send').disabled) return { outcome: 'not-ready', error: $('status').textContent };
 
     $('maxtok').value = String(tokens);
+    if ($('spec')) $('spec').value = spec ? 'on' : 'off';
+    if (greedy) for (const [id, v] of [['temp', 0], ['freq', 0], ['pres', 0], ['rep', 1], ['ngram', 0]]) $(id).value = String(v);
     $('input').value = text;
     const t0 = performance.now();
     $('send').click();
@@ -313,7 +355,7 @@ if (has('summarize')) {
 const records = [];
 const started = Date.now();
 function record(r) {
-    const row = { label: LABEL, at: Date.now() - started, ...r };
+    const row = { label: LABEL, at: Date.now() - started, spec: SPEC, greedy: GREEDY, prompts: PROMPT_SET, ...r };
     records.push(row);
     if (OUT) appendFileSync(OUT, `${JSON.stringify(row)}\n`);
     return row;
@@ -407,7 +449,7 @@ async function visitor(i) {
         peak = Math.max(peak, inflight);
         let r;
         try {
-            const asked = tab.eval(call(turn, { text, tokens: TOKENS, timeout: TIMEOUT_S * 1000 }),
+            const asked = tab.eval(call(turn, { text, tokens: TOKENS, timeout: TIMEOUT_S * 1000, spec: SPEC, greedy: GREEDY }),
                 { timeout: (TIMEOUT_S + 60) * 1000 });
             if (leaves) {
                 // A visitor who gives up: the tab closes mid-reply.
@@ -442,11 +484,13 @@ try {
         const tab = await openPage(`c${c}`, { own: false });
         open.add(tab);
         await tab.eval(call(answerWelcome, true));
-        console.log(`c${c}: contributing`);
+        if (VRAM) await tab.eval(call(setVram, VRAM));
+        console.log(`c${c}: contributing${VRAM ? `, VRAM limit ${VRAM}` : ''}`);
     }
     if (CONTRIB) {
         const first = [...open][0];
-        const covered = await first.eval(call(waitCovered, { timeout: 600000 }), { timeout: 660000 });
+        const ms = HOLD ? 7 * 86400000 : 600000;
+        const covered = await first.eval(call(waitCovered, { timeout: ms }), { timeout: ms + 60000 });
         if (!covered) throw new Error('the model was not covered after 10 minutes');
         console.log('model covered');
     }
@@ -455,6 +499,10 @@ try {
     console.log(`\n${summarize(records)}`);
     console.log(`  most replies in flight at once, from here: ${peak}`);
     if (OUT) console.log(`  records appended to ${OUT}`);
+    if (HOLD) {
+        console.log('holding: contributors keep serving until stopped');
+        await new Promise((res) => { process.once('SIGINT', res); process.once('SIGTERM', res); });
+    }
 } catch (err) {
     failed = true;
     console.error(err);

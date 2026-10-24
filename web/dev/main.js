@@ -16,6 +16,8 @@
 
 import { DIMS, adapterLabel } from '../model/kernels.js';
 import { runAllTests } from './kernels.test.js';
+import { runSpecTests } from './spec.test.js';
+import { runMtpTests } from './mtp.test.js';
 import { benchKernels, benchForward, formatRows, formatForward } from './bench.js';
 import { smokeForward } from './smoke.js';
 import { checkDims, makeCache, makeScratch, weightBudget } from '../model/model.js';
@@ -252,6 +254,8 @@ async function main(device) {
 
     const kernels = await runAllTests(device);
     const kernelsOk = logRows('kernel tests', kernels.rows);
+    logRows('speculative decoding (bitwise against plain decoding)', (await runSpecTests(device)).rows);
+    logRows('MTP draft head (plumbing, random weights)', (await runMtpTests(device)).rows);
 
     // Runs before the smoke test and the weights: the bench builds its own
     // fixture.

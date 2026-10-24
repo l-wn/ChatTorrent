@@ -184,6 +184,9 @@ export function dimsFromManifest(manifest) {
         // Gated DeltaNet's head and width config, separate from
         // full-attention's n_heads/head_dim above. `group` here is the
         // value-head repeat factor (nV/nK), not full-attention's GQA `group`.
+        // The MTP draft head (tools/convert_hf.py export_mtp()): its file and
+        // how many vocabulary rows it drafts over. Undefined without one.
+        mtp: manifest.mtp ? { file: manifest.mtp.file, draftVocab: manifest.mtp.draft_vocab } : undefined,
         linear: hybrid ? {
             nK:  manifest.linear_num_key_heads,
             nV:  manifest.linear_num_value_heads,
@@ -616,6 +619,22 @@ export async function loadBlock(device, { baseUrl, manifest, d, index,
     const uploaded = await uploadTensors(device, blob, manifest.files[fn], fn, blockShapes(d, kind),
         dtypeOf(device, manifest, baseUrl));
     return Object.assign(uploaded, { kind });
+}
+
+// mtp.bin: the MTP draft head (model.js mtpBlock()). Its full-attention layer
+// has a block's tensor names; `fc_e`/`fc_h` are the halves of its input
+// projection, `enorm`/`hnorm`/`mtp_norm` its norms, and `embed_draft`/
+// `head_draft` the first `draftVocab` rows of the embedding and the LM head.
+export async function loadMtp(device, { baseUrl, manifest, d, onBytes } = {}) {
+    baseUrl ??= await activeWeights();
+    if (!d.mtp) throw new Error(`${manifest?.model ?? baseUrl} has no MTP head`);
+    const fn = d.mtp.file, H = d.hidden, V = d.mtp.draftVocab;
+    const blob = await loadFile(baseUrl, fn, onBytes, { bytes: fileBytes(manifest, fn) });
+    const shapes = { ...fullAttnBlockShapes(d), enorm: [H], hnorm: [H], fc_e: [H, H], fc_h: [H, H],
+                     mtp_norm: [H], embed_draft: [V, H], head_draft: [V, H] };
+    const uploaded = await uploadTensors(device, blob, manifest.files[fn], fn, shapes,
+        dtypeOf(device, manifest, baseUrl));
+    return Object.assign(uploaded, { kind: 'full_attention', draftVocab: V });
 }
 
 // client.bin: `wte` and the final norm. An untied checkpoint's LM head is in a

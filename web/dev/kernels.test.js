@@ -15,8 +15,8 @@
 // names.
 
 import {
-    F32, DIMS, uploadF32, uploadF16, makeStorage, readF32,
-    matmulNobias, gatherEmbedNoPos, rmsnorm, reshapeHeads, scatterKV, rope,
+    F32, DIMS, uploadF32, uploadF16, uploadQ8, makeStorage, readF32,
+    matmulNobias, GEMV_ROWS_MAX, gatherEmbedNoPos, rmsnorm, reshapeHeads, scatterKV, rope,
     qkScoresGQA, causalSoftmax, attnAVGQA, mergeHeads, addInplace, siluMul, withPass,
     sigmoidMul, causalConv1d, l2NormalizeHeads, gatedDeltaNetStep, updateConvHistory,
 } from '../model/kernels.js';
@@ -568,17 +568,82 @@ async function testMatmulNobiasGemv(device, r) {
     }
 
     // The kernel is selected by M, so a 1-row call and the first row of a
-    // 2-row call go through different code and must give the same numbers.
+    // tiled call go through different code and must give the same numbers.
     {
-        const K = 300, N = 40;
-        const X = randF32(2 * K, rng), W = randF32(N * K, rng);
+        const K = 300, N = 40, M = GEMV_ROWS_MAX + 9;
+        const X = randF32(M * K, rng), W = randF32(N * K, rng);
         const xb = uploadF32(device, X), wb = uploadF32(device, W);
-        const y1 = makeStorage(device, N * F32), y2 = makeStorage(device, 2 * N * F32);
+        const y1 = makeStorage(device, N * F32), y2 = makeStorage(device, M * N * F32);
         submit(device, 'gemv row', (pass) => matmulNobias(device, pass, xb, wb, y1, 1, K, N));
-        submit(device, 'tiled rows', (pass) => matmulNobias(device, pass, xb, wb, y2, 2, K, N));
+        submit(device, 'tiled rows', (pass) => matmulNobias(device, pass, xb, wb, y2, M, K, N));
         const a = await readF32(device, y1, N * F32);
-        const b = (await readF32(device, y2, 2 * N * F32)).slice(0, N);
-        r.close('the M=1 and M>1 kernels agree on the same row', a, b, 1e-4);
+        const b = (await readF32(device, y2, M * N * F32)).slice(0, N);
+        r.close('the M=1 and tiled kernels agree on the same row', a, b, 1e-4);
+    }
+}
+
+// --- a few rows (a speculative verify) ---
+//
+// For 2 <= M <= GEMV_ROWS_MAX every row must match a one-row call. The kernels
+// are written to give the same bits, so a verified token is the one plain
+// decoding samples; the detail says whether this GPU does. Bit-exactness is
+// not required to serve (the output is right either way), so the check is to
+// the GEMV tolerance. web/dev/spec.test.js holds it to the bit.
+async function testMatmulRowsBitwise(device, r) {
+    const rng = makeRng(31);
+    const same = (a, b) => a.length === b.length && a.every((v, i) => Object.is(v, b[i]));
+    const maxDiff = (a, b) => a.reduce((m, v, i) => Math.max(m, Math.abs(v - b[i])), 0);
+
+    async function check(label, K, N, upload) {
+        const wb = upload(K, N);
+        let bitwise = true, worst = 0, scale = 0;
+        for (let M = 2; M <= GEMV_ROWS_MAX; M++) {
+            const X = randF32(M * K, rng);
+            const xb = uploadF32(device, X);
+            const ym = makeStorage(device, M * N * F32);
+            submit(device, `rows ${M}`, (pass) => matmulNobias(device, pass, xb, wb, ym, M, K, N));
+            const rows = await readF32(device, ym, M * N * F32);
+            for (let i = 0; i < M; i++) {
+                const x1 = uploadF32(device, X.slice(i * K, (i + 1) * K));
+                const y1 = makeStorage(device, N * F32);
+                submit(device, 'row 1', (pass) => matmulNobias(device, pass, x1, wb, y1, 1, K, N));
+                const one = await readF32(device, y1, N * F32);
+                const row = rows.slice(i * N, (i + 1) * N);
+                if (!same(one, row)) bitwise = false;
+                worst = Math.max(worst, maxDiff(one, row));
+                scale = Math.max(scale, ...one.map(Math.abs));
+            }
+        }
+        r.assert(`matmul rows ${label} M=2..${GEMV_ROWS_MAX} match M=1`,
+            worst <= 1e-5 * Math.max(1, K / 64) * Math.max(1, scale),
+            bitwise ? 'bitwise' : `not bitwise, max diff ${worst.toExponential(2)}`);
+    }
+
+    // vec4 (K % 4 == 0), the scalar build, f16, and q8 with a partial group.
+    await check('f32 vec4', 516, 77, (K, N) => uploadF32(device, randF32(N * K, rng)));
+    await check('f32 scalar', 301, 45, (K, N) => uploadF32(device, randF32(N * K, rng)));
+    if (device.features?.has('shader-f16')) {
+        await check('f16', 516, 77, (K, N) => uploadF16(device, randF16Bits(N * K, rng)));
+    } else {
+        r.assert('matmul rows f16 (skipped: no shader-f16)', true);
+    }
+    const group = 64;
+    await check('q8', 6 * group + 32, 70, (K, N) => {
+        const data = new Int8Array(N * K);
+        for (let i = 0; i < data.length; i++) data[i] = Math.floor(rng() * 255) - 127;
+        const scales = randF32(N * Math.ceil(K / group), rng);
+        return uploadQ8(device, new Uint8Array(data.buffer), scales, group);
+    });
+
+    // And against the CPU reference, so the rows are right as well as alike.
+    {
+        const M = 5, K = 516, N = 77;
+        const X = randF32(M * K, rng), W = randF32(N * K, rng);
+        const xb = uploadF32(device, X), wb = uploadF32(device, W);
+        const yb = makeStorage(device, M * N * F32);
+        submit(device, 'rows ref', (pass) => matmulNobias(device, pass, xb, wb, yb, M, K, N));
+        r.close('matmul rows M=5 vs reference', await readF32(device, yb, M * N * F32),
+            matmulNobiasCPU(X, W, M, K, N), 1e-5 * Math.max(1, K / 64));
     }
 }
 
@@ -857,6 +922,47 @@ async function testAttention(device, r) {
     r.close('attention chain (qk→softmax→av)', ctx, chain, 2e-5);
 }
 
+// A speculative verify runs n query rows at once. Row i must match a one-row
+// job at T_past + i; the detail says whether it does to the bit (see
+// testMatmulRowsBitwise).
+async function testAttentionRowsBitwise(device, r) {
+    const T_past = 37, n = 6, N_max = 64;
+    const D = 32, nHeads = 8, group = 4, nKV = nHeads / group;
+    const rng = makeRng(17);
+    const Q = randF32(nHeads * n * D, rng);
+    const K = randF32(nKV * N_max * D, rng), V = randF32(nKV * N_max * D, rng);
+    const kb = uploadF32(device, K), vb = uploadF32(device, V);
+
+    async function run(Qrows, T_new, past) {
+        const T_act = past + T_new;
+        const qb = uploadF32(device, Qrows);
+        const sb = makeStorage(device, nHeads * T_new * T_act * F32);
+        const ob = makeStorage(device, nHeads * T_new * D * F32);
+        submit(device, 'attn rows', (pass) => {
+            qkScoresGQA(device, pass, qb, kb, sb, T_new, T_act, N_max, D, nHeads, group);
+            causalSoftmax(device, pass, sb, T_new, T_act, past, nHeads);
+            attnAVGQA(device, pass, sb, vb, ob, T_new, T_act, N_max, D, nHeads, group);
+        });
+        return readF32(device, ob, nHeads * T_new * D * F32);
+    }
+
+    const all = await run(Q, n, T_past);
+    let bitwise = true, worst = 0;
+    for (let i = 0; i < n; i++) {
+        const q1 = new Float32Array(nHeads * D);
+        for (let h = 0; h < nHeads; h++) q1.set(Q.subarray((h * n + i) * D, (h * n + i + 1) * D), h * D);
+        const one = await run(q1, 1, T_past + i);
+        for (let h = 0; h < nHeads; h++)
+            for (let d = 0; d < D; d++) {
+                const a = one[h * D + d], b = all[(h * n + i) * D + d];
+                if (!Object.is(a, b)) bitwise = false;
+                worst = Math.max(worst, Math.abs(a - b));
+            }
+    }
+    r.assert(`attention row i of T_new=${n} matches T_new=1 at T_past+i`, worst <= 1e-5,
+        bitwise ? 'bitwise' : `not bitwise, max diff ${worst.toExponential(2)}`);
+}
+
 async function testAddInplace(device, r) {
     const N = 1000;                                 // not a multiple of 256
     const rng = makeRng(8);
@@ -1074,6 +1180,7 @@ export async function runAllTests(device) {
     await testMatmulNobias(device, r);
     await testMatmulNobiasF16(device, r);
     await testMatmulNobiasGemv(device, r);
+    await testMatmulRowsBitwise(device, r);
     await testGatherEmbed(device, r);
     await testRmsnorm(device, r);
     await testSiluMul(device, r);
@@ -1082,6 +1189,7 @@ export async function runAllTests(device) {
     await testScatterKV(device, r);
     await testRope(device, r);
     await testAttention(device, r);
+    await testAttentionRowsBitwise(device, r);
     await testSigmoidMul(device, r);
     await testCausalConv1d(device, r);
     await testUpdateConvHistory(device, r);

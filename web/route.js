@@ -12,6 +12,8 @@
 // (Routing, Wire format, Sessions and generation, Chats, Failures).
 
 import { penaltyState } from './model/sampling.js';
+import { lookup, makeDepth, pickDepth, noteDepth, MIN_DRAFTS } from './draft.js';
+import { SPEC_COLS, N_MAX } from './split.js';
 
 // Longest run of tokens in one job. Chosen for latency: net.js fragments a
 // message too big for one datachannel send.
@@ -705,8 +707,9 @@ export function makeRouter({
         // Skipped for this tab's own sessions: either the timeout fired and
         // recover() is rebuilding, or the chat is parked and left to idle
         // eviction. Skipped for `busy`: the peer has no room, and a replay
-        // would take capacity from another chat. Both are passed back.
-        const out = h.busy || own.has(h.s) ? null : outgoing(h.s);
+        // would take capacity from another chat. Skipped for `nospec`: nothing
+        // is broken, the enqueuer re-sends the job plain. All are passed back.
+        const out = h.busy || h.nospec || own.has(h.s) ? null : outgoing(h.s);
         const sent = out && outbound.get(out);
         // The err must carry the key of the job this peer handed on.
         if (sent && h.key !== sent.key) {
@@ -841,19 +844,29 @@ export function makeRouter({
             if (links.has(out)) hop.link = links.get(out);
             const trace = [...(h.trace ?? []), hop];
             if (r.token !== undefined) {
+                // A verify job answers with every token it kept: the accepted
+                // drafts and the sample after them. Nothing after end-of-text
+                // is part of the reply.
+                let tokens = r.tokens ?? null;
+                const cut = tokens ? tokens.indexOf(eos) : -1;
+                if (cut >= 0) tokens = tokens.slice(0, cut + 1);
+                const token = tokens ? tokens[tokens.length - 1] : r.token;
                 // Send the next job first: it is on the critical path.
                 const looping = h.loop && closedLoop;
-                const fed = looping ? feed(h, r.token) : false;
-                route({ k: 'tok', s: h.s, key: h.key, to: h.from, past: h.past, token: r.token,
-                        eos: r.token === eos, trace,
+                const fed = looping ? feed(h, token, tokens ?? [token], r.mtp) : false;
+                route({ k: 'tok', s: h.s, key: h.key, to: h.from, past: h.past, token,
+                        ...(tokens && { tokens }),
+                        eos: token === eos, trace,
                         ...(looping && { fed, head: net.id,
                                          ...(links.has(`${h.s}|0`) && { link: links.get(`${h.s}|0`) }) }) });
             } else if (r.hidden !== undefined) {
-                // Leaves at `r.at`, the session's cut. ids exist only at
-                // position 0. `replay` is copied by the spread, so a replay
-                // rebuilds caches to the end of the line. The peer that ran
-                // position 0 stamps `entry` for the head.
-                forward({ ...h, pos: r.at, ids: undefined, trace, ...(h.pos === 0 && { entry: net.id }) },
+                // Leaves at `r.at`, the session's cut. ids are read only at
+                // position 0, and kept after it only for the MTP head (`mtp`),
+                // which fills its KV from them. `replay` is copied by the
+                // spread, so a replay rebuilds caches to the end of the line.
+                // The peer that ran position 0 stamps `entry` for the head.
+                forward({ ...h, pos: r.at, ...(!h.mtp && { ids: undefined }), trace,
+                          ...(h.pos === 0 && { entry: net.id }) },
                         r.hidden, null, from);
                 // Packing and sending time on this tab, stored with the RTT.
                 if (!h.replay) put(links, out, { ...links.get(out), send: round(performance.now() - t3) });
@@ -866,8 +879,12 @@ export function makeRouter({
             // Back one hop like fail(), but to the channel the job arrived on:
             // the cursor has not moved, so there is no exit cursor to key by.
             // A refused or evicted cache (Runner.#cacheFor) ends up here.
-            route({ k: 'err', s: h.s, key: h.key, to: from ?? h.from, from: net.id,
-                    msg: err.message, busy: err.busy || undefined });
+            // A `nospec` goes straight to the enqueuer, which re-sends the job:
+            // nothing on the way can repair it, and in the closed loop the
+            // entry's upstream is the head, so walking back would loop.
+            route({ k: 'err', s: h.s, key: h.key, to: err.nospec ? h.from : from ?? h.from, from: net.id,
+                    msg: err.message, busy: err.busy || undefined,
+                    nospec: err.nospec || undefined });
         }
     }
 
@@ -897,16 +914,28 @@ export function makeRouter({
     // re-sending a hand-off. It feeds nothing, whether or not the loop has
     // ended. A newer loop starts fresh, even at a lower position (after a
     // rewind).
-    function feed(h, token) {
+    //
+    // With speculation on (`loop.spec`), the head also drafts: it looks the
+    // context up for what followed its last few tokens (draft.js), and sends
+    // the sample and up to K drafts as one verify job (`drafts`). The answer
+    // to a verify job carries `tokens`, the drafts it accepted and the sample
+    // after them. The session keeps those rows, so the next job's `past` is
+    // the verify's plus their count, and each peer rolls back the rest (see
+    // stage.js). `rowOpts` carries the repetition summary for each draft's
+    // row, as plain decoding would have computed it.
+    function feed(h, token, tokens = [token], mtp = null) {
         const { s, key, loop } = h;
-        const at = h.past + h.n;
+        // The rows of this job the session keeps.
+        const at = h.past + (h.drafts ? tokens.length : h.n);
         const id = loop.id ?? 0;
         const known = heading.get(s)?.key === key ? heading.get(s) : null;
         if (known && (id < known.id || (id === known.id && at <= known.fedTo))) return false;
         const state = known?.id === id ? known : null;
         const end = () => { put(heading, s, { key, id, ctx: null, halt: false, fedTo: at, ended: true }); return false; };
         const owner = h.from === net.id || net.has(h.from);
-        if (token === eos || state?.halt || !(loop.left > 0) || !owner) return end();
+        // Accepted drafts were fed in this job, so they spend the budget too.
+        const left = loop.left - (tokens.length - 1);
+        if (token === eos || state?.halt || !(left > 0) || !owner) return end();
         // The head must have an open link to the entry. Every peer links to
         // every holder of position 0, but a link can still be opening (a new
         // peer's ICE). A failed hand-off here cannot be repaired, so decline.
@@ -915,21 +944,63 @@ export function makeRouter({
         if (entry == null || (entry !== net.id && !net.linked(entry))) return end();
 
         const settings = { ...h.opts, ngram: loop.ngram };
+        const spec = !!loop.spec;
+        // The context through this job's kept rows: carried by the loop's
+        // first job, then kept here.
         let ctx = null;
-        if (penalized(settings)) {
+        if (penalized(settings) || spec) {
+            const through = h.past + (h.drafts ? 1 : h.n);
             if (loop.ctx) ctx = [...loop.ctx];
-            else if (state && !state.ended && state.ctx?.length === at) ctx = state.ctx;
-            else return end();
-            ctx.push(token);
+            else if (state && !state.ended && state.ctx?.length === through) ctx = state.ctx;
+            else if (penalized(settings)) return end();
+            // Without penalties the context only feeds the drafter: decode
+            // plain from here.
+            if (ctx) ctx.push(...tokens);
         }
-        put(heading, s, { key, id, ctx, halt: false, fedTo: at, ended: false });
+
+        // How the last step went, for the depth picker, then this step's drafts.
+        const now = performance.now();
+        const depth = spec ? (state?.depth ?? makeDepth()) : null;
+        if (depth && state?.stepAt != null) noteDepth(depth, state.k, tokens.length, now - state.stepAt);
+        const opts = jobOpts(settings, ctx ?? [], eos);
+        let drafts = [], chosen = 0, rowOpts = null;
+        if (depth && ctx) {
+            const nMax = runner()?.nMax ?? N_MAX;
+            chosen = pickDepth(depth);
+            const K = Math.min(chosen, left - 1, SPEC_COLS - 1, nMax - at - 1);
+            if (K >= MIN_DRAFTS) {
+                drafts = lookup(ctx, K);
+                // The MTP head's drafts, when lookup finds no repeat.
+                if (drafts.length < MIN_DRAFTS && mtp) drafts = mtp.slice(0, K);
+            }
+        }
+        if (drafts.length && penalized(settings)) {
+            // Each row's summary, as plain decoding would build it with the
+            // drafts before it accepted. A draft its own row bans (the
+            // no-repeat n-gram block, which forbids exactly the copies lookup
+            // proposes) could never be accepted, so the drafts stop there.
+            const rows = [opts];
+            for (let i = 0; i < drafts.length; i++) {
+                if (rows[i].ban?.includes(drafts[i])) { drafts = drafts.slice(0, i); break; }
+                rows.push(jobOpts(settings, [...ctx, ...drafts.slice(0, i + 1)], eos));
+            }
+            rowOpts = rows.slice(1, drafts.length + 1);
+        }
+        if (drafts.length < MIN_DRAFTS) { drafts = []; rowOpts = null; }
+        // A step without drafts is measured as a plain one, whatever depth
+        // was picked.
+        put(heading, s, { key, id, ctx, halt: false, fedTo: at, ended: false,
+                          depth, k: drafts.length ? chosen : 0, stepAt: now });
 
         const next = {
-            k: 'job', s, key, from: h.from, pos: 0, past: h.past + h.n, n: 1, ids: [token],
-            opts: jobOpts(settings, ctx ?? [], eos),
-            loop: { id, left: loop.left - 1, ...(loop.ngram && { ngram: loop.ngram }) },
+            k: 'job', s, key, from: h.from, pos: 0, past: at, n: 1 + drafts.length,
+            ids: [token, ...drafts],
+            opts,
+            ...(drafts.length && { drafts, ...(rowOpts && { rowOpts }) }),
+            loop: { id, left: left - 1, ...(loop.ngram && { ngram: loop.ngram }), ...(spec && { spec }) },
             auto: true,
             prof: h.prof,
+            ...(h.mtp && { mtp: true }),
         };
         if (entry === net.id) {
             runJob(next, null, null);
@@ -948,10 +1019,13 @@ export function makeRouter({
     // What a job asks of the loop: `left` more tokens and, when a penalty
     // needs them, the n-gram setting and the context the head computes its
     // summaries from. Each call opens a loop with the next id.
+    // `spec` asks the head to draft (see feed()), which needs the context too.
     function loopFor(ids, opts, left, c = conv) {
         const id = ++loops;
-        if (!penalized(opts)) return { id, left };
-        return { id, left, ...(opts.ngram && { ngram: opts.ngram }), ctx: [...c.history, ...ids] };
+        const spec = !!opts.spec;
+        if (!penalized(opts) && !spec) return { id, left };
+        return { id, left, ...(opts.ngram && { ngram: opts.ngram }), ...(spec && { spec }),
+                 ctx: [...c.history, ...ids] };
     }
 
     // One job per session is in flight at a time, so the session id matches
@@ -981,6 +1055,8 @@ export function makeRouter({
                 opts: optsFor(ids, opts),
                 prof: opts.prof || undefined,
                 ...(loop && { loop }),
+                // The MTP head fills its KV from every job, prefill included.
+                ...(opts.spec && { mtp: true }),
             });
         });
     }
@@ -1180,7 +1256,9 @@ export function makeRouter({
 
     // One job of the stream: the prompt's chunk, or a token the head did not
     // feed. `left` is how many tokens the head may feed after it.
-    function send(st, ids) {
+    // `rb`: re-sending a token whose verify job was refused (`nospec`), so
+    // the peers that ran the verify roll it back.
+    function send(st, ids, rb = false) {
         const c = st.c;
         st.s = c.session;
         st.key = c.key;
@@ -1188,11 +1266,14 @@ export function makeRouter({
         st.expect = c.history.length;
         streams.set(st.s, st);
         arm(st);
+        const opts = st.nospec ? { ...st.opts, spec: false } : st.opts;
         route({
             k: 'job', s: st.s, key: st.key, from: net.id, pos: 0, past: st.expect,
-            n: ids.length, ids, opts: optsFor(ids, st.opts, c),
-            prof: st.opts.prof || undefined,
-            loop: loopFor(ids, st.opts, st.budget - st.sent, c),
+            n: ids.length, ids, opts: optsFor(ids, opts, c),
+            prof: opts.prof || undefined,
+            loop: loopFor(ids, opts, st.budget - st.sent, c),
+            ...(rb && { rb }),
+            ...(st.opts.spec && { mtp: true }),
         });
     }
 
@@ -1213,8 +1294,16 @@ export function makeRouter({
         }
         clearTimeout(st.timer);
         const c = st.c;
-        c.history.push(...st.feeding);
+        // A verify job's answer: the drafts it accepted are part of the
+        // context (and of the reply) as well as the job's own first id.
+        const toks = Array.isArray(h.tokens) && h.tokens.length ? h.tokens : [h.token];
+        const accepted = toks.slice(0, -1);
+        c.history.push(...st.feeding, ...accepted);
         c.parked = false;
+        st.sent += accepted.length;
+        for (const t of accepted) {
+            st.queue.push({ token: t, eos: false, fed: true, closed: true, draft: true, trace: [], rt: 0 });
+        }
 
         const now = performance.now();
         // `closed`: the head fed the token, so this tab did not have to.
@@ -1257,6 +1346,14 @@ export function makeRouter({
     function failed(st, h) {
         if (st.done) return;
         clearTimeout(st.timer);
+        // A peer had no room to verify drafts. Nothing broke: re-send the
+        // token the head fed, plain, and decode the rest of the turn plain.
+        if (h.nospec && !st.first) {
+            st.nospec = true;
+            st.early.clear();
+            sendHalt(st);
+            return send(st, st.feeding, true);
+        }
         const err = h instanceof Error ? h : new Error(`peer ${h.from ?? ''}: ${h.msg}`);
         if (h.busy) err.busy = true;
         if (streams.get(st.s) === st) streams.delete(st.s);

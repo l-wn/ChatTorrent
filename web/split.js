@@ -165,6 +165,8 @@ export function storedBytes(m) {
         norm:    tensor('client.bin', 'norm'),
         // 0, not undefined: a tied checkpoint has no lm_head.bin.
         lm_head: fileBytes(m, 'lm_head.bin') ?? 0,
+        // The MTP draft head's bundle, 0 without one.
+        mtp: m.mtp ? fileBytes(m, m.mtp.file) ?? 0 : 0,
     };
 }
 
@@ -238,16 +240,43 @@ export function recurrentStateBytes(d) {
     return (nV * Dk * Dv + Kh * keyDim * 2 + Kh * valueDim) * 4;
 }
 
+// The widest speculative verify job, in tokens: the last sampled token plus
+// up to SPEC_COLS - 1 drafts. Matches kernels.js's GEMV_ROWS_MAX, so every
+// verify row goes through the batched GEMV and gets plain decoding's bits.
+export const SPEC_COLS = 8;
+
+// One linear_attention block's replay data for one speculating session
+// (model.js makeReplayLayer): the recurrent state and conv rings as they were
+// before a verify job, and that job's per-token inputs, enough to re-run its
+// first k tokens after a rejection.
+export function replayLayerBytes(d, cols = SPEC_COLS) {
+    if (!d.linear) return 0;
+    const { nV, keyDim, valueDim } = d.linear;
+    return recurrentStateBytes(d) + cols * (keyDim * 2 + valueDim + nV * 2) * 4;
+}
+
 // Everything one held block costs on the GPU: its weights, plus its share of
 // the KV pool (full_attention) or a recurrent state in every session frame
 // (linear_attention). `index` selects a block and is exact, `kind` a kind of
 // block. With neither, returns the mean weighted by kvShare().
-export function blockBytes(d, { nMax = N_MAX, slots = SLOTS, sessions = SESSIONS, kind, index } = {}) {
+//
+// A linear_attention block also reserves `spec` speculative replay slots
+// (stage.js, one per session speculating through it at once), `slots` by
+// default, as the Runner does.
+export function blockBytes(d, { nMax = N_MAX, slots = SLOTS, sessions = SESSIONS, spec = slots,
+                                kind, index } = {}) {
     const kv = d.n_kv_heads * d.head_dim;
     if (index != null) kind = d.layer_types?.[index] ?? 'full_attention';
     const share = kind ? (kind === 'linear_attention' ? 0 : 1) : kvShare(d);
     return blockWeightBytes(d, { index, kind }) + kv * nMax * 4 * 2 * slots * share
-        + recurrentStateBytes(d) * sessions * (1 - share);
+        + (recurrentStateBytes(d) * sessions + replayLayerBytes(d) * spec) * (1 - share);
+}
+
+// What holding the MTP draft head costs, apart from its scratch: its file,
+// and its layer's K and V laid out as one more KV pool layer.
+export function mtpBytes(d, { nMax = N_MAX, slots = SLOTS } = {}) {
+    if (!d.mtp) return 0;
+    return (d.stored?.mtp ?? 0) + d.n_kv_heads * d.head_dim * nMax * 4 * 2 * slots;
 }
 
 // What holding an end position costs. The embedding is `wte` (client.bin,

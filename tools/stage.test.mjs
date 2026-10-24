@@ -917,6 +917,138 @@ console.log('\na job the head fed itself must continue exactly, on every kind of
         (await refusal(r.run(job(0, 1, true), null)))?.stale === true);
 }
 
+console.log('\nspeculative verify: the next job keeps a prefix of the verify, per session');
+{
+    // A verify job's ids are the last sampled token and its drafts. The head
+    // samples every row and accepts drafts while they match. The stub reads
+    // back zero logits, so greedy sampling always gives token 0: drafts of 0
+    // are accepted and drafts of 1 are not.
+    const gpu = makeGpu();
+    const hy = (lo, hi, opts = {}) => new Runner(gpu.device, DH, hybridWeightsFor(lo, hi),
+        { lo, hi, nMax: 64, tMax: 8, slots: 4, sessions: 4, idleMs: 60000, ...opts });
+    const verify = (s, past, drafts, extra = {}) => ({ k: 'job', s, pos: 0, past,
+        n: drafts.length + 1, ids: [0, ...drafts], drafts, opts: {}, auto: true, ...extra });
+    const plain = (s, past, n = 1, extra = {}) => ({ k: 'job', s, pos: 0, past, n,
+        ids: Array(n).fill(0), opts: {}, ...extra });
+    const refusal = (p) => p.then(() => null, (e) => e);
+
+    const r = hy(0, N, { specSlots: 2 });
+    await r.run(plain('a', 0, 4), null);
+    const rej = await r.run(verify('a', 4, [1, 1, 1]), null);
+    eq('a rejected first draft returns one token, the sample', rej.tokens, [0]);
+    const acc = await refusal(r.run(plain('a', 4, 1), null));
+    ok('the enqueuer may not rewind to the verify\'s base without rb', acc !== null);
+    ok('the next job keeps 1 of the 4 rows and runs',
+        (await refusal(r.run(plain('a', 5, 1, { auto: true }), null))) === null);
+    ok('and the one after continues from there',
+        (await refusal(r.run(plain('a', 6, 1, { auto: true }), null))) === null);
+
+    const all = await r.run(verify('a', 7, [0, 0, 0]), null);
+    eq('every draft accepted returns all of them and one more', all.tokens, [0, 0, 0, 0]);
+    ok('keeping every row needs no rollback and runs',
+        (await refusal(r.run(plain('a', 11, 1, { auto: true }), null))) === null);
+
+    await r.run(verify('a', 12, [0, 1, 1]), null);
+    const dup = await refusal(r.run(verify('a', 12, [0, 1, 1]), null));
+    ok('a duplicate of a verify job is stale', dup?.stale === true, `got ${dup?.message}`);
+    const past = await refusal(r.run(plain('a', 17, 1, { auto: true }), null));
+    ok('a job beyond the verify\'s rows is cold', /no longer cached/.test(past?.message ?? ''),
+        `got ${past?.message}`);
+    ok('rb lets a re-sent plain job roll back to the verify\'s base',
+        (await refusal(r.run(plain('a', 12, 1, { auto: true, rb: true }), null))) === null);
+    ok('after which the session continues from there',
+        (await refusal(r.run(plain('a', 13, 1, { auto: true }), null))) === null);
+
+    // Sessions interleave: a's verify, b's verify, then each rolls back its own.
+    await r.run(plain('b', 0, 3), null);
+    await r.run(verify('a', 14, [1, 1]), null);
+    await r.run(verify('b', 3, [0, 0, 1, 1]), null);
+    ok('interleaved: a keeps 2 of its 3 rows',
+        (await refusal(r.run(plain('a', 16, 1, { auto: true }), null))) === null);
+    ok('interleaved: b keeps 3 of its 5 rows',
+        (await refusal(r.run(plain('b', 6, 1, { auto: true }), null))) === null);
+    eq('each holds its own replay slot', r.specLive.size, 2);
+
+    // With every slot leased, a third session's verify is refused before
+    // anything changes, and its plain re-send runs.
+    await r.run(plain('c', 0, 2), null);
+    const before = gpu.passes.cleared;
+    const no = await refusal(r.run(verify('c', 2, [0, 0]), null));
+    ok('no slot free: the verify is refused as nospec', no?.nospec === true, `got ${no?.message}`);
+    eq('and counted', r.counts.nospec, 1);
+    ok('the session is as it was: the plain job from the same past runs',
+        (await refusal(r.run(plain('c', 2, 1, { auto: true }), null))) === null);
+    eq('nothing was cleared on the way', gpu.passes.cleared - before, 0);
+
+    await r.release('a');
+    eq('a released session returns its slot', r.specFree.length, 1);
+    ok('which the next verify takes',
+        (await refusal(r.run(verify('c', 3, [0]), null))) === null && r.specLive.has('c'));
+    const bytes = r.vramBytes;
+    ok('replay slots and the verify readback are counted in vramBytes',
+        r.specFree.length + r.specLive.size === 2 && bytes > 0 && r.specReadback !== null);
+
+    // Full attention needs no replay, but takes the same window.
+    const full = hy(2, 3);
+    const mid = (past, n, extra = {}) => ({ k: 'job', s: 'f', pos: 2, past, n, opts: {}, ...extra });
+    await full.run(mid(0, 4), new Float32Array(4 * DH.hidden));
+    await full.run(mid(4, 4, { drafts: [1, 1, 1], auto: true }), new Float32Array(4 * DH.hidden));
+    ok('a full_attention block takes the next job inside the window, fed by the head',
+        (await refusal(full.run(mid(6, 1, { auto: true }), new Float32Array(DH.hidden)))) === null);
+    eq('and leases no slot', full.specLive.size, 0);
+
+    // A session idle for idleMs with nothing queued gives its slot to a new
+    // verify. Its next job inside its last verify is refused as cold (so the
+    // enqueuer rebuilds), never dropped as a duplicate.
+    {
+        const t = hy(0, N, { specSlots: 1, idleMs: 0 });
+        await t.run(plain('old', 0, 3), null);
+        await t.run(verify('old', 3, [1, 1, 1]), null);
+        await t.run(plain('new', 0, 2), null);
+        ok('an idle session\'s slot is taken by the next verify',
+            (await refusal(t.run(verify('new', 2, [0, 0]), null))) === null && t.specLive.has('new')
+            && !t.specLive.has('old'));
+        const late = await refusal(t.run(plain('old', 4, 1, { auto: true }), null));
+        ok('the robbed session\'s next job is refused as cold, not dropped as stale',
+            /no longer cached/.test(late?.message ?? '') && !late?.stale, `got ${late?.message}`);
+    }
+
+    const bad = await refusal(r.run({ ...verify('c', 4, [0]), drafts: [0, 0] }, null));
+    ok('a verify whose drafts do not fit its ids is refused', /draft ids/.test(bad?.message ?? ''),
+        `got ${bad?.message}`);
+}
+
+console.log('\nthe MTP draft head: a head holding it drafts after the sample');
+{
+    const gpu = makeGpu();
+    const { marker: mk } = await import('./stub-gpu.mjs');
+    const r = new Runner(gpu.device, { ...DH, mtp: { file: 'mtp.bin', draftVocab: 20 } },
+        hybridWeightsFor(0, N), { lo: 0, hi: N, nMax: 64, tMax: 8, slots: 2, idleMs: 0 });
+    const names = ['input_layernorm', 'q_proj', 'k_proj', 'v_proj', 'o_proj', 'post_attention_layernorm',
+                   'gate_proj', 'up_proj', 'down_proj', 'enorm', 'hnorm', 'fc_e', 'fc_h', 'mtp_norm',
+                   'embed_draft', 'head_draft'];
+    const before = r.vramBytes;
+    r.attachMtp({ ...Object.fromEntries(names.map((n) => [n, mk('M')])), kind: 'full_attention',
+                  draftVocab: 20, bytes: 5000 });
+    ok('attaching it is counted in vramBytes', r.vramBytes > before + 5000);
+    const job = (past, n, extra = {}) => ({ k: 'job', s: 'a', pos: 0, past, n, ids: Array(n).fill(3), opts: {}, ...extra });
+    gpu.resetTrace();
+    const plain = await r.run(job(0, 4), null);
+    ok('a job not flagged mtp runs no MTP work and drafts nothing',
+        plain.mtp === undefined && !gpu.takeTrace().includes('M'));
+    gpu.resetTrace();
+    const filled = await r.run(job(4, 2, { mtp: true }), null);
+    ok('a job flagged mtp fills the head\'s KV (its layer runs)', gpu.takeTrace().includes('M'));
+    ok('but drafts only for a loop with speculation on', filled.mtp === undefined);
+    const drafted = await r.run(job(6, 1, { mtp: true, auto: true, loop: { id: 1, left: 5, spec: true } }), null);
+    ok(`a speculative loop job comes back with ${drafted.mtp?.length} drafts`,
+        Array.isArray(drafted.mtp) && drafted.mtp.length === 7, JSON.stringify(drafted.mtp));
+    // nMax is 64: after a sample at 60, drafts fit at 61 and 62 only.
+    for (let p = 7; p < 60; p += 8) await r.run(job(p, Math.min(8, 60 - p), { mtp: true }), null);
+    const far = await r.run(job(60, 1, { mtp: true, auto: true, loop: { id: 1, left: 5, spec: true } }), null);
+    eq('the drafts stop short of the context window', far.mtp?.length, 2);
+}
+
 // A VRAM limit is checked against vramBytes, so it must equal what was
 // allocated on the GPU. The stub counts bytes created and not destroyed. The
 // weights are markers, so they are counted by the `bytes` their upload

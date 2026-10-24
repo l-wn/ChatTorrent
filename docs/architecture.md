@@ -40,6 +40,7 @@ web/room.js           which mesh: invite links, join token, the seal on offers/a
 web/split.js          positions, depth, coverage, placement, cost model (shared by both sides)
 web/net.js            Mesh: signaling socket, link set, message framing
 web/route.js          the router: one peer's share of the protocol
+web/draft.js          speculative decoding's drafter (prompt lookup) and depth picker
 web/engine.js         Engine: connect / serve / grow / generate, no DOM
 web/model/stage.js    Runner: one peer's range on the GPU, KV pool, boundary logs
 web/model/*.js        kernels, forward pass, loader, tokenizer, sampler, GPU profiler
@@ -234,7 +235,7 @@ arrives at. On Qwen3.8-27B at q8:
 
 | position | weights | state | total |
 |---|---|---|---|
-| a `linear_attention` block | 388.5 MiB | 8 recurrent states, 24.9 MiB | 413 MiB |
+| a `linear_attention` block | 388.5 MiB | 8 recurrent states, 24.9 MiB; 2 replay slots, 6.9 MiB | 420 MiB |
 | a `full_attention` block | 377.2 MiB | KV pool, 2 x 4096 tokens of K and V, 64 MiB | 441 MiB |
 | the embedding | `wte`, 1.26 GiB | none | 1.26 GiB |
 | the head | `lm_head`, 1.26 GiB | none | 1.26 GiB |
@@ -357,10 +358,10 @@ Headers (`route.js`):
 
 ```
 job   { k, s, key, from, pos, past, n, ids?, opts?, replay?, trace?, prof?,
-        loop?, entry?, auto? }                      + f32 [n, hidden] payload
+        loop?, entry?, auto?, drafts?, rowOpts?, rb? }  + f32 [n, hidden] payload
 ack   { k, s, to, at }
-tok   { k, s, key, to, past, token, eos, trace, ttl, fed?, head?, link? }
-err   { k, s, key, to, from, msg, busy?, ttl }
+tok   { k, s, key, to, past, token, tokens?, eos, trace, ttl, fed?, head?, link? }
+err   { k, s, key, to, from, msg, busy?, nospec?, ttl }
 fix   { k, s, key, to, from, at, rows, ttl }       a hand-off was repaired
 free  { k, s, to, ttl }                             the session is over; drop its KV
 halt  { k, s, key, to, ttl }                        stop feeding this session's loop
@@ -368,9 +369,10 @@ halt  { k, s, key, to, ttl }                        stop feeding this session's 
 
 - `opts`: the sampler settings plus the repetition summary. The head clamps
   them to `LIMITS` in `model/sampling.js`.
-- `loop: { id, left, ngram?, ctx? }`: the head feeds the token it samples back
-  in as the next job, `left` more times. `id` numbers each loop the enqueuer
-  opens.
+- `loop: { id, left, ngram?, spec?, ctx? }`: the head feeds the token it
+  samples back in as the next job, `left` more times. `id` numbers each loop
+  the enqueuer opens. `spec` asks the head to draft (see Speculative decoding).
+- `drafts`, `rowOpts`, `rb`, `tokens`, `nospec`: see Speculative decoding.
 - `entry`: the peer that ran position 0 for this session, stamped as the job
   leaves it. `auto`: the head fed this job.
 - `tok.past` is the job's `past`, so the enqueuer can tell this answer from a
@@ -466,7 +468,59 @@ it for the jobs it sends. Under the closed loop the head builds it for the jobs
 it feeds, from the whole context, which the loop's first job carries once and
 the head then keeps up to date.
 
-## KV cache and admission
+## Speculative decoding
+
+With the page's Speculative decoding setting on (closed loop only), the head
+drafts the tokens after the one it sampled and the mesh checks them in one
+pass. A hop costs about the same for a few rows as for one, so each accepted
+draft is a token that took no lap of its own. The reply is the reply plain
+decoding gives.
+
+**Drafting** (`route.js` `feed()`, `web/draft.js`). The head keeps the
+context (the loop's first job carries it, as for penalties). It looks for the
+most recent earlier place the context's last 4 to 2 tokens occurred and
+proposes what followed, up to K tokens. K is picked per session from
+{0, 3, 5, 7} by measured tokens per second; 0 is a plain step, so a busy mesh
+falls back to plain decoding. Fewer than 2 drafts are not sent. With
+penalties on, the drafts stop at the first one its own row would ban (the
+no-repeat n-gram block bans exactly the copies lookup proposes).
+
+**The verify job** carries `ids = [token, ...drafts]` and `drafts`, so
+`n = drafts + 1` (at most `SPEC_COLS`, 8). Every peer runs the rows as usual.
+The head reads back every row's logits and samples row i with the repetition
+summary plain decoding would have used for it (`opts` for row 0, `rowOpts[i-1]`
+after, built assuming the drafts before it were accepted). Drafts are accepted
+while they equal their row's sample; the first mismatch, or the sample after
+the last draft, is the next token. The `tok` carries `tokens`: the accepted
+drafts and that token, cut after end-of-text. Accepted drafts spend the loop's
+budget and reach the enqueuer as fed answers.
+
+**Rollback** (`Runner.#checkFed`, `model.js` `linearBlock`). The next job
+starts at `past + tokens.length`, so each block tells from `past` alone how
+many of the verify's rows the session keeps. A full-attention block's KV is
+addressed by position and needs nothing. A linear_attention block's recurrent
+state folded every row in, so a verify job records, in the session's replay
+slot, the state and conv rings from before it and its own per-token
+projections. When the next job keeps k < n rows, the block puts the state back
+and re-runs the same kernels over the first k rows before the job's own work,
+in the same submit. The restored state has the bits k plain steps leave.
+
+- Each block accepts the next job anywhere in `(base, base + n]` after a verify
+  of n rows from `base`; outside it the usual rules apply. A duplicate of the
+  verify (`past == base`) is stale.
+- Everything is per session: the window lives on the session's frame and the
+  replay data in its own slot, so chats interleaving on a Runner never touch
+  each other's. A runner keeps at most `specSlots` (its `slots` by default)
+  replay slots, leased on a session's first verify and returned with its frame.
+- A verify that finds no free slot, or no GPU memory for one, is refused with
+  `err { nospec }` before anything changes. Nothing repairs it. The enqueuer
+  re-sends the token the head fed as a plain job with `rb`, which lets the
+  peers that ran the verify roll back to `base`, and decodes the rest of the
+  turn plain.
+- A turn that ends on a verify (end-of-text or the budget) leaves its rejected
+  rows in place. The next turn's first job starts inside the window and rolls
+  them back like any other.
+
 
 Each Runner has a **page pool**: one buffer per full-attention layer for K and
 for V, cut into 64-token pages, sized for `poolSlots(sessions)` full contexts:
@@ -647,7 +701,10 @@ npm run test:gpu    builds a tiny model (tools/tinymodel.mjs) and runs
   - a rewind or a replay through recurrent blocks, whose toy state folds
     cumulatively the way DeltaNet's does;
   - the closed loop, held to the round trip's tokens and context across every
-    cut, placement, stop, failure and old head.
+    cut, placement, stop, failure and old head;
+  - speculative decoding, held to plain decoding's tokens and context across
+    every cut, budgets, end-of-text inside a verify, `nospec` refusals,
+    several chats at once, and each verify row's penalty summary.
 
   `--fuzz N` (`--fuzz-seed S`) draws random meshes, people, conversations,
   halts, cuts and departures. Each turn is replayed against a single peer's
@@ -669,8 +726,11 @@ npm run test:gpu    builds a tiny model (tools/tinymodel.mjs) and runs
     `--prompts N`, `--heavy`, `--show`.
   - It aborts on a software adapter. Each tab loads `web/dev/harness.html`.
 
-`web/dev.html` runs the kernel tests, the smoke check, the tokenizer self-test,
-and a full oracle diff and generation in one tab. Parameters:
+`web/dev.html` runs the kernel tests, the speculative decoding tests
+(`web/dev/spec.test.js`: a DeltaNet block that verifies n rows and keeps k
+holds the state and gives the output of k plain steps, to the bit, at small
+and at Qwen3.8-27B's head shapes, sessions interleaved), the smoke check, the
+tokenizer self-test, and a full oracle diff and generation in one tab. Parameters:
 `?weights=<url>`, `?oracle=<url>`, `?stream=1` (verify a block at a time, for
 a model larger than this GPU), `?decodeSteps=N`, `?bench=…`. The oracle dumps in
 `oracle/` come from `tools/dump_*_oracle.py`.

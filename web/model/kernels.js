@@ -500,6 +500,137 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>,
 `;
     });
 
+// --- a few rows (batched GEMV) ---
+//
+// For 2 <= M <= GEMV_ROWS_MAX: a speculative verify job or a short prefill
+// tail. The GEMV above with R rows per workgroup: each weight is read once and
+// used for every row. Each row's arithmetic is the GEMV's (the same lane
+// split, the same accumulation expression, the same reduction tree), so every
+// row is bit-identical to a one-row call. That is what makes a verified token
+// the token plain decoding would have produced.
+export const GEMV_ROWS_MAX = 8;
+
+export const matmulGemvRowsSrc = (f16, vec4, R) =>
+    memoSrc(`matmul_gemv_rows:${f16}:${vec4}:${R}`, () => /* wgsl */ `${wEnable(f16)}
+struct U { M: u32, K: u32, N: u32, _p: u32 }
+${vec4 ? `
+@group(0) @binding(0) var<storage, read>       X: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       W: array<vec4<${wType(f16)}>>;
+` : `
+@group(0) @binding(0) var<storage, read>       X: array<f32>;
+@group(0) @binding(1) var<storage, read>       W: array<${wType(f16)}>;
+`}
+@group(0) @binding(2) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(3) var<uniform>             u: U;
+
+const R = ${R}u;
+var<workgroup> red: array<f32, ${GEMV_WG * R}u>;
+
+@compute @workgroup_size(${GEMV_WG})
+fn main(@builtin(workgroup_id) wg: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid  = lid.x;
+    let lane = tid % ${GEMV_LANES}u;
+    let col  = wg.x * ${GEMV_COLS}u + tid / ${GEMV_LANES}u;
+    let liveCol = col < u.N;
+
+    var acc: array<f32, ${R}>;
+    for (var r = 0u; r < R; r++) { acc[r] = 0.0; }
+    if (liveCol) {
+${vec4 ? `
+        let K4 = u.K / 4u;
+        let wBase = col * K4;
+        for (var i = lane; i < K4; i += ${GEMV_LANES}u) {
+            let w = vec4<f32>(W[wBase + i]);
+            for (var r = 0u; r < R; r++) { acc[r] += dot(X[r * K4 + i], w); }
+        }
+` : `
+        let wBase = col * u.K;
+        for (var i = lane; i < u.K; i += ${GEMV_LANES}u) {
+            let w = f32(W[wBase + i]);
+            for (var r = 0u; r < R; r++) { acc[r] += X[r * u.K + i] * w; }
+        }
+`}
+    }
+
+    for (var r = 0u; r < R; r++) { red[r * ${GEMV_WG}u + tid] = acc[r]; }
+    workgroupBarrier();
+    for (var s = ${GEMV_LANES}u / 2u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            for (var r = 0u; r < R; r++) {
+                red[r * ${GEMV_WG}u + tid] += red[r * ${GEMV_WG}u + tid + s];
+            }
+        }
+        workgroupBarrier();
+    }
+
+    if (lane == 0u && liveCol) {
+        for (var r = 0u; r < R; r++) { Y[r * u.N + col] = red[r * ${GEMV_WG}u + tid]; }
+    }
+}
+`);
+
+// The q8 GEMV with R rows per workgroup, on the same terms as above.
+export const matmulGemvRowsQ8Src = (group, R) =>
+    memoSrc(`matmul_gemv_rows_q8:${group}:${R}`, () => {
+        const LANES = group / 4;
+        const COLS  = Math.max(1, Math.floor(256 / LANES));
+        const WG    = LANES * COLS;
+        return /* wgsl */ `
+struct U { M: u32, K: u32, N: u32, _p: u32 }
+@group(0) @binding(0) var<storage, read>       X: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       W: array<u32>;
+@group(0) @binding(2) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(3) var<uniform>             u: U;
+@group(0) @binding(4) var<storage, read>       S: array<f32>;
+
+const R = ${R}u;
+var<workgroup> red: array<f32, ${WG * R}u>;
+
+@compute @workgroup_size(${WG})
+fn main(@builtin(workgroup_id) wg: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid  = lid.x;
+    let lane = tid % ${LANES}u;
+    let col  = wg.x * ${COLS}u + tid / ${LANES}u;
+    let liveCol = col < u.N;
+
+    let K4     = u.K / 4u;
+    let nGroup = (u.K + ${group}u - 1u) / ${group}u;
+
+    var acc: array<f32, ${R}>;
+    for (var r = 0u; r < R; r++) { acc[r] = 0.0; }
+    if (liveCol) {
+        let wBase = col * K4;
+        let sBase = col * nGroup;
+        for (var g = 0u; g < nGroup; g++) {
+            let idx = g * ${LANES}u + lane;
+            if (idx < K4) {
+                let q  = vec4<f32>(unpack4xI8(W[wBase + idx]));
+                let sc = S[sBase + g];
+                for (var r = 0u; r < R; r++) { acc[r] += sc * dot(X[r * K4 + idx], q); }
+            }
+        }
+    }
+
+    for (var r = 0u; r < R; r++) { red[r * ${WG}u + tid] = acc[r]; }
+    workgroupBarrier();
+    for (var s = ${LANES}u / 2u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            for (var r = 0u; r < R; r++) {
+                red[r * ${WG}u + tid] += red[r * ${WG}u + tid + s];
+            }
+        }
+        workgroupBarrier();
+    }
+
+    if (lane == 0u && liveCol) {
+        for (var r = 0u; r < R; r++) { Y[r * u.N + col] = red[r * ${WG}u + tid]; }
+    }
+}
+`;
+    });
+
 // --- prefill, q8 ---
 // The tiled kernel with dequantization in the staging step. Each staged weight
 // is used TILE times, so the dequantization cost is amortized. Only the read
@@ -1036,6 +1167,66 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
+// --- copy_f32 ---
+// dst[dstOff + i] = src[srcOff + i] for i < N. A copy recorded inside an open
+// compute pass, where copyBufferToBuffer is not allowed (speculative-decoding
+// snapshots, the MTP head's inputs). Two-dimensional, so N may exceed 65535
+// workgroups' worth of 256.
+// bindings: src, dst, u{N, rowLen, srcOff, dstOff}   dispatch: min(ceil(N/256), 4096), rows
+KERNEL.copy_f32 = /* wgsl */ `
+struct U { N: u32, rowLen: u32, srcOff: u32, dstOff: u32 }
+@group(0) @binding(0) var<storage, read>       src: array<f32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(2) var<uniform>             u: U;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.y * u.rowLen + gid.x;
+  if (gid.x >= u.rowLen || i >= u.N) { return; }
+  dst[u.dstOff + i] = src[u.srcOff + i];
+}
+`;
+
+// --- argmax_rows ---
+// ids[idOff + r] = f32(argmax of row r of x[T, N]), the lowest index on a tie
+// (as sampling.js's greedy pick). One workgroup per row. Written as f32 so
+// gather_embed_nopos can read it as the next step's token: the MTP draft chain
+// runs on the GPU without a readback between steps.
+// bindings: x, ids, u{N, idOff}                 dispatch: T
+const ARGMAX_WG = 256;
+KERNEL.argmax_rows = /* wgsl */ `
+struct U { N: u32, idOff: u32 }
+@group(0) @binding(0) var<storage, read>       x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> ids: array<f32>;
+@group(0) @binding(2) var<uniform>             u: U;
+
+var<workgroup> bv: array<f32, ${ARGMAX_WG}u>;
+var<workgroup> bi: array<u32, ${ARGMAX_WG}u>;
+
+@compute @workgroup_size(${ARGMAX_WG})
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let base = wg.x * u.N;
+  var best = -3.0e38;
+  var at = 0xffffffffu;
+  for (var i = lid.x; i < u.N; i += ${ARGMAX_WG}u) {
+    let v = x[base + i];
+    if (v > best) { best = v; at = i; }
+  }
+  bv[lid.x] = best;
+  bi[lid.x] = at;
+  workgroupBarrier();
+  for (var s = ${ARGMAX_WG}u / 2u; s > 0u; s >>= 1u) {
+    if (lid.x < s) {
+      let v = bv[lid.x + s];
+      let j = bi[lid.x + s];
+      if (v > bv[lid.x] || (v == bv[lid.x] && j < bi[lid.x])) { bv[lid.x] = v; bi[lid.x] = j; }
+    }
+    workgroupBarrier();
+  }
+  if (lid.x == 0u) { ids[u.idOff + wg.x] = f32(bi[0]); }
+}
+`;
+
 // --- silu_mul ---
 // out[i] = silu(gate[i]) * up[i], silu(z) = z / (1 + exp(-z)).
 // Two input buffers and a separate output.
@@ -1397,21 +1588,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // Y[M,N] = X[M,K] @ W[N,K]^T
 //
-// Picks the build from M: GEMV for one row, tiled otherwise. The two agree to
-// f32 rounding; kernels.test.js checks both against the same CPU reference.
+// Picks the build from M: GEMV for one row, the batched GEMV for up to
+// GEMV_ROWS_MAX rows, tiled otherwise. The GEMV builds give each row the same
+// bits; the tiled build agrees with them to f32 rounding. kernels.test.js
+// checks all three against the same CPU reference.
 export function matmulNobias(device, pass, X, W, Y, M, K, N) {
     const gemv = M === 1;
+    const rows = M > 1 && M <= GEMV_ROWS_MAX;
     const q8 = q8Of(W);
     // The profile name uses K→N, since the kernel does not know which
     // projection it is. The shape distinguishes gate/up, down, the attention
     // projections and the LM head.
     const name = pass.prof && `matmul ${q8 ? 'q8' : isF16(W) ? 'f16' : 'f32'}`
-        + `${gemv ? '' : ' tiled'} ${K}→${N}`;
+        + `${gemv ? '' : rows ? ` rows${M}` : ' tiled'} ${K}→${N}`;
 
-    // Three weight formats and two shapes. Each combination is a separate
+    // Three weight formats and three shapes. Each combination is a separate
     // compiled source, not a branch in the shader.
     if (q8) {
         const p  = getPipeline(device, gemv ? matmulGemvQ8Src(q8.group)
+                                     : rows ? matmulGemvRowsQ8Src(q8.group, M)
                                             : matmulTiledQ8Src(q8.group));
         const u  = uniform(device, u4(M, K, N));
         const bg = bind(device, p, [X, W, Y, u, q8.scales]);
@@ -1419,16 +1614,19 @@ export function matmulNobias(device, pass, X, W, Y, M, K, N) {
         // its columns per workgroup depend on the group size.
         const cols = Math.max(1, Math.floor(256 / (q8.group / 4)));
         if (gemv) dispatch(pass, p, bg, Math.ceil(N / cols), M, 1, name);
+        else if (rows) dispatch(pass, p, bg, Math.ceil(N / cols), 1, 1, name);
         else dispatch(pass, p, bg, Math.ceil(N / 16), Math.ceil(M / 16), 1, name);
         return;
     }
 
     // vec4 whenever K is a multiple of 4, which holds for every real checkpoint.
     const p  = getPipeline(device, gemv ? matmulGemvSrc(isF16(W), K % 4 === 0)
+                                 : rows ? matmulGemvRowsSrc(isF16(W), K % 4 === 0, M)
                                         : matmulTiledSrc(isF16(W)));
     const u  = uniform(device, u4(M, K, N));
     const bg = bind(device, p, [X, W, Y, u]);
     if (gemv) dispatch(pass, p, bg, Math.ceil(N / GEMV_COLS), M, 1, name);
+    else if (rows) dispatch(pass, p, bg, Math.ceil(N / GEMV_COLS), 1, 1, name);
     else dispatch(pass, p, bg, Math.ceil(N / 16), Math.ceil(M / 16), 1, name);
 }
 
@@ -1591,6 +1789,25 @@ export function addInplace(device, pass, a, b, N) {
     const u  = uniform(device, u4(N));
     const bg = bind(device, p, [a, b, u]);
     dispatch(pass, p, bg, Math.ceil(N / 256), 1, 1, 'add_inplace');
+}
+
+// dst[dstOff, dstOff + N) = src[srcOff, srcOff + N), inside a compute pass.
+// Offsets and N are in floats.
+export function copyF32(device, pass, src, dst, N, srcOff = 0, dstOff = 0) {
+    const p  = getPipeline(device, KERNEL.copy_f32);
+    const wgX = Math.min(Math.ceil(N / 256), 4096);
+    const rowLen = wgX * 256;
+    const u  = uniform(device, u4(N, rowLen, srcOff, dstOff));
+    const bg = bind(device, p, [src, dst, u]);
+    dispatch(pass, p, bg, wgX, Math.ceil(N / rowLen), 1, 'copy_f32');
+}
+
+// ids[idOff + r] = argmax of row r of x[T, N], as an f32 token id.
+export function argmaxRows(device, pass, x, ids, T, N, idOff = 0) {
+    const p  = getPipeline(device, KERNEL.argmax_rows);
+    const u  = uniform(device, u4(N, idOff));
+    const bg = bind(device, p, [x, ids, u]);
+    dispatch(pass, p, bg, T, 1, 1, 'argmax_rows');
 }
 
 // out[i] = silu(gate[i]) * up[i]

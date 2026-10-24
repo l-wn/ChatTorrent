@@ -151,6 +151,45 @@ bindings per stage. The converter splits the fused `in_proj_qkv` and
 A reused session frame must have its recurrent state cleared, because the
 state is accumulated, not overwritten (`Runner.#cacheFor` does it).
 
+### Rollback after a speculative verify
+
+A verify job of n rows (architecture.md, Speculative decoding) is followed by
+a job that keeps k <= n of them. `linearBlock` takes the session's replay data
+for the layer (`makeReplayLayer`):
+
+```
+verify job:  copy S, hist{Q,K,V} -> replay          (copy_f32, before the block)
+             in_proj_{q,k,v,a,b} write into replay.lin{Q,K,V,A,B}
+             the block runs on those buffers as usual
+next job, k < n:
+             copy replay S, hist -> S, hist
+             causal_conv1d, l2norm, gated_delta_net_step, update_conv_history
+             over replay.lin* rows [0, k)          (linearCore, as in the forward)
+             then the job's own block
+```
+
+The restore runs the forward pass's kernels on the forward pass's inputs, so
+the state it leaves has the bits k one-token jobs leave. k = 0 (a verify
+refused further down the line) only copies the state back.
+
+## Matching plain decoding row by row
+
+A verify row must produce the logits a one-token job produces for the same
+position, or a verified token could differ from plain decoding's. Each kernel
+on the verify path gives row i the same arithmetic in the same order as a
+one-row call:
+
+- the batched GEMV (2 to 8 rows) reads each weight once and accumulates every
+  row with the GEMV's lane split, expression and reduction tree;
+- attention: a score is one dot product, softmax visits only unmasked columns
+  with a fixed thread-to-column mapping, and the value sum adds exact zeros for
+  masked columns;
+- rmsnorm, RoPE and the elementwise kernels work per row, and
+  `gated_delta_net_step` runs tokens in order with the state in registers.
+
+`kernels.test.js` reports whether a GPU matches to the bit (it needs only the
+usual tolerance to serve); `spec.test.js` requires it.
+
 ## Weight formats
 
 | dtype | stored as | notes |
@@ -171,7 +210,7 @@ dispatch shape:
 
 | kernel | does |
 |---|---|
-| `matmul` (GEMV, tiled; f32/f16/q8) | `Y = X @ W^T`; GEMV for one row, 16×16 tiles otherwise |
+| `matmul` (GEMV, rows, tiled; f32/f16/q8) | `Y = X @ W^T`; GEMV for one row, the batched GEMV for 2 to 8 rows, 16×16 tiles otherwise |
 | `gather_embed_nopos` | `out[t] = wte[ids[t]]` |
 | `rmsnorm` | one workgroup per row |
 | `reshape_heads`, `merge_heads` | row-major ↔ head-major |
@@ -181,6 +220,7 @@ dispatch shape:
 | `silu_mul`, `sigmoid_mul`, `add_inplace` | elementwise |
 | `causal_conv1d`, `update_conv_history` | Gated DeltaNet convolution |
 | `l2norm_heads`, `gated_delta_net_step` | Gated DeltaNet recurrence |
+| `copy_f32` | a buffer copy inside a compute pass (speculative snapshots) |
 
 ## Verification
 

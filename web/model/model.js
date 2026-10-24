@@ -11,8 +11,9 @@ import {
     matmulNobias, gatherEmbedNoPos, rmsnorm, reshapeHeads, scatterKV, rope,
     qkScoresGQA, causalSoftmax, attnAVGQA, mergeHeads, addInplace, siluMul,
     sigmoidMul, causalConv1d, updateConvHistory, l2NormalizeHeads, gatedDeltaNetStep,
+    copyF32, argmaxRows,
 } from './kernels.js';
-import { recurrentStateBytes } from '../split.js';
+import { recurrentStateBytes, replayLayerBytes, SPEC_COLS } from '../split.js';
 
 // --- Shapes ---
 
@@ -51,7 +52,31 @@ export function makeRecurrentState(device, d) {
 }
 
 // Defined in split.js, because blockBytes() charges for it.
-export { recurrentStateBytes };
+export { recurrentStateBytes, replayLayerBytes };
+
+// One linear_attention layer's replay data for a speculating session. A
+// verify job of n <= cols tokens records:
+//   S, hist{Q,K,V}   the recurrent state and conv rings before the job
+//   lin{Q,K,V,A,B}   the job's per-token projections (pre-conv q/k/v, a, b)
+// A rejection keeping k < n tokens puts the state back and re-runs the same
+// kernels over the first k rows (linearBlock), so the restored state has the
+// bits a k-token job would have left.
+export function makeReplayLayer(device, d, cols = SPEC_COLS) {
+    const { nV, Dk, Dv, K4, keyDim, valueDim } = d.linear;
+    const Kh = K4 - 1;
+    return {
+        cols,
+        S:     makeStorage(device, nV * Dk * Dv * F32),
+        histQ: makeStorage(device, Kh * keyDim * F32),
+        histK: makeStorage(device, Kh * keyDim * F32),
+        histV: makeStorage(device, Kh * valueDim * F32),
+        linQ:  makeStorage(device, cols * keyDim * F32),
+        linK:  makeStorage(device, cols * keyDim * F32),
+        linV:  makeStorage(device, cols * valueDim * F32),
+        linA:  makeStorage(device, cols * nV * F32),
+        linB:  makeStorage(device, cols * nV * F32),
+    };
+}
 
 // KV cache: one [n_kv, N_max, head_dim] buffer per layer for K and one for V.
 // On a hybrid checkpoint, a linear_attention layer has a recurrent-state entry
@@ -340,57 +365,163 @@ export function fullBlock(device, pass, d, w, layer, cache, s, T_new, T_past) {
 //
 // Takes no T_past: the recurrent state (`rc.S`) and the causal conv's history
 // (`rc.hist{Q,K,V}`) hold the effect of all earlier jobs.
-function linearBlock(device, pass, d, w, layer, cache, s, T_new) {
-    const H = d.hidden;
+// The recurrence and conv-ring update for `T` rows of projections, shared by
+// the forward pass and a speculative restore so both run the same kernels in
+// the same order. Writes the core output to s.coreOut.
+function linearCore(device, pass, d, L, rc, s, lin, T) {
     const { nK, nV, Dk, Dv, K4, keyDim, valueDim, group } = d.linear;
-    const L = w.layers[layer];
-    const rc = cache.recurrent[layer];
-
-    rmsnorm(device, pass, s.x, L.input_layernorm, s.h, T_new, H, d.rms_eps);
-
-    matmulNobias(device, pass, s.h, L.in_proj_q, s.linQ, T_new, H, keyDim);
-    matmulNobias(device, pass, s.h, L.in_proj_k, s.linK, T_new, H, keyDim);
-    matmulNobias(device, pass, s.h, L.in_proj_v, s.linV, T_new, H, valueDim);
-    matmulNobias(device, pass, s.h, L.in_proj_z, s.linZ, T_new, H, valueDim);
-    matmulNobias(device, pass, s.h, L.in_proj_b, s.linB, T_new, H, nV);
-    matmulNobias(device, pass, s.h, L.in_proj_a, s.linA, T_new, H, nV);
 
     // Rows before this job come from the history ring, so T_past is 0 here.
-    causalConv1d(device, pass, s.linQ, L.conv1d_q, s.convQ, T_new, keyDim,   K4, 0, rc.histQ);
-    causalConv1d(device, pass, s.linK, L.conv1d_k, s.convK, T_new, keyDim,   K4, 0, rc.histK);
-    causalConv1d(device, pass, s.linV, L.conv1d_v, s.convV, T_new, valueDim, K4, 0, rc.histV);
+    causalConv1d(device, pass, lin.q, L.conv1d_q, s.convQ, T, keyDim,   K4, 0, rc.histQ);
+    causalConv1d(device, pass, lin.k, L.conv1d_k, s.convK, T, keyDim,   K4, 0, rc.histK);
+    causalConv1d(device, pass, lin.v, L.conv1d_v, s.convV, T, valueDim, K4, 0, rc.histV);
 
     // `group` applies Gated DeltaNet's repeat_interleave (query/key have fewer
     // heads than value/gate) in the same pass.
-    l2NormalizeHeads(device, pass, s.convQ, s.qL2, T_new, nK, Dk, group);
-    l2NormalizeHeads(device, pass, s.convK, s.kL2, T_new, nK, Dk, group);
+    l2NormalizeHeads(device, pass, s.convQ, s.qL2, T, nK, Dk, group);
+    l2NormalizeHeads(device, pass, s.convK, s.kL2, T, nK, Dk, group);
 
-    // One dispatch runs the recurrence through all T_new tokens on the
-    // persistent state `rc.S`, keeping each head's state in registers for the
-    // whole chunk (see gated_delta_net_step in kernels.js). Decode is the
-    // T_new = 1 case.
-    gatedDeltaNetStep(device, pass, s.qL2, s.kL2, s.convV, s.linA, s.linB, L.gate_params,
-        rc.S, s.coreOut, 0, nV, Dk, Dv, T_new);
+    // One dispatch runs the recurrence through all T tokens on the persistent
+    // state `rc.S`, keeping each head's state in registers for the whole chunk
+    // (see gated_delta_net_step in kernels.js). Decode is the T = 1 case.
+    gatedDeltaNetStep(device, pass, s.qL2, s.kL2, s.convV, lin.a, lin.b, L.gate_params,
+        rc.S, s.coreOut, 0, nV, Dk, Dv, T);
+
+    // Advance the ring with the raw (pre-conv) projections. This must come
+    // after causalConv1d above, which reads the ring's previous contents.
+    updateConvHistory(device, pass, rc.histQ, lin.q, T, keyDim,   K4);
+    updateConvHistory(device, pass, rc.histK, lin.k, T, keyDim,   K4);
+    updateConvHistory(device, pass, rc.histV, lin.v, T, valueDim, K4);
+}
+
+// `spec` (optional) is the session's speculative state at this Runner:
+//   replay[layer]  its replay data (makeReplayLayer), or none
+//   keep           not null: the last verify job left too many tokens; put
+//                  the state back and re-run its first `keep` rows (0: none)
+//   snap           this job is a verify: record what a later `keep` needs
+function linearBlock(device, pass, d, w, layer, cache, s, T_new, spec = null) {
+    const H = d.hidden;
+    const { nV, Dv, keyDim, valueDim } = d.linear;
+    const L = w.layers[layer];
+    const rc = cache.recurrent[layer];
+    const rp = spec?.replay?.[layer] ?? null;
+
+    if (rp && spec.keep != null) {
+        copyF32(device, pass, rp.S, rc.S, rc.S.size / F32);
+        copyF32(device, pass, rp.histQ, rc.histQ, rc.histQ.size / F32);
+        copyF32(device, pass, rp.histK, rc.histK, rc.histK.size / F32);
+        copyF32(device, pass, rp.histV, rc.histV, rc.histV.size / F32);
+        if (spec.keep > 0) {
+            linearCore(device, pass, d, L, rc, s,
+                { q: rp.linQ, k: rp.linK, v: rp.linV, a: rp.linA, b: rp.linB }, spec.keep);
+        }
+    }
+    const snap = rp && spec.snap;
+    if (snap) {
+        copyF32(device, pass, rc.S, rp.S, rc.S.size / F32);
+        copyF32(device, pass, rc.histQ, rp.histQ, rc.histQ.size / F32);
+        copyF32(device, pass, rc.histK, rp.histK, rc.histK.size / F32);
+        copyF32(device, pass, rc.histV, rp.histV, rc.histV.size / F32);
+    }
+    // A verify job's projections go straight into the replay buffers, which
+    // then serve as this job's inputs too.
+    const lin = snap
+        ? { q: rp.linQ, k: rp.linK, v: rp.linV, a: rp.linA, b: rp.linB }
+        : { q: s.linQ, k: s.linK, v: s.linV, a: s.linA, b: s.linB };
+
+    rmsnorm(device, pass, s.x, L.input_layernorm, s.h, T_new, H, d.rms_eps);
+
+    matmulNobias(device, pass, s.h, L.in_proj_q, lin.q, T_new, H, keyDim);
+    matmulNobias(device, pass, s.h, L.in_proj_k, lin.k, T_new, H, keyDim);
+    matmulNobias(device, pass, s.h, L.in_proj_v, lin.v, T_new, H, valueDim);
+    matmulNobias(device, pass, s.h, L.in_proj_z, s.linZ, T_new, H, valueDim);
+    matmulNobias(device, pass, s.h, L.in_proj_b, lin.b, T_new, H, nV);
+    matmulNobias(device, pass, s.h, L.in_proj_a, lin.a, T_new, H, nV);
+
+    linearCore(device, pass, d, L, rc, s, lin, T_new);
+
 
     rmsnorm(device, pass, s.coreOut, L.gated_norm, s.gatedNorm, T_new * nV, Dv, d.rms_eps);
     siluMul(device, pass, s.linZ, s.gatedNorm, s.gatedFinal, T_new * nV * Dv);
     matmulNobias(device, pass, s.gatedFinal, L.out_proj, s.linAttnOut, T_new, valueDim, H);
     addInplace(device, pass, s.x, s.linAttnOut, T_new * H);
 
-    // Advance the ring with this job's raw (pre-conv) projections. This must
-    // come after causalConv1d above, which reads the ring's previous contents.
-    updateConvHistory(device, pass, rc.histQ, s.linQ, T_new, keyDim,   K4);
-    updateConvHistory(device, pass, rc.histK, s.linK, T_new, keyDim,   K4);
-    updateConvHistory(device, pass, rc.histV, s.linV, T_new, valueDim, K4);
-
     ffnBlock(device, pass, d, L, s, T_new);
+}
+
+// --- The MTP draft head (Qwen3.8 multi-token prediction) ---
+//
+// The head drafts the token after next from the trunk's last hidden state h
+// (before the final norm) and the embedding e of the next token:
+//
+//     x      = fc_e · enorm(e) + fc_h · hnorm(h)
+//     x      = one full-attention layer (x)            its own KV, per session
+//     logits = head_draft · mtp_norm(x)                 the first draftVocab rows
+//
+// `m` is loader.js loadMtp()'s weights, `mc` the session's cache view for the
+// layer (its K/V pool buffers and the frame's page table), `ms` its scratch
+// (makeMtpScratch). Row r pairs hIn[r] (the hidden state of position past + r
+// - 1) with ids[r] (the token at past + r) and writes the KV row at past + r.
+// The layer's output is left in ms.x.
+export function mtpBlock(device, pass, d, m, mc, ms, hIn, ids, T, past) {
+    const H = d.hidden;
+    gatherEmbedNoPos(device, pass, ids, m.embed_draft, ms.mtpEmb, T, H);
+    rmsnorm(device, pass, ms.mtpEmb, m.enorm, ms.mtpEn, T, H, d.rms_eps);
+    rmsnorm(device, pass, hIn, m.hnorm, ms.mtpHn, T, H, d.rms_eps);
+    matmulNobias(device, pass, ms.mtpEn, m.fc_e, ms.x, T, H, H);
+    matmulNobias(device, pass, ms.mtpHn, m.fc_h, ms.mtpFc, T, H, H);
+    addInplace(device, pass, ms.x, ms.mtpFc, T * H);
+    fullBlock(device, pass, d, { layers: [m] }, 0, mc, ms, T, past);
+}
+
+// The draft for each of T rows of ms.x: mtp_norm, the draft head, argmax. The
+// ids are written as f32 into `ids` from `idOff`.
+export function mtpDraft(device, pass, d, m, ms, ids, T, idOff) {
+    const H = d.hidden, V = m.draftVocab;
+    rmsnorm(device, pass, ms.x, m.mtp_norm, ms.h, T, H, d.rms_eps);
+    matmulNobias(device, pass, ms.h, m.head_draft, ms.logits, T, H, V);
+    argmaxRows(device, pass, ms.logits, ids, T, V, idOff);
+}
+
+// Chain K drafts after token `ids[0]` at position `pos`, from `h`, the trunk's
+// hidden state at pos - 1 ([1, H]). Step k feeds the previous step's output
+// and draft back in. The drafts land in ids[1..K]; the layer's KV rows
+// pos..pos+K-1 are speculative and are rewritten by the next job's fill.
+export function mtpChain(device, pass, d, m, mc, ms, h, ids, pos, K) {
+    const H = d.hidden;
+    copyF32(device, pass, h, ms.mtpH, H);
+    for (let k = 0; k < K; k++) {
+        copyF32(device, pass, ids, ms.mtpId, 1, k, 0);
+        mtpBlock(device, pass, d, m, mc, ms, ms.mtpH, ms.mtpId, 1, pos + k);
+        mtpDraft(device, pass, d, m, ms, ids, 1, k + 1);
+        if (k + 1 < K) copyF32(device, pass, ms.x, ms.mtpH, H);
+    }
+}
+
+// The MTP head's scratch: a block's (for `fullBlock`), with the logits sized
+// for the draft vocabulary, plus its own inputs.
+export function makeMtpScratch(device, d, draftVocab, T_max, N_max) {
+    const s = makeScratch(device, { ...d, linear: undefined, vocab: draftVocab }, T_max, N_max);
+    const H = d.hidden;
+    const extra = {
+        mtpEmb: T_max * H, mtpEn: T_max * H, mtpHn: T_max * H, mtpFc: T_max * H,
+        mtpIn: T_max * H, mtpH: H, mtpId: 4, mtpIds: T_max + 8,
+    };
+    for (const [name, n] of Object.entries(extra)) {
+        s[name] = makeStorage(device, n * F32);
+        s.bytes += Math.max(n * F32, 16);
+    }
+    return s;
 }
 
 // Dispatches on the block's `kind`, set by loader.js's loadBlock()
 // (randomWeights() sets 'full_attention').
-export function block(device, pass, d, w, layer, cache, s, T_new, T_past) {
+// `spec` is the session's speculative state, read by linear_attention blocks
+// only: a full-attention block's KV is overwritten by position, so a rejected
+// row needs no undo.
+export function block(device, pass, d, w, layer, cache, s, T_new, T_past, spec = null) {
     const kind = w.layers[layer].kind ?? 'full_attention';
-    if (kind === 'linear_attention') return linearBlock(device, pass, d, w, layer, cache, s, T_new);
+    if (kind === 'linear_attention') return linearBlock(device, pass, d, w, layer, cache, s, T_new, spec);
     return fullBlock(device, pass, d, w, layer, cache, s, T_new, T_past);
 }
 

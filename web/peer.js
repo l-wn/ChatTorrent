@@ -342,7 +342,9 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
     openStore(room);
 
     ui.bootnote.textContent = 'connecting to the signaling server…';
-    engine = new Engine({ onEvent: handleEngineEvent });
+    // ?mtp=1: holding the head, also hold the MTP draft head.
+    engine = new Engine({ onEvent: handleEngineEvent,
+                          mtp: new URLSearchParams(location.search).get('mtp') === '1' });
 
     let manifest;
     try {
@@ -937,6 +939,7 @@ const options = () => ({
     thinking: ui.thinking.checked,
     prof: Number(ui.prof.value),
     loop: ui.loop.value === 'closed',
+    spec: ui.spec.value === 'on' && ui.loop.value === 'closed',
 });
 
 async function submitPrompt() {

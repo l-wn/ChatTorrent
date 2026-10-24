@@ -81,7 +81,7 @@ const RECURRENT = /^R\d+$/;
 // The proxy Runner. Every guard under test is the real Runner's. The proxy
 // adds the toy forward pass and one ledger assertion that the real Runner
 // cannot make, because it never sees more than one job's context.
-function peerRunner(world, id, lo, hi, have, slots, idleMs = 0) {
+function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null) {
     // Each peer has its own GPU and trace. With a shared trace, a replay into
     // one peer while another is working would be recorded as one run.
     const { device, setFill, resetTrace, takeTrace, passes } = makeGpu();
@@ -96,14 +96,20 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0) {
         // `waitMs: 0`: no job waits for a frame. With `idleMs` 0 a frame can
         // always be taken, and the fuzz expects refusals to be immediate.
         // Waiting is tested in tools/stage.test.mjs.
-        { lo, hi, have, nMax: 4 * T_MAX, tMax: T_MAX, slots, idleMs, waitMs: 0 });
+        { lo, hi, have, nMax: 4 * T_MAX, tMax: T_MAX, slots, idleMs, waitMs: 0,
+          ...(specSlots != null && { specSlots }) });
 
     // `${session}|${tag}` -> the prefix fold, one entry per token position.
     // Stored by position, like the KV cache it models, so re-running a
     // position with the same input changes nothing and a replay does not look
     // like corruption.
     const kv = new Map();
-    // `${session}|${tag}` -> the recurrent fold. See RECURRENT.
+    // `${session}|${tag}` -> { st, win }: the recurrent fold (see RECURRENT),
+    // and while the session's last job was a verify, `win`: where it started,
+    // its rows, and the fold before and after each row. The next job may start
+    // anywhere inside it and continues from that row's fold, as the real
+    // Runner's rollback does. Anywhere else, it folds on top, so a rollback
+    // the Runner should not have taken still shows up as wrong tokens.
     const rec = new Map();
     // `${session}|${entry}` -> { len, at }: how far this cursor has been fed,
     // and the input digest at each position, so a rewrite can be checked. A
@@ -174,6 +180,7 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0) {
     async function one(h, hidden, want) {
         resetTrace();
         let last = 0, filled = false;
+        const digs = [];                 // each row's digest, for a verify's tokens
         const cleared = passes.cleared;
 
         function fold(tags, bytes) {
@@ -184,7 +191,11 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0) {
             // since it only receives `past`.
             const fk = `${h.s}|${h.pos}`;
             let seen = fed.get(fk);
-            if (!seen) fed.set(fk, seen = { len: 0, at: new Uint32Array(real.nMax) });
+            // `tent`: rows a verify wrote after its first, which may be
+            // rejected drafts. Any later job may rewrite them with other
+            // values (a replay after a repair, the job after the verify).
+            if (!seen) fed.set(fk, seen = { len: 0, at: new Uint32Array(real.nMax),
+                                            tent: new Uint8Array(real.nMax) });
             if (h.past > seen.len) {
                 world.violation(`peer ${id}: session ${h.s} entered at ${h.pos} with ` +
                     `past=${h.past}, but only ${seen.len} positions have been fed there`);
@@ -195,26 +206,46 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0) {
             // they overwrite). A replay, a repair's re-sent job, and a job the
             // head fed must store the same values as before.
             const mayRewind = !h.replay && !h.auto;
+            // A job after a verify drops the rows it does not keep: they are
+            // the drafts after the first rejected one, and its own first ids
+            // replace them.
+            const win = seen.win;
+            if (win && h.past < seen.len && h.past < win.base + win.n
+                && (h.past > win.base || (h.rb && h.past === win.base))) {
+                seen.len = h.past;
+            }
+            seen.win = h.drafts ? { base: h.past, n: h.n } : null;
 
             const rows = bytes === null || bytes === D.vocab * F32
                 ? null : new Float32Array(bytes / F32);
             for (let j = 0; j < h.n; j++) {
                 const p = h.past + j;
                 let d = (h.pos === 0 ? h.ids[j] : hidden[j * H]) >>> 0;
-                if (p < seen.len && seen.at[p] !== d) {
+                if (p < seen.len && seen.at[p] !== d && !seen.tent[p]) {
                     if (mayRewind) seen.len = p;
                     else world.violation(`peer ${id}: session ${h.s} re-fed position ${p} ` +
                         `at ${h.pos} with a different residual`);
                 }
                 seen.at[p] = d;
+                seen.tent[p] = h.drafts && j > 0 ? 1 : 0;
                 for (const t of tags) {
                     d = mix(d, tagId(t));
                     if (RECURRENT.test(t)) {
                         const k = `${h.s}|${t}`;
                         if (j === 0 && passes.cleared > cleared) rec.delete(k);
-                        const st = mix(rec.get(k) ?? SEED, d);
-                        rec.set(k, st);
-                        d = mix(d, st);
+                        let e = rec.get(k);
+                        if (!e) rec.set(k, e = { st: SEED, win: null });
+                        if (j === 0) {
+                            const w = e.win;
+                            if (w && h.past < w.base + w.n
+                                && (h.past > w.base || (h.rb && h.past === w.base))) {
+                                e.st = w.snaps[h.past - w.base];
+                            }
+                            e.win = h.drafts ? { base: h.past, n: h.n, snaps: [e.st] } : null;
+                        }
+                        e.st = mix(e.st, d);
+                        if (e.win) e.win.snaps.push(e.st);
+                        d = mix(d, e.st);
                     }
                     if (HAS_KV.test(t)) {
                         const k = `${h.s}|${t}`;
@@ -226,6 +257,7 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0) {
                     d &= 0xffffff;
                 }
                 if (rows) rows[j * H] = d;
+                digs.push(d);
                 last = d;
             }
             seen.len = Math.max(seen.len, h.past + h.n);
@@ -263,7 +295,18 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0) {
         // (a replay that reached the end of the line). The other fields (phase
         // timings, a GPU profile) are the real Runner's and are passed
         // through.
-        if (r.token !== undefined) return { ...r, token: last % D.vocab };
+        // A verify's tokens: each row's, accepted while it matches the draft.
+        const V = world.toyVocab ?? D.vocab;
+        if (r.tokens !== undefined) {
+            const tokens = [];
+            for (let j = 0; j < h.n; j++) {
+                const t = digs[j] % V;
+                tokens.push(t);
+                if (j === h.n - 1 || t !== h.drafts[j]) break;
+            }
+            return { ...r, token: tokens.at(-1), tokens };
+        }
+        if (r.token !== undefined) return { ...r, token: last % V };
         return r;
     }
 }
@@ -276,7 +319,10 @@ class World {
     // every departure the mesh can absorb is absorbed, and a budget would make
     // it fail for reasons unrelated to routing.
     constructor({ maxRepairs, maxFixes, maxLocalReplay, hybrid = false, hybridRouter = hybrid,
-                  idleMs = 0, ackRate = Infinity } = {}) {
+                  idleMs = 0, ackRate = Infinity, toyVocab = null } = {}) {
+        // How many distinct tokens the toy model samples. A small one makes
+        // replies repeat, so prompt lookup finds drafts and some are accepted.
+        this.toyVocab = toyVocab;
         // Bytes per second a hop's ack wait allows for on top of ackTimeout.
         // Unlimited here, so the 15ms timeout in the other tests is exact.
         this.ackRate = ackRate;
@@ -310,7 +356,8 @@ class World {
     // A peer that claims `[lo, hi)` and has downloaded `[lo, have)`.
     // `lo === null` is a spectator: in the mesh, linked to the entry point,
     // never routed a job.
-    join(id, lo = null, hi = null, { have = hi, slots = SLOTS, ready = true, closedLoop = true } = {}) {
+    join(id, lo = null, hi = null, { have = hi, slots = SLOTS, ready = true, closedLoop = true,
+                                     specSlots = null } = {}) {
         const net = new Mesh({});
         net.ready.catch(() => {});          // never welcomed (the WebSocket is a stub)
         Object.assign(net, {
@@ -319,7 +366,8 @@ class World {
             peers: this.peers,
         });
 
-        const runner = lo == null ? null : peerRunner(this, id, lo, hi, have, slots, this.idleMs);
+        const runner = lo == null ? null
+            : peerRunner(this, id, lo, hi, have, slots, this.idleMs, specSlots);
         const tab = { id, net, runner, repairs: 0, fixes: [], sessions: [],
                       progress: [], cancelled: false };
 
@@ -385,7 +433,10 @@ class World {
         const { header: sent } = unpack(buf);
         this.wire.push({ from, to, k: sent.k, addr: sent.to, s: sent.s, pos: sent.pos,
                          replay: !!sent.replay, past: sent.past, n: sent.n, prof: sent.prof,
-                         opts: sent.opts, loop: !!sent.loop, fed: sent.fed, auto: !!sent.auto });
+                         opts: sent.opts, loop: !!sent.loop, fed: sent.fed, auto: !!sent.auto,
+                         drafts: sent.drafts, rowOpts: sent.rowOpts, tokens: sent.tokens,
+                         nospec: !!sent.nospec,
+                         rb: !!sent.rb });
         const slow = this.slowLinks.get(`${from}>${to}`);
         const later = (fn) => {
             if (!slow) return queueMicrotask(fn);
@@ -2723,8 +2774,8 @@ const ROOM = 4 * T_MAX - 4;
 
 // Whether a single peer using the round trip produces `continuation` after
 // `context`. Returns the index of the first token that differs, or -1.
-async function diverges(hybrid, context, continuation) {
-    const { asker } = chain([0, N], {}, { hybrid });
+async function diverges(hybrid, context, continuation, toyVocab = null) {
+    const { asker } = chain([0, N], {}, { hybrid, toyVocab });
     let tok = null;
     for (let i = 0; i < context.length; i += T_MAX) {
         ({ token: tok } = await asker.router.submit(context.slice(i, i + T_MAX), GREEDY));
@@ -2748,9 +2799,16 @@ async function fuzzOne(seed) {
     // askers take one another's caches mid-reply and mid-rebuild, with a small
     // repair budget. Turns may then fail, but must never give wrong tokens.
     const thrash = rand() < 0.15;
-    const w = new World({ hybrid, maxRepairs: thrash ? 3 : 200, idleMs: thrash ? 0 : 25 });
+    // Speculative decoding on half the scenarios. A small toy vocabulary makes
+    // replies repeat, so drafts are found and some accepted. Some peers have
+    // few or no replay slots, so verifies are refused and decode goes plain.
+    const spec = rand() < 0.5;
+    const toyVocab = rand() < 0.5 ? int(2, 5) : null;
+    const vocab = toyVocab ?? D.vocab;
+    const w = new World({ hybrid, maxRepairs: thrash ? 3 : 200, idleMs: thrash ? 0 : 25, toyVocab });
     const ranges = randomMesh(rand, { deep: rand() < 0.7 });
-    ranges.forEach(([lo, hi], i) => w.join(i, lo, hi, { slots, closedLoop: rand() > 0.15 }));
+    ranges.forEach(([lo, hi], i) => w.join(i, lo, hi, { slots, closedLoop: rand() > 0.15,
+        specSlots: rand() < 0.2 ? int(0, 2) : null }));
     const workers = ranges.map((_, i) => i);
 
     // One to three askers: each a spectator or one of the workers.
@@ -2759,7 +2817,7 @@ async function fuzzOne(seed) {
         const own = rand() < 0.3 ? workers.find((id) => !askers.includes(w.tabs.get(id))) : undefined;
         askers.push(own !== undefined ? w.tabs.get(own) : w.join(100 + j));
     }
-    const eosId = rand() < 0.2 ? int(0, D.vocab - 1) : -1;
+    const eosId = rand() < 0.2 ? int(0, vocab - 1) : -1;
     for (const tab of w.tabs.values()) tab.router.eos = eosId;
     for (const id of workers) if (rand() < 0.3) w.slow(id, int(1, 3));
     const askerIds = new Set(askers.map((a) => a.id));
@@ -2795,7 +2853,7 @@ async function fuzzOne(seed) {
             let reply, err = null;
             try {
                 reply = loop
-                    ? await streamed(a, prompt, budget, { between,
+                    ? await streamed(a, prompt, budget, { between, ...(spec && { opts: { spec } }),
                         ...(action === 'stop' && { stopAfter: k }), ...(action === 'cut' && { breakAfter: k }) })
                     : await generate(a, prompt, action === 'none' ? budget : Math.min(k, budget), { between });
             } catch (e) { err = e; }
@@ -2819,7 +2877,7 @@ async function fuzzOne(seed) {
                 if (JSON.stringify(part) !== JSON.stringify(prompt.slice(0, part.length))) {
                     problems.push(`${where(a, t)}: a failed turn left a context that is not its prompt`);
                 } else if (tail.length > prompt.length
-                           && await diverges(hybrid, [...before, ...prompt], tail.slice(prompt.length)) >= 0) {
+                           && await diverges(hybrid, [...before, ...prompt], tail.slice(prompt.length), toyVocab) >= 0) {
                     problems.push(`${where(a, t)}: a failed turn left a reply that is not the reference's`);
                 }
                 continue;
@@ -2834,7 +2892,7 @@ async function fuzzOne(seed) {
                     `(${JSON.stringify(reply)} vs ${JSON.stringify(fed)})`);
                 continue;
             }
-            const bad = await diverges(hybrid, [...before, ...prompt], fed);
+            const bad = await diverges(hybrid, [...before, ...prompt], fed, toyVocab);
             if (bad >= 0) {
                 problems.push(`${where(a, t)}: token ${bad} of the reply is not the reference's`);
                 continue;
@@ -2855,6 +2913,184 @@ async function fuzzOne(seed) {
     if (w.violations.length) problems.push(`fuzz seed ${seed}: ${w.violations[0]}`);
     if (!(await quiet(w, 30))) problems.push(`fuzz seed ${seed}: a loop still feeding after every reply ended`);
     return problems;
+}
+
+// --- Speculative decoding ---
+//
+// With `spec` on, the head drafts by prompt lookup and sends verify jobs. The
+// reply and the context it leaves must be exactly plain decoding's, through
+// every cut of the line, on both kinds of model. A toy vocabulary of 3 makes
+// replies repeat, so lookup finds drafts and accepts some of them.
+
+const SPEC = { spec: true };
+const SPEC_PROMPT = [1, 2, 0, 1, 2, 0, 1, 2, 0];
+const verifiesOn = (w) => w.wire.filter((m) => m.k === 'job' && Array.isArray(m.drafts)).length;
+
+console.log('\nspeculative decoding: every cut gives plain decoding\'s reply and context');
+for (const hybrid of [false, true]) {
+    const world = { hybrid, toyVocab: 3 };
+    const ref = chain([0, N], {}, world);
+    const control = await streamed(ref.asker, SPEC_PROMPT, 30);
+    let bad = [], n = 0, verifies = 0;
+    for (const cuts of everyCut()) {
+        const { w, asker } = chain(cuts, {}, world);
+        const got = await streamed(asker, SPEC_PROMPT, 30, { opts: SPEC });
+        n++;
+        verifies += verifiesOn(w);
+        if (JSON.stringify(got) !== JSON.stringify(control)) bad.push(`${cuts.join('-')}: ${JSON.stringify(got)}`);
+        else if (JSON.stringify(asker.router.history) !== JSON.stringify([...SPEC_PROMPT, ...control])) {
+            bad.push(`${cuts.join('-')}: history`);
+        } else if (w.violations.length) bad.push(`${cuts.join('-')}: ${w.violations[0]}`);
+    }
+    ok(`${hybrid ? 'hybrid' : 'full attention'}: every chain gives plain decoding's tokens and context (${n} arrangements)`,
+        bad.length === 0, `${bad.length} wrong, e.g. ${bad[0]}\n        want ${JSON.stringify(control)}`);
+    ok('  and the head really did send verify jobs', verifies > n, `${verifies} over ${n} runs`);
+}
+
+console.log('\nspeculative decoding: drafts are accepted, and fewer jobs carry the reply');
+{
+    const world = { hybrid: true, toyVocab: 3 };
+    const plain = chain([0, 3, 6, N], {}, world);
+    const control = await streamed(plain.asker, SPEC_PROMPT, 40);
+    const plainJobs = plain.w.wire.filter((m) => m.k === 'job' && m.pos === 0 && m.auto).length;
+    const { w, asker } = chain([0, 3, 6, N], {}, world);
+    const got = await streamed(asker, SPEC_PROMPT, 40, { opts: SPEC });
+    eq('the same 40 tokens as plain decoding', got, control);
+    const jobs = w.wire.filter((m) => m.k === 'job' && m.pos === 0 && m.auto);
+    const verifies = jobs.filter((m) => m.drafts);
+    ok('some jobs were verifies', verifies.length > 0, `${verifies.length}`);
+    ok(`and the reply took fewer head-fed jobs than plain (${jobs.length} vs ${plainJobs})`,
+        jobs.length < plainJobs);
+    ok('every verify fits a batched GEMV', verifies.every((m) => m.n <= 8 && m.drafts.length === m.n - 1));
+    eq('no ledger violations', w.violations, []);
+}
+
+console.log('\nspeculative decoding: budgets are exact, and the last answer is not fed');
+for (const budget of [1, 2, 3, 5, 17]) {
+    const world = { hybrid: true, toyVocab: 3 };
+    const control = await streamed(chain([0, N], {}, world).asker, SPEC_PROMPT, budget);
+    const { w, asker } = chain([0, 4, N], {}, world);
+    const got = await streamed(asker, SPEC_PROMPT, budget, { opts: SPEC });
+    eq(`budget ${budget}: plain decoding's tokens`, got, control);
+    eq('  and context', asker.router.history, [...SPEC_PROMPT, ...control]);
+    eq('  the answer that ended it was not fed', asker.lastEnd?.fed, false);
+    eq('  no ledger violations', w.violations, []);
+}
+
+console.log('\nspeculative decoding: end-of-text inside a verify ends the reply there');
+{
+    const world = { hybrid: true, toyVocab: 3 };
+    const ref = chain([0, N], {}, world);
+    for (const tab of ref.w.tabs.values()) tab.router.eos = 2;
+    const want = await streamed(ref.asker, SPEC_PROMPT, 30);
+    const { w, asker } = chain([0, 3, N], {}, world);
+    for (const tab of w.tabs.values()) tab.router.eos = 2;
+    const got = await streamed(asker, SPEC_PROMPT, 30, { opts: SPEC });
+    eq('the reply stops where plain decoding stops', got, want);
+    ok('  at end-of-text', asker.lastEnd?.eos === true);
+    eq('  the context is plain decoding\'s', asker.router.history, ref.asker.router.history);
+    eq('  no ledger violations', w.violations, []);
+
+    // The next turn starts below what the verify left in the recurrent state:
+    // the rows after end-of-text are rolled back.
+    const next = await streamed(asker, TURN2, 6, { opts: SPEC });
+    const wantNext = await streamed(ref.asker, TURN2, 6);
+    eq('and the next turn continues as plain decoding\'s does', next, wantNext);
+    eq('  with no rebuild', asker.repairs, 0);
+    eq('  and no ledger violations', w.violations, []);
+}
+
+console.log('\nspeculative decoding: every verify row is sampled with plain decoding\'s penalty summary');
+{
+    // Row i of a verify at `past` predicts position past + i, with the drafts
+    // before it in the context. Where those drafts were accepted, its summary
+    // must be the one the round trip sent for the job at past + i.
+    const PENS = { rep: 1.1, freq: 0.4, pres: 0.2, ngram: 5 };
+    const world = { hybrid: true, toyVocab: 3 };
+    const a = chain([0, 4, N], {}, world);
+    await generate(a.asker, SPEC_PROMPT, 30, { opts: PENS });
+    const want = {};
+    for (const m of a.w.wire) if (m.k === 'job' && m.pos === 0 && !m.replay) want[m.past] = JSON.stringify(m.opts);
+
+    const b = chain([0, 4, N], {}, world);
+    const got = await streamed(b.asker, SPEC_PROMPT, 30, { opts: { ...PENS, ...SPEC } });
+    eq('the same reply as plain decoding with the same penalties',
+        got, (await generate(chain([0, 4, N], {}, world).asker, SPEC_PROMPT, 30, { opts: PENS })));
+    const kept = new Map();               // past of a verify -> rows its answer kept
+    for (const m of b.w.wire) if (m.k === 'tok' && Array.isArray(m.tokens)) kept.set(m.past, m.tokens.length);
+    let rows = 0, wrong = [], banned = 0;
+    const verifies = b.w.wire.filter((m) => m.k === 'job' && m.pos === 0 && Array.isArray(m.drafts) && !m.replay);
+    for (const m of verifies) {
+        const opts = [m.opts, ...(m.rowOpts ?? [])];
+        m.drafts.forEach((d, i) => { if (opts[i]?.ban?.includes(d)) banned++; });
+        for (let i = 0; i < Math.min(kept.get(m.past) ?? 1, opts.length); i++) {
+            rows++;
+            if (JSON.stringify(opts[i]) !== want[m.past + i]) wrong.push(`${m.past}+${i}`);
+        }
+    }
+    ok('some verifies were sent with penalties on', verifies.length > 0, `${verifies.length}`);
+    ok(`every kept row's summary is the round trip's (${rows} rows)`, wrong.length === 0, wrong.join(', '));
+    eq('no draft is one its own row bans', banned, 0);
+}
+
+console.log('\nspeculative decoding: a peer with no replay slot refuses, and the reply goes on plain');
+{
+    const world = { hybrid: true, toyVocab: 3 };
+    const control = await streamed(chain([0, N], {}, world).asker, SPEC_PROMPT, 30);
+    const w = new World(world);
+    w.join(0, 0, 3);
+    w.join(1, 3, 6, { specSlots: 0 });
+    w.join(2, 6, N);
+    const asker = w.join(100);
+    const got = await streamed(asker, SPEC_PROMPT, 30, { opts: SPEC });
+    eq('the reply is plain decoding\'s', got, control);
+    eq('  and so is the context', asker.router.history, [...SPEC_PROMPT, ...control]);
+    ok('  the refusal came back as nospec', w.wire.some((m) => m.k === 'err' && m.nospec));
+    ok('  the enqueuer re-sent the token with rb', w.wire.some((m) => m.k === 'job' && m.rb && m.from === 100));
+    eq('  with no rebuild and no repair', [asker.repairs, w.tabs.get(0).router.repaired], [0, 0]);
+    eq('  no ledger violations', w.violations, []);
+    ok('  nothing left running', await quiet(w));
+}
+
+console.log('\nspeculative decoding: the head itself refuses, and the refusal still reaches the enqueuer');
+{
+    // In the closed loop the entry's upstream is the head, so a refusal that
+    // walked back hop by hop would bounce between them and never arrive.
+    const world = { hybrid: true, toyVocab: 3 };
+    const control = await streamed(chain([0, N], {}, world).asker, SPEC_PROMPT, 30);
+    for (const [label, ranges] of [['two peers, the head refuses', [[0, 4, null], [4, N, 0]]],
+                                   ['three peers, the entry refuses', [[0, 3, 0], [3, 6, null], [6, N, null]]]]) {
+        const w = new World(world);
+        ranges.forEach(([lo, hi, specSlots], i) => w.join(i, lo, hi, { specSlots }));
+        const asker = w.join(100);
+        const t0 = performance.now();
+        const got = await streamed(asker, SPEC_PROMPT, 30, { opts: SPEC });
+        eq(`${label}: plain decoding's reply`, got, control);
+        ok('  the refusal reached the enqueuer, which re-sent with rb',
+            w.wire.some((m) => m.k === 'job' && m.rb && m.from === 100));
+        ok('  without waiting for a timeout', performance.now() - t0 < 400, `${(performance.now() - t0).toFixed(0)} ms`);
+        eq('  with no rebuild', asker.repairs, 0);
+        eq('  no ledger violations', w.violations, []);
+    }
+}
+
+console.log('\nspeculative decoding: several people at once, interleaving on the same runners');
+for (const slots of [3, 1]) {
+    const world = { hybrid: true, toyVocab: 3, maxRepairs: 200 };
+    const prompts = [SPEC_PROMPT, [2, 2, 1, 2, 2, 1], [0, 1, 1, 0, 1, 1, 0]];
+    const controls = [];
+    for (const p of prompts) controls.push(await streamed(chain([0, N], {}, world).asker, p, 20));
+    const w = new World(world);
+    w.join(0, 0, 3, { slots });
+    w.join(1, 3, 6, { slots, specSlots: 2 });
+    w.join(2, 6, N, { slots });
+    const askers = prompts.map((_, i) => w.join(100 + i));
+    for (const id of [0, 1, 2]) w.slow(id, 1);
+    const got = await Promise.all(askers.map((a, i) => streamed(a, prompts[i], 20, { opts: SPEC })));
+    eq(`${slots} slot${slots === 1 ? '' : 's'} per peer, three speculating enqueuers: every reply is its own`,
+        got, controls);
+    eq('  no ledger violations', w.violations, []);
+    ok('  nothing left running', await quiet(w));
 }
 
 console.log(`\nclosed loop: the fuzz: ${FUZZ} random scenarios  (--fuzz-seed ${FUZZ_SEED})`);

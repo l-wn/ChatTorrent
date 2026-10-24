@@ -118,8 +118,9 @@ LINEAR_ATTN_BLOCK_TENSORS = [
 # f32. It is 2-D ([conv_dim, 4]), so the ndim<2 rule does not cover it.
 FORCE_F32_NAMES = {"conv1d_q", "conv1d_k", "conv1d_v"}
 
-# Top-level state-dict prefixes that are dropped, not exported: the vision
-# tower and the multi-token-prediction head, which text-only chat does not use.
+# Top-level state-dict prefixes AutoModelForCausalLM does not load: the vision
+# tower, which text-only chat does not use, and the multi-token-prediction
+# head, which export_mtp() reads from the shards separately.
 # AutoModelForCausalLM instantiates only the text backbone, so these never
 # appear in model.state_dict(). They appear in from_pretrained's
 # unexpected_keys report, which main() checks against this list.
@@ -159,11 +160,12 @@ def split_q_gate(arr, n_heads, head_dim):
     return q, gate
 
 
-def full_attn_layer_tensors(sd, i, cfg):
+def full_attn_layer_tensors(sd, i, cfg, prefix=None):
     """One full_attention layer's (name, array) pairs. The double-width q_proj
     is split into the query and the attention-output gate. The RMSNorm weights
-    get +1 added (see linear_attn_layer_tensors)."""
-    p = f"model.layers.{i}"
+    get +1 added (see linear_attn_layer_tensors). `prefix` names a layer
+    outside the stack (the MTP head's)."""
+    p = prefix or f"model.layers.{i}"
     n_head = cfg.num_attention_heads
     head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // n_head
     q, gate = split_q_gate(f32(sd[f"{p}.self_attn.q_proj.weight"]), n_head, head_dim)
@@ -217,6 +219,100 @@ def linear_attn_layer_tensors(sd, i, dims):
     ]
 
 
+# Vocabulary rows the MTP draft head embeds and scores. Byte-level BPE ids
+# are ordered by merge frequency, so the first rows cover most text. A token
+# outside them is never drafted, and drafting pauses after one.
+MTP_DRAFT_VOCAB = 65536
+
+
+def mtp_tensors(sd, cfg, embed, lm_head, draft_vocab=MTP_DRAFT_VOCAB):
+    """The multi-token-prediction head's (name, array) pairs, for mtp.bin.
+
+    Qwen3.8's MTP head drafts the token after next from the trunk's last
+    hidden state h (before the final norm) and the embedding e of the next
+    token:
+
+        x      = fc([enorm(e) | hnorm(h)])          fc: [H, 2H]
+        x      = one full-attention layer (x)        its own KV cache
+        logits = lm_head(norm(x))                    the shared head
+
+    fc is split into its embedding and hidden halves (fc_e, fc_h), so the
+    client adds two [H, H] products and needs no concatenation. The three
+    norms get +1 like every other Qwen3.5 RMSNorm. `embed` and `lm_head` are
+    the full tables; only their first `draft_vocab` rows are kept, so the
+    bundle can be held by a peer that holds neither end.
+    """
+    H = cfg.hidden_size
+    fc = f32(sd["mtp.fc.weight"])
+    if fc.shape != (H, 2 * H):
+        raise ValueError(f"mtp.fc.weight is {fc.shape}, expected {(H, 2 * H)}")
+    v = min(draft_vocab, embed.shape[0])
+    return [
+        ("enorm", f32(sd["mtp.pre_fc_norm_embedding.weight"]) + 1.0),
+        ("hnorm", f32(sd["mtp.pre_fc_norm_hidden.weight"]) + 1.0),
+        ("fc_e", np.ascontiguousarray(fc[:, :H])),
+        ("fc_h", np.ascontiguousarray(fc[:, H:])),
+        *full_attn_layer_tensors(sd, 0, cfg, prefix="mtp.layers.0"),
+        ("mtp_norm", f32(sd["mtp.norm.weight"]) + 1.0),
+        ("embed_draft", np.ascontiguousarray(embed[:v])),
+        ("head_draft", np.ascontiguousarray(lm_head[:v])),
+    ]
+
+
+class Shards:
+    """Tensors read one at a time from a checkpoint's safetensors shards, by
+    name, so the MTP head can be exported without loading the model."""
+
+    def __init__(self, model):
+        from safetensors import safe_open
+        path = model if os.path.isdir(model) else __import__(
+            "huggingface_hub").snapshot_download(model, local_files_only=True)
+        with open(os.path.join(path, "model.safetensors.index.json")) as f:
+            self.where = json.load(f)["weight_map"]
+        self.path, self.open, self.handles = path, safe_open, {}
+
+    def __contains__(self, key):
+        return key in self.where
+
+    def __getitem__(self, key):
+        shard = self.where[key]
+        if shard not in self.handles:
+            self.handles[shard] = self.open(os.path.join(self.path, shard), framework="pt")
+        return self.handles[shard].get_tensor(key)
+
+
+def export_mtp(model, out_dir, dtype, draft_vocab, embed=None, lm_head=None):
+    """Write mtp.bin into a converted checkpoint and add it to manifest.json.
+    `embed`/`lm_head` are the full tables if already loaded."""
+    from transformers import AutoConfig
+    cfg = AutoConfig.from_pretrained(model)
+    cfg = getattr(cfg, "text_config", cfg)
+    if not getattr(cfg, "mtp_num_hidden_layers", 0):
+        print("  no MTP head in this checkpoint")
+        return None
+    sd = Shards(model)
+    if embed is None:
+        key = next(k for k in ("model.language_model.embed_tokens.weight",
+                               "model.embed_tokens.weight") if k in sd)
+        embed = f32(sd[key])
+    if lm_head is None:
+        lm_head = f32(sd["lm_head.weight"]) if "lm_head.weight" in sd else embed
+    tensors = mtp_tensors(sd, cfg, embed, lm_head, draft_vocab)
+    raw = {n: float(np.abs(a - 1.0).mean()) for n, a in tensors if n in ("enorm", "hnorm", "mtp_norm")}
+    print(f"  MTP norms, mean |w| after +1 minus 1: {raw}")
+    print("Packing mtp.bin...")
+    entries = pack_file(out_dir, "mtp.bin", tensors, dtype)
+    path = f"{out_dir}/manifest.json"
+    with open(path) as f:
+        manifest = json.load(f)
+    manifest["files"]["mtp.bin"] = entries
+    manifest["mtp"] = {"file": "mtp.bin", "draft_vocab": int(min(draft_vocab, embed.shape[0]))}
+    with open(path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"  added mtp to {path}")
+    return tensors
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description="Convert a HF decoder-only model for the WebGPU client.",
@@ -235,6 +331,11 @@ def parse_args():
                         "only the stored weights lose precision.")
     p.add_argument("--no-verify", action="store_true",
                    help="skip the round-trip check (faster, less safe)")
+    p.add_argument("--mtp-only", action="store_true",
+                   help="add the MTP draft head (mtp.bin) to an already converted --out "
+                        "dir, reading only its tensors from the checkpoint")
+    p.add_argument("--mtp-vocab", type=int, default=MTP_DRAFT_VOCAB,
+                   help=f"vocabulary rows the MTP head drafts over (default {MTP_DRAFT_VOCAB})")
     return p.parse_args()
 
 
@@ -552,6 +653,11 @@ def main():
     args = parse_args()
     out_dir = args.out or default_out(args.model)
     torch.set_grad_enabled(False)
+    if args.mtp_only:
+        with open(f"{out_dir}/manifest.json") as f:
+            dtype = json.load(f)["dtype"]
+        export_mtp(args.model, out_dir, dtype, args.mtp_vocab)
+        return
 
     # A Windows console defaults to cp1252, which cannot encode characters
     # outside Latin-1, and HF model ids can contain them. Without this a
@@ -781,6 +887,14 @@ def main():
     with open(f"{out_dir}/manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
     print(f"\nManifest: {out_dir}/manifest.json")
+
+    # --- The MTP draft head, read from the shards (sd has no mtp.* tensors) ---
+    if hybrid:
+        wte = dict(client)["wte"]
+        export_mtp(args.model, out_dir, args.dtype, args.mtp_vocab, embed=wte,
+                   lm_head=wte if tied else f32(sd["lm_head.weight"]))
+        with open(f"{out_dir}/manifest.json") as f:
+            manifest = json.load(f)
 
     # --- Tokenizer ---
     # web/model/tokenizer.js reads tokenizer.json from next to the weights. It

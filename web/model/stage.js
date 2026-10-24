@@ -14,13 +14,14 @@
 //
 // See docs/architecture.md (KV cache and admission, Routing, Failures).
 
-import { F32, makeStorage, readF32, gatherEmbedNoPos, rmsnorm, matmulNobias, withPass, counters }
-    from './kernels.js';
+import { F32, makeStorage, makeReadback, readF32, gatherEmbedNoPos, rmsnorm, matmulNobias,
+         withPass, counters, copyF32 } from './kernels.js';
 import { block, makeCache, makeScratch, makeRecurrentState, recurrentStateBytes,
-         makePagePool, makeSessionFrame, ensurePages, freePages } from './model.js';
+         makePagePool, makeSessionFrame, ensurePages, freePages, makeReplayLayer,
+         replayLayerBytes, mtpBlock, mtpChain, makeMtpScratch } from './model.js';
 import { makeGpuProf } from './gpuprof.js';
 import { sampleFromLogitsRow } from './generate.js';
-import { positions, blockRange, PAGE_TOKENS, IDLE_MS, WAIT_MS } from '../split.js';
+import { positions, blockRange, PAGE_TOKENS, IDLE_MS, WAIT_MS, SPEC_COLS } from '../split.js';
 
 // The session id a warm-up pass runs under. Peer-minted ids are
 // `${peerId}-${base36}`, so it cannot collide with a chat.
@@ -38,6 +39,9 @@ export const MAX_QUEUE = 32;
 // the gap between a reply's tokens and a short pause between turns.
 export const ACTIVE_MS = 5000;
 
+// A replay layer's buffers (model.js makeReplayLayer).
+const SLOT_BUFS = ['S', 'histQ', 'histK', 'histV', 'linQ', 'linK', 'linV', 'linA', 'linB'];
+
 // Thrown by #cacheFor for a job that must wait for a frame. The queue catches
 // it and parks the job. Never leaves this file.
 const WAIT = new Error('waiting for a session frame');
@@ -49,7 +53,7 @@ export class Runner {
     // at a time by append(), `hi` (the default) for one given a whole range.
     constructor(device, d, w, { lo, hi, have = hi, nMax, tMax, slots = 5,
                                 sessions = slots, pageTokens = PAGE_TOKENS,
-                                idleMs = IDLE_MS, waitMs = WAIT_MS }) {
+                                idleMs = IDLE_MS, waitMs = WAIT_MS, specSlots = slots }) {
         const [blockLo, blockHi] = blockRange(lo, hi, d.n_layer);
         const held = blockRange(lo, have, d.n_layer)[1] - blockLo;
         if (held !== w.layers.length) {
@@ -136,7 +140,17 @@ export class Runner {
         this.waiting = [];
         // The waiting session whose jobs are back on the queue to be admitted.
         this.turn = null;
-        this.counts = { admitted: 0, evicted: 0, cold: 0, released: 0, refused: 0, waited: 0 };
+        this.counts = { admitted: 0, evicted: 0, cold: 0, released: 0, refused: 0, waited: 0,
+                        nospec: 0 };
+
+        // Speculative decoding's replay slots (see #specSlot()): at most
+        // `specSlots` sessions speculate through this Runner's linear_attention
+        // blocks at once. A slot is made on first use and kept for reuse.
+        // split.js's blockBytes() reserves room for all of them.
+        this.specSlots = specSlots;
+        this.specFree = [];
+        this.specLive = new Map();                           // session -> slot
+        this.specReadback = null;                            // the head's verify rows
     }
 
     // `embed` needs `w.wte`. `head` needs `w.norm` and `w.lm_head` (or `w.wte`
@@ -153,7 +167,159 @@ export class Runner {
         for (const frame of this.free) bytes += frame.bytes;
         for (const frame of this.live.values()) bytes += frame.bytes;
         if (this.warm) bytes += this.warm.bytes;
-        return bytes;
+        for (const slot of [...this.specFree, ...this.specLive.values()]) bytes += slot.bytes;
+        if (this.specReadback) bytes += this.specReadback.size;
+        return bytes + (this.mtpBytes ?? 0);
+    }
+
+    // --- The MTP draft head ---
+    //
+    // A Runner holding the head can also hold the MTP head (loader.js
+    // loadMtp()). For a job flagged `mtp` that reaches the head, the layer's
+    // KV is filled from the job's rows (each row's token with the trunk's
+    // hidden state one position earlier), in the same submit. After sampling,
+    // a second submit keeps the hidden state the sample came from (per session,
+    // `frame.mtpH`) and, for a loop job with speculation on, chains up to
+    // SPEC_COLS - 1 drafts after the sampled token. They come back as `mtp`
+    // and route.js may send them as the next verify job's drafts.
+    //
+    // The layer's K/V buffers are laid out as a pool layer, so each session's
+    // page table addresses them too.
+    attachMtp(m) {
+        const { device, d } = this;
+        const kv = this.#poolBufferBytes();
+        this.mtp = m;
+        this.mtpK = makeStorage(device, kv);
+        this.mtpV = makeStorage(device, kv);
+        this.mtpScratch = makeMtpScratch(device, d, m.draftVocab, this.tMax, this.nMax);
+        this.mtpReadback = makeReadback(device, SPEC_COLS * F32);
+        const row = d.hidden * F32;
+        const frames = [...this.free, ...this.live.values()];
+        for (const frame of frames) frame.mtpH = makeStorage(device, row);
+        this.weightBytes += m.bytes ?? 0;
+        this.mtpBytes = 2 * kv + this.mtpScratch.bytes + SPEC_COLS * F32 + frames.length * row;
+    }
+
+    #mtpCache(frame) {
+        return { K: [this.mtpK], V: [this.mtpV], pages: frame.pages, pageTokens: frame.pageTokens,
+                 N_max: frame.N_max };
+    }
+
+    // After sampling `t` from row `a` of a job: keep that row's hidden state
+    // and, when asked, chain drafts after `t`. Returns the drafts, or null.
+    async #mtpAfter(h, frame, a, t) {
+        const { device, d } = this;
+        const ms = this.mtpScratch, H = d.hidden;
+        const pos = h.past + a + 1;
+        const K = h.loop?.spec && t < this.mtp.draftVocab
+            ? Math.max(0, Math.min(SPEC_COLS - 1, this.nMax - pos - 1)) : 0;
+        device.queue.writeBuffer(ms.mtpIds, 0, new Float32Array([t]));
+        const enc = device.createCommandEncoder({ label: 'mtp draft' });
+        withPass(enc, (pass) => {
+            copyF32(device, pass, this.scratch.x, frame.mtpH, H, a * H, 0);
+            if (K > 0) mtpChain(device, pass, d, this.mtp, this.#mtpCache(frame), ms, frame.mtpH,
+                                ms.mtpIds, pos, K);
+        }, 'mtp draft');
+        if (K === 0) { device.queue.submit([enc.finish()]); return null; }
+        enc.copyBufferToBuffer(ms.mtpIds, F32, this.mtpReadback, 0, K * F32);
+        device.queue.submit([enc.finish()]);
+        await this.mtpReadback.mapAsync(GPUMapMode.READ, 0, K * F32);
+        const ids = Array.from(new Float32Array(this.mtpReadback.getMappedRange(0, K * F32)), Math.round);
+        this.mtpReadback.unmap();
+        return ids;
+    }
+
+    // --- Speculative decoding ---
+    //
+    // A verify job carries `drafts`: the job's ids are the last sampled token
+    // and the drafts after it, and the head samples every row. The next job of
+    // the session starts at `past + kept`, so each block tells from `past`
+    // alone how many of the verify's tokens survived. Full-attention KV is
+    // addressed by position and needs nothing. A linear_attention block's
+    // recurrent state folded every row in, so it is put back from the
+    // session's replay slot and the kept rows re-run (model.js linearBlock).
+    //
+    // Every piece of this is per session: the markers live on the session's
+    // frame and the replay data in its own slot, so chats interleaving on one
+    // Runner never touch each other's.
+
+    // The session's replay slot, leased on its first verify job here and held
+    // until its frame goes (release, eviction). Throws `nospec` when all
+    // `specSlots` are leased, or the GPU has no memory for a new one: nothing
+    // has changed yet, so the sender re-sends the job as a plain one.
+    async #specSlot(session) {
+        const live = this.specLive.get(session);
+        if (live) return live;
+        const refuse = (why) => {
+            this.counts.nospec++;
+            return Object.assign(new Error(`no speculative replay slot here (${why})`), { nospec: true });
+        };
+        let slot = this.specFree.pop() ?? this.#specSteal();
+        if (!slot) {
+            if (this.specLive.size >= this.specSlots) throw refuse(`${this.specSlots} in use`);
+            const { device } = this;
+            device.pushErrorScope?.('out-of-memory');
+            const layers = [];
+            let bytes = 0;
+            for (let i = 0; i < this.blocks; i++) {
+                const kind = this.d.layer_types?.[this.blockLo + i] ?? 'full_attention';
+                if (kind !== 'linear_attention') { layers.push(null); continue; }
+                layers.push(makeReplayLayer(device, this.d));
+                bytes += replayLayerBytes(this.d);
+            }
+            const oom = await device.popErrorScope?.();
+            if (oom) {
+                for (const rp of layers) if (rp) for (const k of SLOT_BUFS) rp[k].destroy();
+                throw refuse('out of GPU memory');
+            }
+            slot = { layers, bytes };
+        }
+        this.specLive.set(session, slot);
+        return slot;
+    }
+
+    // The slot of the least recently used session that has been idle for
+    // `idleMs` with no job queued here, or null. That session loses its
+    // rollback: if its next job starts inside its last verify, the block
+    // refuses it as no longer cached, and the enqueuer rebuilds the chat.
+    #specSteal() {
+        const now = performance.now();
+        for (const [id, frame] of this.live) {
+            const slot = this.specLive.get(id);
+            if (!slot || this.pending.has(id) || now - (frame.lastUse ?? 0) < this.idleMs) continue;
+            this.specLive.delete(id);
+            frame.specAt?.clear();
+            frame.specLost = true;
+            return slot;
+        }
+        return null;
+    }
+
+    // The session's frame is gone: its slot goes back for reuse.
+    #specRelease(session) {
+        const slot = this.specLive.get(session);
+        if (!slot) return;
+        this.specLive.delete(session);
+        this.specFree.push(slot);
+    }
+
+    // Growth changes the block layout. Free slots are dropped (the next lease
+    // makes one with the new layout). A live session never crosses a new block,
+    // since its cut is pinned, so its slot only needs the index kept aligned.
+    #specGrow(atStart) {
+        for (const slot of this.specFree) {
+            for (const rp of slot.layers) if (rp) for (const k of SLOT_BUFS) rp[k].destroy();
+        }
+        this.specFree = [];
+        for (const slot of this.specLive.values()) {
+            if (atStart) slot.layers.unshift(null); else slot.layers.push(null);
+        }
+    }
+
+    // The buffer the head reads verify rows back into: SPEC_COLS logits rows,
+    // made the first time this Runner verifies.
+    #verifyReadback() {
+        return this.specReadback ??= makeReadback(this.device, SPEC_COLS * this.d.vocab * F32);
     }
 
     // The warm-up cache is sized for the blocks held, so growth replaces it.
@@ -236,6 +402,7 @@ export class Runner {
             }
             // The next warmup() recreates it at the new size.
             this.#dropWarm();
+            this.#specGrow(true);
             this.blocks++;
             this.blockLo--;
         }
@@ -309,6 +476,7 @@ export class Runner {
                 }
             }
             this.#dropWarm();
+            this.#specGrow(false);
             this.blocks++;
         }
         this.hi++;
@@ -489,6 +657,7 @@ export class Runner {
             this.free.push(cache);
             this.counts.released++;
         }
+        this.#specRelease(session);
         this.cuts.delete(session);
         this.logs.delete(session);
         // Also remove its jobs from the waiting list.
@@ -587,6 +756,7 @@ export class Runner {
             freePages(this.pool, cache);
             this.cuts.delete(oldest);
             this.logs.delete(oldest);
+            this.#specRelease(oldest);
         }
         // A reused frame holds the previous session's state. For KV that is
         // harmless: scatter_kv overwrites every row before attention reads it.
@@ -602,8 +772,11 @@ export class Runner {
             this.device.queue.submit([enc.finish()]);
         }
         cache.used = true;
-        // Rows each block holds for this session. See #checkFed().
+        // Rows each block holds for this session, and the last verify job each
+        // block ran if the session has not moved on since. See #checkFed().
         cache.fed = new Map();
+        cache.specAt = new Map();
+        cache.specLost = false;
 
         cache.lastUse = performance.now();
         this.live.set(session, cache);
@@ -622,6 +795,12 @@ export class Runner {
     // rewound, only restarted: `past` 0 clears the state. The buffers to clear
     // are returned, and the caller encodes the clear before the pass.
     //
+    // The one exception is a verify job (see Speculative decoding above). If
+    // the block's last job was a verify of n rows from `base`, the next job
+    // may start anywhere in (base, base + n]: it keeps `past - base` of those
+    // rows, and `keep` says so. With `rb` (a verify refused further down the
+    // line, re-sent as a plain job) it may also start at `base`, keeping none.
+    //
     // Keyed by global block index, so growth on either side does not shift it.
     // A mismatch throws the same error as an evicted cache and is handled the
     // same way: passed back, repaired locally, or rebuilt by the enqueuer.
@@ -630,23 +809,46 @@ export class Runner {
     // block exactly, since only the enqueuer rewinds. If it is behind, it is a
     // duplicate from a repair re-sending a hand-off that had arrived. It
     // throws `stale`, which route.js drops without answering.
-    #checkFed(session, cache, at, last, past, exact = false) {
+    //
+    // Returns { reset, keep }: keep is null when nothing is rolled back.
+    #checkFed(session, cache, at, last, past, exact = false, rb = false) {
         const reset = [];
+        let keep = null;
         for (let p = Math.max(at, 1); p < last; p++) {
             const b = p - 1;
             const fed = cache.fed.get(b) ?? 0;
             const rc = cache.recurrent[b - this.blockLo];
-            if (past === 0 && !exact) { if (rc && fed > 0) reset.push(rc); continue; }
-            if (rc || exact ? past === fed : past <= fed) continue;
-            if (exact && past < fed) {
+            const sp = cache.specAt?.get(b);
+            let k = null;
+            if (sp && fed === sp.base + sp.n && past < fed
+                && (past > sp.base || (rb && past === sp.base))) {
+                k = past - sp.base;
+            } else if (past === 0 && !exact) {
+                if (rc && fed > 0) reset.push(rc);
+                continue;
+            } else if (rc || exact ? past === fed : past <= fed) {
+                continue;
+            } else if (exact && past < fed && !cache.specLost) {
+                // A frame whose replay slot was taken (#specSteal) cannot tell
+                // a duplicate from a job that needed the rollback, so it
+                // refuses as cold instead, which reaches the enqueuer.
                 throw Object.assign(new Error(`a duplicate of session ${session}'s job at ${past} ` +
                     `(block ${b} is already at ${fed})`), { stale: true });
+            } else {
+                this.counts.cold++;
+                throw new Error(`session ${session} is no longer cached here ` +
+                    `(block ${b} holds ${fed} rows, the job continues from ${past})`);
             }
-            this.counts.cold++;
-            throw new Error(`session ${session} is no longer cached here ` +
-                `(block ${b} holds ${fed} rows, the job continues from ${past})`);
+            // Every block a session crosses here ran the same jobs, so they
+            // agree on what to keep.
+            if (keep !== null && keep !== k) {
+                this.counts.cold++;
+                throw new Error(`session ${session}'s blocks disagree on a rollback ` +
+                    `(${keep} and ${k} rows)`);
+            }
+            keep = k;
         }
-        return reset;
+        return { reset, keep };
     }
 
     // Get enough pages for `tokens` logical positions from the pool, evicting
@@ -663,6 +865,7 @@ export class Runner {
             freePages(this.pool, victim);
             this.cuts.delete(id);
             this.logs.delete(id);
+            this.#specRelease(id);
             this.counts.evicted++;
             if (ensurePages(this.device, this.pool, frame, tokens)) return;
         }
@@ -759,16 +962,49 @@ export class Runner {
         if (!gather && hidden?.length !== T * H) {
             throw new Error(`payload is ${hidden?.length ?? 0} floats, expected ${T * H}`);
         }
+        // A verify job: its ids are the last sampled token and the drafts.
+        const drafts = h.drafts ?? null;
+        const verify = drafts !== null && h.s !== WARMUP && !h.replay;
+        if (drafts !== null && !(Array.isArray(drafts) && drafts.length >= 1
+                && drafts.length === T - 1 && T <= SPEC_COLS
+                && drafts.every((id) => Number.isInteger(id) && id >= 0))) {
+            throw new Error(`a verify job needs 1–${SPEC_COLS - 1} draft ids, one fewer than its ${T} tokens`);
+        }
         const cache = this.#cacheFor(h.s, h.past);
         // The block positions this job runs: from the cursor (or position 1,
         // if the cursor is the embedding) up to the session's cut or the head,
         // whichever is first.
         const first = Math.max(at, 1), last = Math.min(to, d.n_layer + 1);
-        const reset = h.s === WARMUP ? [] : this.#checkFed(h.s, cache, at, last, h.past, !!h.auto);
+        const { reset, keep } = h.s === WARMUP ? { reset: [], keep: null }
+            : this.#checkFed(h.s, cache, at, last, h.past, !!h.auto, !!h.rb);
+        // The replay slot, when a linear_attention block here snapshots (a
+        // verify) or rolls back (the job after one). Leased before anything
+        // changes, so a `nospec` refusal leaves the session as it was.
+        let linear = false;
+        for (let p = first; p < last; p++) {
+            if (cache.recurrent[p - 1 - this.blockLo]) { linear = true; break; }
+        }
+        let slot = null;
+        if (linear && keep !== null) {
+            slot = this.specLive.get(h.s);
+            if (!slot) {
+                this.counts.cold++;
+                throw new Error(`session ${h.s} has no replay data here to roll back`);
+            }
+        }
+        if (linear && verify) slot = await this.#specSlot(h.s);
+        const spec = slot ? { replay: slot.layers, snap: verify, keep } : null;
         // Before any dispatch: scatter_kv writes rows h.past .. h.past+T-1, so
         // their pages must be allocated and in the table. The warm-up cache is
         // contiguous and not pooled.
-        if (h.s !== WARMUP) this.#pagesFor(h.s, cache, h.past + T);
+        // The MTP head writes its own rows past the job's: the drafts it
+        // chains after the sample.
+        const mtp = head && !spent && !!this.mtp && !!h.mtp && h.s !== WARMUP;
+        if (h.s !== WARMUP) {
+            this.#pagesFor(h.s, cache, mtp ? Math.min(this.nMax, h.past + T + SPEC_COLS) : h.past + T);
+        }
+        const fill = mtp && Array.isArray(h.ids) && h.ids.length === T;
+        if (fill) device.queue.writeBuffer(this.mtpScratch.mtpIds, 0, Float32Array.from(h.ids));
 
         // writeBuffer is ordered on the queue, so these are applied before the
         // command buffer below runs.
@@ -794,7 +1030,7 @@ export class Runner {
             for (let p = first; p < last; p++) {
                 const layer = p - 1 - this.blockLo;
                 prof?.at(this.w.layers[layer].kind === 'linear_attention' ? 'linear' : 'full');
-                block(device, pass, d, this.w, layer, cache, s, T, h.past);
+                block(device, pass, d, this.w, layer, cache, s, T, h.past, spec);
             }
 
             // Sample when the cut reaches the end of the line. A peer that
@@ -806,25 +1042,43 @@ export class Runner {
                 matmulNobias(device, pass, s.h, this.w.lm_head ?? this.w.wte,
                              s.logits, T, H, d.vocab);
             }
+            // The MTP layer's KV for this job's positions. Row r pairs the
+            // token at past + r with the trunk's hidden state at past + r - 1:
+            // the session's kept row for r = 0, this job's rows after.
+            if (fill) {
+                const ms = this.mtpScratch;
+                copyF32(device, pass, cache.mtpH, ms.mtpIn, H);
+                if (T > 1) copyF32(device, pass, s.x, ms.mtpIn, (T - 1) * H, 0, H);
+                mtpBlock(device, pass, d, this.mtp, this.#mtpCache(cache), ms, ms.mtpIn,
+                         ms.mtpIds, T, h.past);
+            }
         }, `positions ${at}–${to - 1}`, prof);
 
         // The readback copy is on the same encoder, outside the pass, in the
         // same submit. A job that ends at the head reads back only the last
-        // logits row and samples it. Any other job reads back the hidden
-        // state. Prefill chunks sample too; the enqueuer keeps only the last
-        // chunk's token.
+        // logits row and samples it, or every row of a verify job. Any other
+        // job reads back the hidden state. Prefill chunks sample too; the
+        // enqueuer keeps only the last chunk's token.
         const rowBytes = d.vocab * F32;
-        const bytes = head ? rowBytes : T * H * F32;
+        const rows = head && verify;
+        const bytes = rows ? T * rowBytes : head ? rowBytes : T * H * F32;
+        const readback = rows ? this.#verifyReadback() : s.readback;
         if (!spent) {
-            enc.copyBufferToBuffer(head ? s.logits : s.x, head ? (T - 1) * rowBytes : 0,
-                                   s.readback, 0, bytes);
+            enc.copyBufferToBuffer(head ? s.logits : s.x, head && !rows ? (T - 1) * rowBytes : 0,
+                                   readback, 0, bytes);
         }
         prof?.finish(enc);
         const cmd = enc.finish();
         const t1 = performance.now();
         device.queue.submit([cmd]);
         const t2 = performance.now();
-        if (h.s !== WARMUP) for (let p = first; p < last; p++) cache.fed.set(p - 1, h.past + T);
+        if (h.s !== WARMUP) {
+            for (let p = first; p < last; p++) {
+                cache.fed.set(p - 1, h.past + T);
+                if (verify) cache.specAt.set(p - 1, { base: h.past, n: T });
+                else cache.specAt.delete(p - 1);
+            }
+        }
 
         // A replay that reached the end returns neither a token nor a hidden
         // state. route.js uses that to tell the three cases apart.
@@ -832,10 +1086,10 @@ export class Runner {
 
         // The timestamps are mapped in parallel with the readback, so
         // profiling adds no latency. The readback is read first.
-        await Promise.all([s.readback.mapAsync(GPUMapMode.READ, 0, bytes), prof?.map()]);
+        await Promise.all([readback.mapAsync(GPUMapMode.READ, 0, bytes), prof?.map()]);
         const t3 = performance.now();
-        const out = new Float32Array(s.readback.getMappedRange(0, bytes).slice(0));
-        s.readback.unmap();
+        const out = new Float32Array(readback.getMappedRange(0, bytes).slice(0));
+        readback.unmap();
         const t4 = performance.now();
         const gpu = prof?.collect();
 
@@ -853,14 +1107,37 @@ export class Runner {
         };
 
         // `at` is the cursor's new position. The caller routes on it.
+        if (head && rows) {
+            // Row i predicts the token after ids[i]. Each is sampled exactly as
+            // plain decoding would sample it: with the repetition summary for
+            // the context up to it (`rowOpts[i - 1]`, built assuming the drafts
+            // before it were accepted). The draft is accepted while the sample
+            // matches it. The first mismatch is the next token, and so is the
+            // sample after the last draft when every draft is accepted.
+            const V = d.vocab, tokens = [];
+            for (let i = 0; i < T; i++) {
+                const opts = i === 0 ? h.opts : (h.rowOpts?.[i - 1] ?? h.opts);
+                const t = sampleFromLogitsRow(out.subarray(i * V, (i + 1) * V), opts);
+                tokens.push(t);
+                if (i === T - 1 || t !== drafts[i]) break;
+            }
+            phases.sample = ms(t4, performance.now());
+            const next = mtp ? await this.#mtpAfter(h, cache, tokens.length - 1, tokens.at(-1)) : null;
+            if (mtp) phases.mtp = ms(t4, performance.now()) - phases.sample;
+            this.#timed(h, queuedAt, t0, t3, to - at);
+            return { at: to, token: tokens[tokens.length - 1], tokens, phases, ...(gpu && { gpu }),
+                     ...(next && { mtp: next }) };
+        }
         if (head) {
             // h.opts already holds the repetition summary, computed from the
             // token history by the enqueuer or by the head in a closed loop
             // (route.js's jobOpts()).
             const token = sampleFromLogitsRow(out, h.opts);
             phases.sample = ms(t4, performance.now());
+            const next = mtp ? await this.#mtpAfter(h, cache, T - 1, token) : null;
+            if (mtp) phases.mtp = ms(t4, performance.now()) - phases.sample;
             this.#timed(h, queuedAt, t0, t3, to - at);
-            return { at: to, token, phases, ...(gpu && { gpu }) };
+            return { at: to, token, phases, ...(gpu && { gpu }), ...(next && { mtp: next }) };
         }
         this.#log(h.s, to, h.past, out);
         phases.log = ms(t4, performance.now());

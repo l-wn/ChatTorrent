@@ -11,14 +11,14 @@
 
 import { adapterLabel } from './model/kernels.js';
 import { checkDims, scratchBytes } from './model/model.js';
-import { loadManifest, loadBlock, loadEmbed, loadHead, dimsFromManifest } from './model/loader.js';
+import { loadManifest, loadBlock, loadEmbed, loadHead, loadMtp, dimsFromManifest } from './model/loader.js';
 import { Runner } from './model/stage.js';
 import { encode, decode, source as tokenizerSource } from './model/tokenizer.js';
 import { runAllTests } from './dev/kernels.test.js';
 import { smokeForward } from './dev/smoke.js';
 import { Mesh } from './net.js';
 import { makeRouter, makeConversation, T_MAX } from './route.js';
-import { blockBytes, endBytes, floorBlocks, positions, describeRange, N_MAX, SLOTS,
+import { blockBytes, endBytes, mtpBytes, floorBlocks, positions, describeRange, N_MAX, SLOTS,
          SESSIONS, runnerSessions } from './split.js';
 
 // How long a Runner must be idle before #growClaim() takes another step, so
@@ -57,6 +57,8 @@ export class Engine {
     #vramLimit = Infinity;
     #growWake = null;        // resolve() of the promise a paused #growClaim() awaits
     #growPausedUnder = null; // the limit the pause note was emitted for; null while growing
+    #mtpTried = null;        // the runner the MTP head was last tried on
+    #mtpWanted = false;      // load the MTP head at the head (constructor option)
     #sp = 0;                 // blocks/sec measured by warmup() in #fill()
     #lastStopReason = null;  // 'length' | 'context' | 'eos' | 'stopped', set by generate()
     #lastPromptTokens = 0;
@@ -68,8 +70,11 @@ export class Engine {
     #growRetryMs = GROW_RETRY_MS;
     #loadOverride = null;    // test-only replacement for #load
 
-    constructor({ onEvent = () => {} } = {}) {
+    // `mtp`: a runner holding the head also loads the MTP draft head, when
+    // the checkpoint has one (peer.html's ?mtp=1).
+    constructor({ onEvent = () => {}, mtp = false } = {}) {
         this.#onEvent = onEvent;
+        this.#mtpWanted = mtp;
     }
 
     // Test-only: build an Engine around an existing net/router/runner,
@@ -368,6 +373,12 @@ export class Engine {
         for (;;) {
             const r = this.#runner;
             if (!r) return;
+            // A head holder takes the MTP draft head before widening.
+            if (this.#mtpWanted && r.head && r.have === r.hi && d.mtp && !r.mtp && this.#mtpTried !== r) {
+                this.#mtpTried = r;
+                await this.#loadMtp(device, d, r);
+                continue;
+            }
             if (r.lo === 0 && r.hi === N) {
                 this.#emit('status', {
                     text: `Holding the whole of ${manifest?.model ?? 'the model'}. Nothing left to grow into.`,
@@ -459,6 +470,34 @@ export class Engine {
                 });
                 return;
             }
+        }
+    }
+
+    // Load the MTP draft head onto a runner holding the head, if it fits
+    // under the VRAM limit. A failure leaves speculation drafting from the
+    // chat's own text only.
+    async #loadMtp(device, d, r) {
+        const draft = { ...d, linear: undefined, vocab: d.mtp.draftVocab };
+        const needed = r.vramBytes + mtpBytes(d, { nMax: N_MAX, slots: r.slots })
+            + scratchBytes(draft, T_MAX, N_MAX);
+        if (needed > this.#vramLimit) {
+            this.#emit('status', { text: `Not loading the MTP draft head: it would take this tab to ` +
+                `${gib(needed)}, past its ${gib(this.#vramLimit)} VRAM limit.` });
+            return;
+        }
+        try {
+            this.#emit('status', { text: 'Loading the MTP draft head…' });
+            const { manifest, baseUrl } = this;
+            const m = await loadMtp(device, { baseUrl, manifest, d });
+            device.pushErrorScope('out-of-memory');
+            r.attachMtp(m);
+            const oom = await device.popErrorScope();
+            if (oom) throw new Error(`GPU ran out of memory (${oom.message || 'out of memory'})`);
+            this.#emit('status', { text: `Holding the MTP draft head (${gib(m.bytes ?? 0)}): ` +
+                'speculative decoding drafts with it here.' });
+        } catch (err) {
+            this.#emit('status', { text: `Could not load the MTP draft head (${err.message}). ` +
+                'Speculative decoding drafts from the chat only.' });
         }
     }
 
@@ -615,13 +654,16 @@ export class Engine {
     }
 
     // Shared setup: the prompt's ids, the budget, and which limit applies.
-    async #prepare(text, { temp, topK, rep, freq, pres, ngram, maxTokens = Infinity, prof = 0 }) {
+    async #prepare(text, { temp, topK, rep, freq, pres, ngram, maxTokens = Infinity, prof = 0,
+                           spec = false }) {
         this.#stopRequested = false;
         this.#router.resetRepairs();
         // `rep`/`freq`/`pres`/`ngram` are passed through. The router turns
         // them into the summary the head samples with, since the router has
         // the token ids and the head has the logits row.
-        const opts = { temp, topK, rep, freq, pres, ngram, prof };
+        // `spec`: the head drafts and verifies (closed loop only; see
+        // route.js feed()).
+        const opts = { temp, topK, rep, freq, pres, ngram, prof, spec };
         const samples = [];
         this.#lastProfile = { level: prof, samples };
         const promptIds = await encode(text);
