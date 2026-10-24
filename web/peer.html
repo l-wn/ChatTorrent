@@ -93,6 +93,7 @@
         </label>
         <label title="Stop this tab's background growth once its own VRAM use would exceed this. Blank = no limit: it keeps growing until the GPU is full or this tab holds the whole model. Raising it later lets growth carry on from what this tab already holds.">VRAM limit <input id="vramlimit" type="text" placeholder="e.g. 4gb" autocomplete="off"></label>
         <label id="meshchatsLabel" title="Replies that can generate at once in a private mesh you create with Create private mesh. Blank = no limit (the server may still cap it).">Private mesh limit <input id="meshchats" type="number" min="1" step="1" placeholder="no limit" autocomplete="off"></label>
+        <label id="meshsessionsLabel" title="Conversations each GPU in a private mesh you create keeps in memory, so pausing between messages does not force a rebuild. Each extra one costs the mesh's GPUs about 280 MB in total, so each holds a little less of the model. Blank = 8 (the server may cap it).">Chats in memory <input id="meshsessions" type="number" min="1" max="32" step="1" placeholder="8" autocomplete="off"></label>
         <span class="grow"></span>
         <span class="hint">Enter sends · Shift+Enter newline</span>
       </div>

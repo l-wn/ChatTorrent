@@ -6,8 +6,7 @@ Every visitor can choose to hold a slice of the model on their own GPU, and toge
 the tabs answer everyone's chats. It's modelled after a torrenting network:
 rather than one central inference server, it is decentralized across its users.
 There is still one signaling server which introduces tabs to each other.
-The model runs in browsers on WebGPU, with hand-written WGSL kernels and no ML
-libraries. Browsers talk to each other through WebRTC.
+The model runs in browsers on WebGPU. Browsers talk to each other through WebRTC.
 
 I built this as an experiment to see how open models could be democratized and
 made more accessible to everyday people with consumer hardware.

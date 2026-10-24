@@ -19,7 +19,7 @@ import { smokeForward } from './dev/smoke.js';
 import { Mesh } from './net.js';
 import { makeRouter, makeConversation, T_MAX } from './route.js';
 import { blockBytes, endBytes, floorBlocks, positions, describeRange, N_MAX, SLOTS,
-         SESSIONS } from './split.js';
+         SESSIONS, runnerSessions } from './split.js';
 
 // How long a Runner must be idle before #growClaim() takes another step, so
 // downloads and warm-ups do not compete with live chats.
@@ -113,11 +113,13 @@ export class Engine {
     //
     // `relayOnly` (default true) sends every link through a TURN relay, so no
     // peer sees this tab's address (see web/net.js). `chats` is the limit on
-    // replies at once to ask for if this join creates a private mesh.
-    async connect({ room, relayOnly = true, chats = null } = {}) {
+    // replies at once, and `sessions` the chats each peer keeps in memory, to
+    // ask for if this join creates a private mesh.
+    async connect({ room, relayOnly = true, chats = null, sessions = null } = {}) {
         const net = new Mesh({
             room,
             chats,
+            sessions,
             relayOnly,
             onMessage: (h, payload, raw, from) => this.#router.route(h, payload, raw, from),
             onChange: () => this.#emit('change'),
@@ -175,8 +177,13 @@ export class Engine {
     // `blocks`/`vram`/`at` are plain values. The caller reads them from a form
     // field or URL parameter.
     async serve({ blocks = null, vram = null, at = null, slowMs = 0, floor = null,
-                  sessions = SESSIONS, pageTokens = undefined, waitMs = undefined } = {}) {
+                  sessions = undefined, pageTokens = undefined, waitMs = undefined } = {}) {
         const { net, manifest, baseUrl } = this;
+        // Chats kept in memory: the caller's number (the dev harness), else the
+        // mesh's from the welcome. Read once: a later welcome cannot resize a
+        // Runner that is already allocated.
+        let slots;
+        ({ sessions, slots } = runnerSessions(sessions, net?.sessions));
         try {
             const d = dimsFromManifest(manifest);
             const problems = checkDims(d);
@@ -198,7 +205,7 @@ export class Engine {
 
             this.#emit('progress', { text: 'asking for a range of blocks…' });
             const cap = at ? at[1] - at[0]
-                : this.#capacity(d, net, { blocks, vram, floor, sessions });
+                : this.#capacity(d, net, { blocks, vram, floor, sessions, slots });
             const range = await net.claim(cap, at);
             if (!range) {
                 throw new Error(`this tab offered ${cap} blocks and the network's minimum is ` +
@@ -212,7 +219,7 @@ export class Engine {
             const held = describeRange(lo, hi, d.n_layer);
             this.#emit('progress', { text: `downloading ${held} (you can chat meanwhile)` });
 
-            await this.#fill(device, d, lo, hi, slowMs, sessions, pageTokens, waitMs);
+            await this.#fill(device, d, lo, hi, slowMs, sessions, slots, pageTokens, waitMs);
 
             const note = `Holding ${held} of ${manifest.model}: ${hi - lo} of ` +
                 `${positions(d.n_layer)} positions. This tab runs that stretch of every job ` +
@@ -274,7 +281,7 @@ export class Engine {
     // How many positions to claim: an explicit block count, a VRAM budget in
     // bytes, or by default the network's minimum, which background growth then
     // extends.
-    #capacity(d, net, { blocks, vram, floor = null, sessions = SESSIONS }) {
+    #capacity(d, net, { blocks, vram, floor = null, sessions = SESSIONS, slots = SLOTS }) {
         const N = net.positions || positions(d.n_layer);
         const clamp = (n) => Math.max(0, Math.min(Math.floor(n) || 0, N));
         if (blocks != null) return clamp(blocks);
@@ -284,7 +291,7 @@ export class Engine {
             // holds at most one). The scratch is needed whatever is held.
             const fixed = scratchBytes(d, T_MAX, N_MAX)
                 + Math.max(endBytes(d, 'embed'), endBytes(d, 'head'));
-            return clamp((vram - fixed) / blockBytes(d, { sessions }));
+            return clamp((vram - fixed) / blockBytes(d, { sessions, slots }));
         }
         return clamp(floor ?? floorBlocks(d, N));
     }
@@ -292,15 +299,15 @@ export class Engine {
     // Download a claim one position at a time, serving each as soon as it is
     // loaded. Ascending from `lo`, because a holding is the contiguous prefix
     // `[lo, have)`.
-    async #fill(device, d, lo, hi, slowMs, sessions = SESSIONS, pageTokens = undefined,
-                waitMs = undefined) {
+    async #fill(device, d, lo, hi, slowMs, sessions = SESSIONS, slots = SLOTS,
+                pageTokens = undefined, waitMs = undefined) {
         const { net } = this;
         const L = d.n_layer, N = positions(L);
 
         device.pushErrorScope('out-of-memory');
         device.pushErrorScope('validation');
         const runner = new Runner(device, d, { layers: [] },
-            { lo, hi, have: lo, nMax: N_MAX, tMax: T_MAX, slots: SLOTS, sessions,
+            { lo, hi, have: lo, nMax: N_MAX, tMax: T_MAX, slots, sessions,
               ...(pageTokens ? { pageTokens } : {}),
               ...(waitMs !== undefined ? { waitMs } : {}) });
         const validation = await device.popErrorScope();
@@ -499,7 +506,7 @@ export class Engine {
         const tied = d.tied_lm_head !== false;
         if (p === 0) return tied && r.w.lm_head ? 0 : endBytes(d, 'embed');
         if (p === positions(d.n_layer) - 1) return tied && r.w.wte ? 0 : endBytes(d, 'head');
-        return blockBytes(d, { nMax: N_MAX, slots: SLOTS, sessions: r.sessions, index: p - 1 });
+        return blockBytes(d, { nMax: N_MAX, slots: r.slots, sessions: r.sessions, index: p - 1 });
     }
 
     async #openDevice() {

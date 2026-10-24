@@ -347,7 +347,8 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
     let manifest;
     try {
         ({ manifest } = await engine.connect({ room, relayOnly: !directParam(),
-                                               chats: creatorChats(secret) }));
+                                               chats: creatorChats(secret),
+                                               sessions: creatorSessions(secret) }));
     } catch (err) {
         console.warn('connect failed:', err);
         ui.title.textContent = 'ChatTorrent';
@@ -512,8 +513,9 @@ function showMesh(room) {
     ui.leave.href = location.pathname;         // this page with no invite or query
     ui.leave.textContent = priv ? 'Leave' : 'Global mesh';
     ui.chatsMesh.textContent = !room ? 'no mesh' : priv ? `private mesh ${room.tag}` : 'global mesh';
-    // The limit applies when this tab creates a private mesh.
+    // The limits apply when this tab creates a private mesh.
     ui.meshchatsLabel.hidden = !room || priv;
+    ui.meshsessionsLabel.hidden = !room || priv;
 }
 
 // Add the mesh's limit on replies at once to its pill, once the welcome has
@@ -521,21 +523,27 @@ function showMesh(room) {
 function showChatLimit() {
     const max = engine?.net?.maxChats;
     if (max) ui.mesh.title += ` Up to ${max} replies can generate at once.`;
+    const kept = engine?.net?.sessions;
+    if (kept) ui.mesh.title += ` Each GPU keeps ${kept} chat${kept === 1 ? '' : 's'} in memory.`;
 }
 
 // The limit on replies at once chosen when this tab created its private mesh,
 // kept in sessionStorage so the tab's reload and reconnects send it again.
 // Null for an invitee and in the global mesh.
 const chatsKey = (s) => `chattorrent:chats:${s}`;
-function creatorChats(s) {
+const sessionsKey = (s) => `chattorrent:sessions:${s}`;
+function creatorNumber(s, key) {
     if (!s) return null;
     try {
-        const n = Number(sessionStorage.getItem(chatsKey(s)));
+        const n = Number(sessionStorage.getItem(key(s)));
         return Number.isInteger(n) && n >= 1 ? n : null;
     } catch {
         return null;
     }
 }
+const creatorChats = (s) => creatorNumber(s, chatsKey);
+// The chats each peer keeps in memory, chosen and kept the same way.
+const creatorSessions = (s) => creatorNumber(s, sessionsKey);
 
 async function copyInvite() {
     const url = inviteUrl(secret);
@@ -560,6 +568,10 @@ function wireEvents() {
         const n = Number(ui.meshchats.value);
         if (Number.isInteger(n) && n >= 1) {
             try { sessionStorage.setItem(chatsKey(fresh), String(n)); } catch { /* no limit then */ }
+        }
+        const kept = Number(ui.meshsessions.value);
+        if (Number.isInteger(kept) && kept >= 1) {
+            try { sessionStorage.setItem(sessionsKey(fresh), String(kept)); } catch { /* the default then */ }
         }
         location.hash = `mesh=${fresh}`;
     });

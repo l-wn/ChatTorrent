@@ -85,6 +85,16 @@ answer to `chat-start` within 5 s the page goes ahead, so a signaling hiccup
 never blocks a chat. This is the mesh-level gate; each runner still admits
 sessions by its own frames (see KV cache and admission).
 
+**Chats in memory.** Each mesh also fixes how many chats every peer keeps in
+memory, its frame count (see KV cache and admission). The global mesh's is
+`MESH_SESSIONS` (default 8). A private mesh's is chosen by its creator (the
+page's "Chats in memory", sent as `sessions` in the join that creates the
+room), capped by `MAX_PRIVATE_SESSIONS` (default 32), and `MESH_SESSIONS` when
+the creator chose none. The welcome brings it as `sessions`, and a peer sizes
+its Runner with it once, in `serve()`. A different number in a later welcome
+(after a server restart) is logged and not applied until the tab reloads.
+Peers need not agree on it: each sizes only its own memory.
+
 Nothing is sent to a socket until its `join`; one that sends anything else, or
 nothing for 10 s, is closed with code 4001, and a full mesh with 4002. The page
 reports both instead of retrying.
@@ -459,11 +469,12 @@ the head then keeps up to date.
 ## KV cache and admission
 
 Each Runner has a **page pool**: one buffer per full-attention layer for K and
-for V, cut into 64-token pages, sized for `SLOTS` (2) full contexts. Each of
-`SESSIONS` (8) **frames** holds one session's page table and, on a hybrid
+for V, cut into 64-token pages, sized for `poolSlots(sessions)` full contexts:
+one per `SESSIONS_PER_SLOT` (4) sessions, so 2 at the default 8. Each of the
+mesh's `sessions` **frames** holds one session's page table and, on a hybrid
 checkpoint, its recurrent state. A chat is charged for the pages it uses, so
-the eight frames share the two contexts' worth of pages rather than each
-reserving a full one.
+the frames share the pool rather than each reserving a full context. On
+Qwen3.8-27B each session beyond 8 costs about 280 MiB across the whole model.
 
 A session's frame or pages may only be taken from a session that has been idle
 for `IDLE_MS` (2 s), counted from the end of its last job here. A session with a

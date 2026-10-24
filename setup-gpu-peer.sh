@@ -21,7 +21,10 @@
 
 set -euo pipefail
 
-URL_DEFAULT=https://chattorrent.net/chat
+# ?direct=1 lets this peer link directly to other direct peers (GPU to GPU),
+# falling back to the TURN relay when they cannot reach each other. It shows
+# this machine's address to the tabs it links to; visitors stay relay-only.
+URL_DEFAULT='https://chattorrent.net/chat?direct=1'
 PORT=${PORT:-9222}
 STATE=${STATE:-$HOME/.chattorrent-peer}
 PROFILE=$STATE/chrome-profile

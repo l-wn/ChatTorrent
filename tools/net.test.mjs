@@ -999,6 +999,8 @@ process.env.JOIN_TIMEOUT_MS = '400';
 // private one, and a lease short enough to expire within the test.
 process.env.MAX_CHATS = '2';
 process.env.MAX_PRIVATE_CHATS = '3';
+process.env.MESH_SESSIONS = '6';
+process.env.MAX_PRIVATE_SESSIONS = '12';
 process.env.CHAT_LEASE_MS = '300';
 // Our own TURN server, so every welcome carries a per-peer credential.
 process.env.TURN_SECRET = 'testsecret';
@@ -1567,6 +1569,38 @@ console.log('\nsignal-server: chats at once');
         (await global.next((m) => m.type === 'welcome')).maxChats, 2);
     for (const p of [over, none, global]) p.close();
     await sleep(150);
+}
+
+console.log('\nsignal-server: chats in memory');
+{
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const welcomed = async (p) => (await p.next((m) => m.type === 'welcome')).sessions;
+
+    // MESH_SESSIONS is 6, MAX_PRIVATE_SESSIONS 12.
+    const g = connect(null, { sessions: 20 });
+    eq('the welcome gives the global mesh\'s number, whatever the join asks', await welcomed(g), 6);
+
+    const t1 = (await openRoom(newSecret())).joinToken;
+    const owner = connect(t1, { sessions: 10 });
+    eq('a private mesh takes its creator\'s number', await welcomed(owner), 10);
+    const guest = connect(t1, { sessions: 2 });
+    eq('and a later join cannot change it', await welcomed(guest), 10);
+
+    for (const p of [g, owner, guest]) p.close();
+    await sleep(150);
+
+    // One private mesh at a time: the suite's MAX_ROOMS is 3.
+    const alone = async (extra) => {
+        const p = connect((await openRoom(newSecret())).joinToken, extra);
+        const n = await welcomed(p);
+        p.close();
+        await sleep(150);
+        return n;
+    };
+    eq('a number above the cap is clamped to it', await alone({ sessions: 40 }), 12);
+    eq('none asked for gives MESH_SESSIONS', await alone({}), 6);
+    eq('a non-integer is ignored', await alone({ sessions: 2.5 }), 6);
+    eq('and so is zero', await alone({ sessions: 0 }), 6);
 }
 
 // --- Mesh: which mesh it joins, and what it passes to WebRTC ---

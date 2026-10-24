@@ -6,6 +6,7 @@ import {
     holds, holders, depths, minDepth, covers, gaps, size, place, assign,
     blockBytes, blockWeightBytes, endBytes, kvShare, recurrentStateBytes, floorBlocks, budgetBlocks, costDims, MIN_BYTES,
     positions, headPos, blockRange, served, filling, coverage, EMBED,
+    SESSIONS, SLOTS, MAX_SESSIONS, poolSlots, runnerSessions,
 } from '../web/split.js';
 
 // The floor depends on the model, so every call passes one. Ten is
@@ -724,6 +725,24 @@ console.log('\ncoverage: the network, drawn from the roster alone');
     eq('and r is the depth of the thinnest position', full.r, 2);
     eq('an empty network covers nothing', coverage([], N).covered, 0);
     eq('and reports the whole line as one hole', coverage([], N).holes, [[0, 32]]);
+}
+
+console.log('\nchats in memory: the pool grows with the session count');
+{
+    eq('the default session count gives the default pool', poolSlots(SESSIONS), SLOTS);
+    eq('one context per four sessions, rounded up', [1, 4, 5, 16, 32].map(poolSlots), [1, 1, 2, 4, 8]);
+    eq('the mesh\'s number sizes the runner', runnerSessions(undefined, 16), { sessions: 16, slots: 4 });
+    eq('a caller\'s number beats the mesh\'s', runnerSessions(3, 16), { sessions: 3, slots: 1 });
+    eq('with neither, the default', runnerSessions(undefined, null), { sessions: SESSIONS, slots: SLOTS });
+    eq('clamped to MAX_SESSIONS', runnerSessions(undefined, 1000).sessions, MAX_SESSIONS);
+    eq('a nonsense number falls back to the default', [0, -2, NaN].map((n) => runnerSessions(n).sessions),
+        [SESSIONS, SESSIONS, SESSIONS]);
+    const d = costDims({ ...SMOLLM2_135M, layer_types: Array.from({ length: 8 },
+        (_, i) => (i % 4 === 3 ? 'full_attention' : 'linear_attention')),
+        linear_num_key_heads: 16, linear_num_value_heads: 48,
+        linear_key_head_dim: 128, linear_value_head_dim: 128, linear_conv_kernel_dim: 4 });
+    ok('more chats in memory make a block cost more',
+        blockBytes(d, { sessions: 16, slots: 4 }) > blockBytes(d));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

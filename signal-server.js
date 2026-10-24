@@ -14,7 +14,7 @@
 import { readFileSync } from 'node:fs';
 import { createHash, createHmac } from 'node:crypto';
 import { WebSocketServer } from 'ws';
-import { costDims, floorBlocks, blockBytes, positions, headPos } from './web/split.js';
+import { costDims, floorBlocks, blockBytes, positions, headPos, SESSIONS } from './web/split.js';
 import { Room } from './signal-room.js';
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -193,6 +193,14 @@ const MAX_PRIVATE_CHATS = limit(process.env.MAX_PRIVATE_CHATS);
 // page waits for any one job (route.js's JOB_TIMEOUT, 300 s).
 const CHAT_LEASE_MS = Number(process.env.CHAT_LEASE_MS) || 600000;
 
+// Chats each peer keeps in memory: MESH_SESSIONS in the global mesh and in a
+// private mesh whose creator chose none, otherwise the creator's number capped
+// by MAX_PRIVATE_SESSIONS. Peers size their KV pool to match (split.js's
+// poolSlots()), so more costs VRAM and leaves fewer blocks per peer.
+const count = (v, d) => Number.isInteger(Number(v)) && Number(v) >= 1 ? Number(v) : d;
+const MESH_SESSIONS = count(process.env.MESH_SESSIONS, SESSIONS);
+const MAX_PRIVATE_SESSIONS = count(process.env.MAX_PRIVATE_SESSIONS, 32);
+
 // How long a new socket has to send its `join`.
 const JOIN_TIMEOUT_MS = Number(process.env.JOIN_TIMEOUT_MS) || 10000;
 
@@ -205,13 +213,13 @@ export const CLOSE_FULL = 4002;
 // A join token is HKDF output: 32 bytes, base64url.
 const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 
-const makeRoom = (label, maxChats) => new Room({
+const makeRoom = (label, maxChats, sessions) => new Room({
     label, positions: POSITIONS, head: HEAD, minBlocks: MIN_BLOCKS, maxPeers: MAX_PEERS_PER_ROOM,
-    maxChats, chatLeaseMs: CHAT_LEASE_MS,
+    maxChats, chatLeaseMs: CHAT_LEASE_MS, sessions,
 });
 
 const GLOBAL = 'global';
-const rooms = new Map([[GLOBAL, makeRoom('', MAX_CHATS)]]);
+const rooms = new Map([[GLOBAL, makeRoom('', MAX_CHATS, MESH_SESSIONS)]]);
 
 // One id counter for all rooms: monotonic and never reused. A browser keys
 // links by peer id, so an id must never refer to a later peer, even after a
@@ -260,6 +268,8 @@ console.log(`  weights: ${WEIGHTS_URL}${process.env.WEIGHTS_URL ? ' (WEIGHTS_URL
     : ` (from ${CHECKPOINT})`}`);
 console.log(`  chats at once: ${Number.isFinite(MAX_CHATS) ? MAX_CHATS : 'no limit'} in the global mesh, `
     + `${Number.isFinite(MAX_PRIVATE_CHATS) ? `at most ${MAX_PRIVATE_CHATS}` : 'no cap'} in a private one`);
+console.log(`  chats in memory per peer: ${MESH_SESSIONS} in the global mesh, `
+    + `at most ${MAX_PRIVATE_SESSIONS} in a private one`);
 if (OWN_TURN) console.log(`  TURN: ${TURN_URLS.join(', ')} (a credential per peer)`);
 else if (TURN_SECRET || TURN_URLS.length) console.warn('TURN_SECRET and TURN_URLS go together. '
     + 'With only one set, peers are not given this TURN server.');
@@ -270,8 +280,9 @@ if (!dims) console.warn('no manifest, falling back to a flat 10-block floor. '
     + 'Set MIN_BLOCKS if that is wrong for this model.');
 
 // The room a `join` names, created if new, or a close code if it is refused.
-// `chats` is the creator's limit, read only when this join creates the room.
-function roomFor(token, chats) {
+// `chats` and `sessions` are the creator's choices, read only when this join
+// creates the room.
+function roomFor(token, chats, sessions) {
     if (token == null) return { key: GLOBAL, room: rooms.get(GLOBAL) };
     if (typeof token !== 'string' || !TOKEN_RE.test(token)) return { refuse: CLOSE_BAD_JOIN };
     const key = createHash('sha256').update(token).digest('hex');
@@ -279,9 +290,12 @@ function roomFor(token, chats) {
     if (!room) {
         if (rooms.size - 1 >= MAX_ROOMS) return { refuse: CLOSE_FULL, why: 'too many private meshes' };
         const asked = Number.isInteger(chats) && chats >= 1 ? chats : Infinity;
-        room = makeRoom(`room ${key.slice(0, 6)} `, Math.min(asked, MAX_PRIVATE_CHATS));
+        const kept = Number.isInteger(sessions) && sessions >= 1
+            ? Math.min(sessions, MAX_PRIVATE_SESSIONS) : Math.min(MESH_SESSIONS, MAX_PRIVATE_SESSIONS);
+        room = makeRoom(`room ${key.slice(0, 6)} `, Math.min(asked, MAX_PRIVATE_CHATS), kept);
         rooms.set(key, room);
-        room.log(`opened, ${room.chatLimit === 1 ? '1 chat' : `${room.chatLimit ?? 'no limit on'} chats`} at once`);
+        room.log(`opened, ${room.chatLimit === 1 ? '1 chat' : `${room.chatLimit ?? 'no limit on'} chats`} at once, `
+            + `${kept} in memory per peer`);
     }
     return { key, room };
 }
@@ -306,7 +320,7 @@ wss.on('connection', (ws, req) => {
 
         if (m.type !== 'join') return ws.close(CLOSE_BAD_JOIN, 'join first');
         clearTimeout(timer);
-        const { key, room, refuse, why } = roomFor(m.room, m.chats);
+        const { key, room, refuse, why } = roomFor(m.room, m.chats, m.sessions);
         if (refuse) return ws.close(refuse, why ?? 'bad join');
         if (room.full) {
             if (!room.size) rooms.delete(key);
@@ -329,6 +343,8 @@ wss.on('connection', (ws, req) => {
             private: key !== GLOBAL,
             // Replies that may generate at once here, or null for no limit.
             maxChats: room.chatLimit,
+            // Chats each peer keeps in memory here.
+            sessions: room.sessions,
             ice, peers: room.roster(),
         });
         room.broadcast();

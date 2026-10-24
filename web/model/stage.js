@@ -91,6 +91,7 @@ export class Runner {
             n_layer: this.blocks,
             layerLo: this.blockLo,
         });
+        this.slots = slots;
         this.sessions = sessions;
         this.free = Array.from({ length: sessions },
             () => makeSessionFrame(device, d, this.pool, this.maxPages,

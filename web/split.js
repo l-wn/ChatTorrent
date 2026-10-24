@@ -44,9 +44,9 @@ export function describeRange(lo, hi, L) {
 // checkpoint only the full-attention layers keep KV (see kvShare()).
 export const N_MAX = 4096;
 
-// Full-context KV caches a runner's page pool is sized for: SLOTS * N_MAX
-// tokens, shared by every session on the runner (SESSIONS below), not reserved
-// per chat.
+// Full-context KV caches a runner's page pool is sized for at the default
+// SESSIONS: SLOTS * N_MAX tokens, shared by every session on the runner, not
+// reserved per chat. A runner with another session count uses poolSlots().
 export const SLOTS = 2;
 
 // Tokens in one KV page (web/model/model.js's makePagePool). A session's KV is
@@ -62,7 +62,28 @@ export const PAGE_TOKENS = 64;
 //
 // Recurrent state is per session, so blockBytes() charges it SESSIONS times:
 // ~3.3 MB per linear_attention layer per session on Qwen3.8-27B.
+//
+// The default. A mesh's creator can choose another number, which the welcome
+// brings (signal-server.js's MESH_SESSIONS for the global mesh).
 export const SESSIONS = 8;
+
+// The most sessions a page will size a runner for, whatever the welcome says.
+export const MAX_SESSIONS = 64;
+
+// The KV pool keeps one full context per SESSIONS_PER_SLOT sessions, so a
+// mesh that keeps more chats also has room for their history. poolSlots(SESSIONS)
+// is SLOTS.
+export const SESSIONS_PER_SLOT = SESSIONS / SLOTS;
+export const poolSlots = (sessions) => Math.max(1, Math.ceil(sessions / SESSIONS_PER_SLOT));
+
+// The sessions a runner is sized for: the caller's number (the dev harness's
+// ?sessions=), else the mesh's from the welcome, else SESSIONS, clamped to
+// [1, MAX_SESSIONS]. Returns the pool's slots with it.
+export function runnerSessions(asked, mesh) {
+    const n = Math.floor(asked ?? mesh ?? SESSIONS);
+    const sessions = Number.isFinite(n) && n >= 1 ? Math.min(n, MAX_SESSIONS) : SESSIONS;
+    return { sessions, slots: poolSlots(sessions) };
+}
 
 // How long a session must be unused before its frame or pages may be taken. A
 // chat mid-reply is never evicted; the arriving session waits (WAIT_MS). An

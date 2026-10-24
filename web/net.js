@@ -272,11 +272,14 @@ export class Mesh {
     // `room` is the mesh to join (web/room.js), the global one by default.
     // `chats` is the limit on replies at once this tab asks for when its join
     // creates a private mesh (the server ignores it otherwise).
+    // `sessions` is how many chats each peer keeps in memory, asked for the same
+    // way.
     // `relayOnly` routes every link through TURN, so no peer learns this tab's
     // address. `rate`, `linkWait`, `readyTimeout`, `linkRetry` and `linkOpen`
     // override RATE, LINK_WAIT_MS, READY_TIMEOUT_MS, LINK_RETRY_MS and
     // LINK_OPEN_MS, for tests.
-    constructor({ onMessage, onChange, rate = RATE, room = GLOBAL, chats = null, relayOnly = true,
+    constructor({ onMessage, onChange, rate = RATE, room = GLOBAL, chats = null, sessions = null,
+                  relayOnly = true,
                   linkWait = LINK_WAIT_MS, readyTimeout = READY_TIMEOUT_MS,
                   linkRetry = LINK_RETRY_MS, linkOpen = LINK_OPEN_MS } = {}) {
         this.id = null;
@@ -296,6 +299,10 @@ export class Mesh {
         // Replies that may generate at once in this mesh, from the welcome.
         // Null for no limit.
         this.maxChats = null;
+        this.askSessions = sessions;
+        // Chats each peer keeps in memory in this mesh, from the welcome. Null
+        // if the server sends none.
+        this.sessions = null;
         this.relayOnly = relayOnly;
         this.linkWait = linkWait;
         this.readyTimeout = readyTimeout;
@@ -364,7 +371,8 @@ export class Mesh {
             this.#kick();
             // `join` is the first message on every socket: it names the mesh.
             this.#ws({ type: 'join', v: 1, room: this.room.joinToken,
-                       ...(this.chats && { chats: this.chats }) });
+                       ...(this.chats && { chats: this.chats }),
+                       ...(this.askSessions && { sessions: this.askSessions }) });
         });
         ws.addEventListener('message', (e) => {
             if (gone || ws !== this.ws) return;
@@ -785,6 +793,13 @@ export class Mesh {
             this.trouble = null;
             const rejoin = this.#rejoining;
             const held = this.range;
+            const sessions = Number.isInteger(m.sessions) && m.sessions >= 1 ? m.sessions : null;
+            // A runner is sized once, so a different number after a reconnect
+            // (a restarted server) does not apply to it.
+            if (this.sessions != null && sessions !== this.sessions) {
+                console.warn(`the mesh now keeps ${sessions ?? 'the default number of'} chats in `
+                    + `memory per peer; this tab keeps ${this.sessions} until it is reloaded`);
+            }
             Object.assign(this, {
                 id: m.id, blocks: m.blocks, positions: m.positions ?? 0,
                 minBlocks: m.minBlocks, ice: m.ice ?? ICE,
@@ -792,6 +807,7 @@ export class Mesh {
                 // /checkpoint.json.
                 weightsUrl: m.weightsUrl ?? null,
                 maxChats: m.maxChats ?? null,
+                sessions: this.sessions ?? sessions,
             });
             this.#welcomed();
 

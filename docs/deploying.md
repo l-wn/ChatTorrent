@@ -255,6 +255,8 @@ Signaling server environment:
 | `MAX_CHATS` | unset (no limit) | replies that may generate at once in the global mesh |
 | `MAX_PRIVATE_CHATS` | unset (no limit) | cap on a private mesh's own limit, and its limit when the creator set none |
 | `CHAT_LEASE_MS` | 600000 | a seat whose `chat-end` never arrives is freed after this long |
+| `MESH_SESSIONS` | 8 | chats each peer keeps in memory in the global mesh, and in a private mesh whose creator set none. Peers size their KV pool to match, about 280 MiB per chat across Qwen3.8-27B |
+| `MAX_PRIVATE_SESSIONS` | 32 | cap on a private mesh creator's "Chats in memory" |
 
 Caddy environment: `WEIGHTS_ORIGIN` (default
 `https://weights.chattorrent.net`), and for `Caddyfile.dev`, `CHAT_PASS_HASH`
