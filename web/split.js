@@ -10,6 +10,10 @@
 //
 // See docs/architecture.md (Positions, Claims, holdings and growth).
 
+// The version of the messages peers exchange. The signaling server refuses a
+// page with another, so one mesh never mixes two.
+export const PROTOCOL = 2;
+
 // --- The position line ---
 
 // Only these helpers encode the meaning of a position.

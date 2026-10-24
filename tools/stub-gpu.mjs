@@ -119,7 +119,7 @@ export function makeGpu({ timestamps = false, fallback = null } = {}) {
             clearBuffer() { passes.cleared++; },
             copyBufferToBuffer() {}, finish: () => ({}),
         }),
-        queue: { writeBuffer() {}, submit() {} },
+        queue: { writeBuffer() {}, submit() {}, onSubmittedWorkDone: async () => {} },
     };
     return {
         device,

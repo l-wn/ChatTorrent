@@ -8,6 +8,7 @@
 //   node tools/mesh.gpu.test.mjs --prompts 200       a soak
 //   node tools/mesh.gpu.test.mjs --show              stream every peer's console
 //   node tools/mesh.gpu.test.mjs --round-trip        every row without the closed loop
+//   node tools/mesh.gpu.test.mjs --long              prompts of several T_MAX chunks
 //   node tools/mesh.gpu.test.mjs --fuzz 12 --seed 3  random scenarios, each replayed
 //                                                    against a one-peer reference
 //
@@ -45,6 +46,8 @@ const HEAVY    = has('heavy');
 const KEEP     = has('keep');
 const WEIGHTS  = opt('weights', 'weights/tiny-test');
 const FUZZ     = Number(opt('fuzz', 0));
+// Prompts long enough to be sent as several pipelined prefill chunks.
+const LONG     = has('long');
 // Run every row on the round trip, to compare with the closed loop.
 const ROUND_TRIP = has('round-trip');
 
@@ -304,7 +307,7 @@ const WORDS = ('the a of and to in is it that was for on are with as his they be
 function prompts(n, rand) {
     const out = [];
     for (let i = 0; i < n; i++) {
-        const len = 2 + Math.floor(rand() * 18);
+        const len = LONG ? 120 + Math.floor(rand() * 180) : 2 + Math.floor(rand() * 18);
         const words = [];
         for (let j = 0; j < len; j++) words.push(WORDS[Math.floor(rand() * WORDS.length)]);
         out.push(`${words.join(' ')}?`);
@@ -623,11 +626,20 @@ async function runScenario(browser, base, scenario, reference) {
 
         // After every reply has ended, nothing may be running: no peer's count
         // of positions run changes for a second. This detects a closed loop
-        // that kept running after its reply.
+        // that kept running after its reply. A turn refused partway through a
+        // long prompt leaves its prefill chunks already sent (at most
+        // route.js's PREFILL_WINDOW) to finish, so the counts are first
+        // given up to 5 s to settle. A loop never settles.
         const live = peers.filter(({ tab }) => !tab.closed);
         const ranAt = async () => (await Promise.all(live.map(({ tab }) =>
             tab.eval('window.harness.stats()')))).map((x) => x.ran);
-        const ran0 = await ranAt();
+        let ran0 = await ranAt();
+        for (const until = Date.now() + 5000; Date.now() < until;) {
+            await new Promise((r) => setTimeout(r, 250));
+            const now = await ranAt();
+            if (JSON.stringify(now) === JSON.stringify(ran0)) break;
+            ran0 = now;
+        }
         await new Promise((r) => setTimeout(r, 1000));
         const ran1 = await ranAt();
         ok(`${name}: nothing still running once every reply had ended`,

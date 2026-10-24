@@ -14,7 +14,7 @@
 import { readFileSync } from 'node:fs';
 import { createHash, createHmac } from 'node:crypto';
 import { WebSocketServer } from 'ws';
-import { costDims, floorBlocks, blockBytes, positions, headPos, SESSIONS } from './web/split.js';
+import { costDims, floorBlocks, blockBytes, positions, headPos, SESSIONS, PROTOCOL } from './web/split.js';
 import { Room } from './signal-room.js';
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -205,8 +205,8 @@ const MAX_PRIVATE_SESSIONS = count(process.env.MAX_PRIVATE_SESSIONS, 32);
 const JOIN_TIMEOUT_MS = Number(process.env.JOIN_TIMEOUT_MS) || 10000;
 
 // Close codes a page reports and does not retry. 4001: a malformed or missing
-// join (the page is older than this server; a reload fixes it). 4002: a full
-// room or server.
+// join, or one from a page with another PROTOCOL (a reload fixes it). 4002: a
+// full room or server.
 export const CLOSE_BAD_JOIN = 4001;
 export const CLOSE_FULL = 4002;
 
@@ -302,7 +302,7 @@ function roomFor(token, chats, sessions) {
 
 // A socket is in no room until its first message, which must be
 //
-//   peer -> join { v: 1, room }     room: a join token, or null for the global mesh
+//   peer -> join { v, room }        v: PROTOCOL; room: a join token, or null for the global mesh
 //
 // Nothing is sent to it before then, including the global roster, which a tab
 // joining a private mesh should not see.
@@ -320,6 +320,7 @@ wss.on('connection', (ws, req) => {
 
         if (m.type !== 'join') return ws.close(CLOSE_BAD_JOIN, 'join first');
         clearTimeout(timer);
+        if (m.v !== PROTOCOL) return ws.close(CLOSE_BAD_JOIN, `protocol ${m.v}, not ${PROTOCOL}`);
         const { key, room, refuse, why } = roomFor(m.room, m.chats, m.sessions);
         if (refuse) return ws.close(refuse, why ?? 'bad join');
         if (room.full) {

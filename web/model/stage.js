@@ -31,10 +31,17 @@ const WARMUP = '\0warmup';
 // Initial row capacity of a boundary log: four prefill chunks.
 const LOG_CHUNK = 256;
 
-// Jobs run() holds queued before it refuses more with `busy`. Normal traffic
-// is one job in flight per session, so this is several times `sessions`. The
-// limit bounds the GPU time and payload memory a flood can take.
+// Sessions run() holds jobs queued for before it refuses another with `busy`,
+// and jobs it holds for one session. A session has one decode job in flight,
+// or a prompt's prefill chunks (route.js PREFILL_WINDOW) and its last chunk.
+// So the first is several times `sessions` and the second a few more than a
+// prompt sends. Together they bound the GPU time and payload memory a flood
+// can take.
 export const MAX_QUEUE = 32;
+export const MAX_SESSION_QUEUE = 8;
+
+// How long a capacity refusal is remembered for its session (see #cold()).
+const REFUSED_MS = 60_000;
 
 // How recently a session must have run here to count towards `load`. Covers
 // the gap between a reply's tokens and a short pause between turns.
@@ -110,7 +117,13 @@ export class Runner {
         // handed to leaves. route.js keys that boundary by the same exit
         // cursor. See #log().
         this.logs = new Map();
-        this.queue = Promise.resolve();
+        // Work waiting to run, one task at a time: jobs, and the functions
+        // schedule() adds (releases, the waiting list's barrier). #next()
+        // picks the task.
+        this.tasks = [];
+        this.draining = false;
+        // session -> when a job of it was last refused for capacity here.
+        this.refused = new Map();
         this.backlog = 0;                                   // jobs queued or running
         // Jobs run() has accepted and not yet settled, by session. A session
         // with any is not idle, however long its job waits in the queue.
@@ -510,12 +523,15 @@ export class Runner {
     // `queuedAt` is taken on arrival, so time spent queued is reported
     // separately from GPU time.
     //
-    // Refused with `busy` once MAX_QUEUE jobs are queued. A job waiting for a
-    // frame counts towards the limit.
+    // Refused with `busy` once MAX_QUEUE sessions have jobs queued, or its
+    // session has MAX_SESSION_QUEUE. A job waiting for a frame counts.
     run(h, hidden, want) {
-        if (this.backlog >= MAX_QUEUE) return Promise.reject(this.#atCapacity('queue slot'));
-        this.backlog++;
         const s = h.s;
+        const mine = this.pending.get(s) ?? 0;
+        if (mine >= MAX_SESSION_QUEUE || (!mine && this.pending.size >= MAX_QUEUE)) {
+            return Promise.reject(this.#atCapacity('queue slot', s));
+        }
+        this.backlog++;
         this.pending.set(s, (this.pending.get(s) ?? 0) + 1);
         return new Promise((resolve, reject) => {
             this.#submit({ h, hidden, want, queuedAt: performance.now(), resolve, reject });
@@ -533,11 +549,46 @@ export class Runner {
     // Queue one job. A job that finds no frame for its session is parked, so
     // the jobs behind it, which belong to other chats, are not delayed.
     #submit(job) {
-        this.queue = this.queue.then(() =>
-            this.#run(job.h, job.hidden, job.want, job.queuedAt).then(job.resolve, (err) => {
+        this.#enqueue({
+            s: job.h.s, fill: !!job.h.fill,
+            run: () => this.#run(job.h, job.hidden, job.want, job.queuedAt).then(job.resolve, (err) => {
                 if (err === WAIT) this.#park(job);
                 else job.reject(err);
-            }));
+            }),
+        });
+    }
+
+    // Run `fn` on the queue, after the work queued ahead of it. Resolves with
+    // its result.
+    schedule(fn) {
+        return new Promise((resolve, reject) => {
+            this.#enqueue({ s: null, fill: false,
+                            run: async () => { try { resolve(await fn()); } catch (e) { reject(e); } } });
+        });
+    }
+
+    #enqueue(task) {
+        this.tasks.push(task);
+        if (this.draining) return;
+        this.draining = true;
+        // Started on a microtask, so run() returns before its job starts.
+        queueMicrotask(() => this.#drain());
+    }
+
+    async #drain() {
+        while (this.tasks.length) {
+            const [task] = this.tasks.splice(this.#next(), 1);
+            try { await task.run(); } catch { /* a task reports its own failure */ }
+        }
+        this.draining = false;
+    }
+
+    // Which queued task runs next: the oldest. A task carries its session and
+    // whether it is a prefill chunk (`fill`), so a policy that runs other
+    // chats' decode jobs ahead of a long prefill can be added here. It must
+    // keep each session's tasks, and every task with no session, in order.
+    #next() {
+        return 0;
     }
 
     // The waiting list: jobs whose session has no frame yet, in arrival order.
@@ -569,7 +620,7 @@ export class Runner {
         const late = this.waiting.filter((j) => now >= j.deadline);
         if (late.length) {
             this.waiting = this.waiting.filter((j) => now < j.deadline);
-            for (const j of late) j.reject(this.#atCapacity('session'));
+            for (const j of late) j.reject(this.#atCapacity('session', j.h.s));
         }
         if (!this.waiting.length) {
             clearInterval(this.waitTimer);
@@ -584,7 +635,7 @@ export class Runner {
         this.waiting = this.waiting.filter((j) => j.h.s !== s);
         this.turn = s;
         for (const job of jobs) this.#submit(job);
-        this.queue = this.queue.then(() => { this.turn = null; });
+        this.schedule(() => { this.turn = null; });
     }
 
     // Run one job through newly loaded positions before they are announced.
@@ -658,9 +709,7 @@ export class Runner {
     // would give its buffers to another chat mid-job, so queued jobs finish
     // first.
     release(session) {
-        const done = this.queue.then(() => this.#release(session));
-        this.queue = done.catch(() => {});
-        return done;
+        return this.schedule(() => this.#release(session));
     }
 
     // Idempotent: a `free` often arrives for a session this peer evicted or
@@ -676,6 +725,7 @@ export class Runner {
         this.#specRelease(session);
         this.cuts.delete(session);
         this.logs.delete(session);
+        this.refused.delete(session);
         // Also remove its jobs from the waiting list.
         const mine = this.waiting.filter((j) => j.h.s === session);
         if (mine.length) {
@@ -726,12 +776,34 @@ export class Runner {
 
     // A capacity refusal. route.js passes it back to the enqueuer without
     // repairing, since no hand-off is broken.
-    #atCapacity(what) {
+    #atCapacity(what, session = null) {
         const err = new Error(`this peer is serving ${this.live.size} chats and has no ` +
             `${what} free for another right now; try again in a moment`);
         err.busy = true;
         this.counts.refused++;
+        if (session != null) {
+            const now = performance.now();
+            for (const [s, at] of this.refused) if (now - at >= REFUSED_MS) this.refused.delete(s);
+            this.refused.set(session, now);
+        }
         return err;
+    }
+
+    // A job that finds its session's cache behind it: cold, which route.js
+    // repairs. But after a job of the session was refused here for capacity,
+    // it is the next chunk of that prompt, sent before the refusal came back.
+    // It is refused for capacity too. A repair would run a prompt, and open a
+    // decode loop, that the enqueuer has already given up on.
+    #cold(session, msg) {
+        const at = this.refused.get(session);
+        if (at !== undefined && performance.now() - at < REFUSED_MS) {
+            const err = new Error(`an earlier job of this chat was refused here for capacity; ` +
+                `try again in a moment`);
+            err.busy = true;
+            return err;
+        }
+        this.counts.cold++;
+        return new Error(msg);
     }
 
     #cacheFor(session, past) {
@@ -751,10 +823,7 @@ export class Runner {
         // The session already has a job waiting. This one waits behind it,
         // whatever its `past`, so the session's jobs run in arrival order.
         if (this.waiting.some((j) => j.h.s === session)) throw WAIT;
-        if (past > 0) {
-          this.counts.cold++;
-          throw new Error(`session ${session} is no longer cached here`);
-        }
+        if (past > 0) throw this.#cold(session, `session ${session} is no longer cached here`);
         // First come, first served: a new session does not take a frame while
         // other sessions are waiting for one.
         if (this.waiting.length && this.turn !== session) throw WAIT;
@@ -762,7 +831,7 @@ export class Runner {
         let cache = this.free.pop();
         if (!cache) {
             const oldest = this.#evictable();
-            if (oldest == null) throw this.waitMs > 0 ? WAIT : this.#atCapacity('session');
+            if (oldest == null) throw this.waitMs > 0 ? WAIT : this.#atCapacity('session', session);
             this.counts.evicted++;
             cache = this.live.get(oldest);
             this.live.delete(oldest);
@@ -850,6 +919,9 @@ export class Runner {
                 // refuses as cold instead, which reaches the enqueuer.
                 throw Object.assign(new Error(`a duplicate of session ${session}'s job at ${past} ` +
                     `(block ${b} is already at ${fed})`), { stale: true });
+            } else if (past > fed) {
+                throw this.#cold(session, `session ${session} is no longer cached here ` +
+                    `(block ${b} holds ${fed} rows, the job continues from ${past})`);
             } else {
                 this.counts.cold++;
                 throw new Error(`session ${session} is no longer cached here ` +
@@ -893,7 +965,7 @@ export class Runner {
             throw new Error(`the KV pool cannot fit ${tokens} tokens for session ` +
                 `${session} (${this.pool.nPages} pages of ${this.pool.pageTokens})`);
         }
-        throw this.#atCapacity('KV page');
+        throw this.#atCapacity('KV page', session);
     }
 
     // The rows handed downstream at `at`, kept for a replay. Rows are stored
@@ -952,8 +1024,13 @@ export class Runner {
         // of the line it runs no LM head, reads nothing back and samples
         // nothing. Before the end it is an ordinary job, handed on with the
         // flag set so it rebuilds the caches down the line.
-        const head = end && !h.replay;
+        // A prefill chunk other than the prompt's last (`fill`) only fills
+        // caches too. At the end of the line it runs no LM head and samples
+        // nothing, but keeps the MTP head's state, and route.js answers it.
+        const filling = end && !h.replay && !!h.fill;
+        const head = end && !h.replay && !h.fill;
         const spent = end && !!h.replay;
+        if (h.fill && h.drafts != null) throw new Error('a prefill chunk cannot carry drafts');
         // The header came from another peer. `n` sizes every scratch write and
         // `ids` goes into the embedding gather, so a job that does not fit the
         // buffers is refused before it reaches the GPU.
@@ -1015,9 +1092,9 @@ export class Runner {
         // contiguous and not pooled.
         // The MTP head writes its own rows past the job's: the drafts it
         // chains after the sample.
-        const mtp = head && !spent && !!this.mtp && !!h.mtp && h.s !== WARMUP;
+        const mtp = (head || filling) && !!this.mtp && !!h.mtp && h.s !== WARMUP;
         if (h.s !== WARMUP) {
-            this.#pagesFor(h.s, cache, mtp ? Math.min(this.nMax, h.past + T + SPEC_COLS) : h.past + T);
+            this.#pagesFor(h.s, cache, mtp && head ? Math.min(this.nMax, h.past + T + SPEC_COLS) : h.past + T);
         }
         const fill = mtp && Array.isArray(h.ids) && h.ids.length === T;
 
@@ -1066,13 +1143,22 @@ export class Runner {
             // Sample when the cut reaches the end of the line. A peer that
             // holds the head can stop before it for a session whose cut is
             // earlier.
+            //
+            // A verify samples every row. Any other job samples only its last,
+            // so the head runs on that row alone. `s.down` is free once the
+            // blocks have run.
             if (head) {
                 prof?.at('head');
-                rmsnorm(device, pass, s.x, this.w.norm, s.h, T, H, d.rms_eps);
+                let src = s.x;
+                if (!verify && T > 1) {
+                    copyF32(device, pass, s.x, s.down, H, (T - 1) * H, 0);
+                    src = s.down;
+                }
+                rmsnorm(device, pass, src, this.w.norm, s.h, sampled, H, d.rms_eps);
                 matmulNobias(device, pass, s.h, this.w.lm_head ?? this.w.wte,
-                             s.logits, T, H, d.vocab);
+                             s.logits, sampled, H, d.vocab);
                 if (topk) picked = topkRows(device, pass, s.logits, sampled, d.vocab, M,
-                                            topk.a, topk.b, verify ? 0 : T - 1);
+                                            topk.a, topk.b, 0);
             }
             // The MTP layer's KV for this job's positions. Row r pairs the
             // token at past + r with the trunk's hidden state at past + r - 1:
@@ -1083,23 +1169,24 @@ export class Runner {
                 if (T > 1) copyF32(device, pass, s.x, ms.mtpIn, (T - 1) * H, 0, H);
                 mtpBlock(device, pass, d, this.mtp, this.#mtpCache(cache), ms, ms.mtpIn,
                          ms.mtpIds, T, h.past);
+                // A prefill chunk samples nothing, so #mtpAfter does not run.
+                // Its last row is the next job's row 0.
+                if (filling) copyF32(device, pass, s.x, cache.mtpH, H, (T - 1) * H, 0);
             }
         }, `positions ${at}–${to - 1}`, prof);
 
         // The readback copy is on the same encoder, outside the pass, in the
-        // same submit. A job that ends at the head reads back only the last
-        // logits row and samples it, or every row of a verify job. Any other
-        // job reads back the hidden state. Prefill chunks sample too; the
-        // enqueuer keeps only the last chunk's token.
+        // same submit. A job that ends at the head reads back the logits row
+        // it sampled, or every row of a verify job. A prefill chunk at the end
+        // reads back nothing. Any other job reads back the hidden state.
         const rowBytes = d.vocab * F32;
         const rows = head && verify;
         const bytes = topk ? sampled * M * 8 : rows ? T * rowBytes : head ? rowBytes : T * H * F32;
         const readback = topk ? topk.readback : rows ? this.#verifyReadback() : s.readback;
         if (topk) {
             enc.copyBufferToBuffer(picked, 0, readback, 0, bytes);
-        } else if (!spent) {
-            enc.copyBufferToBuffer(head ? s.logits : s.x, head && !rows ? (T - 1) * rowBytes : 0,
-                                   readback, 0, bytes);
+        } else if (!spent && !filling) {
+            enc.copyBufferToBuffer(head ? s.logits : s.x, 0, readback, 0, bytes);
         }
         prof?.finish(enc);
         const cmd = enc.finish();
@@ -1119,11 +1206,17 @@ export class Runner {
         if (spent) return { at: to };
 
         // The timestamps are mapped in parallel with the readback, so
-        // profiling adds no latency. The readback is read first.
-        await Promise.all([readback.mapAsync(GPUMapMode.READ, 0, bytes), prof?.map()]);
+        // profiling adds no latency. The readback is read first. A prefill
+        // chunk at the end waits for the GPU instead, so jobs still run one
+        // at a time.
+        await Promise.all([filling ? device.queue.onSubmittedWorkDone()
+                                   : readback.mapAsync(GPUMapMode.READ, 0, bytes), prof?.map()]);
         const t3 = performance.now();
-        const out = new Float32Array(readback.getMappedRange(0, bytes).slice(0));
-        readback.unmap();
+        let out = null;
+        if (!filling) {
+            out = new Float32Array(readback.getMappedRange(0, bytes).slice(0));
+            readback.unmap();
+        }
         const t4 = performance.now();
         const gpu = prof?.collect();
 
@@ -1139,6 +1232,10 @@ export class Runner {
             dispatches: c1.dispatches - c0.dispatches,
             bindGroups: c1.bindGroupsBuilt - c0.bindGroupsBuilt,
         };
+        if (filling) {
+            this.#timed(h, queuedAt, t0, t3, to - at);
+            return { at: to, filled: true, phases, ...(gpu && { gpu }) };
+        }
 
         // Sample row i of those read back: from its candidates, or from the
         // whole logits row.

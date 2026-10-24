@@ -97,8 +97,10 @@ its Runner with it once, in `serve()`. A different number in a later welcome
 Peers need not agree on it: each sizes only its own memory.
 
 Nothing is sent to a socket until its `join`; one that sends anything else, or
-nothing for 10 s, is closed with code 4001, and a full mesh with 4002. The page
-reports both instead of retrying.
+nothing for 10 s, is closed with code 4001, and a full mesh with 4002. A join
+whose `v` is not `PROTOCOL` (`split.js`) is closed with 4001 too, so a mesh
+never mixes pages that speak different versions of the messages below. The
+page reports both instead of retrying.
 
 Anything else that stops a socket short of its welcome (an error, a close, or
 no welcome within 10 s, which catches a socket hung in CONNECTING) is retried
@@ -357,11 +359,12 @@ Messages are a JSON header plus an optional f32 payload (`net.js`):
 Headers (`route.js`):
 
 ```
-job   { k, s, key, from, pos, past, n, ids?, opts?, replay?, trace?, prof?,
+job   { k, s, key, from, pos, past, n, ids?, opts?, replay?, fill?, trace?, prof?,
         loop?, entry?, auto?, drafts?, rowOpts?, rb? }  + f32 [n, hidden] payload
-ack   { k, s, to, at }
+ack   { k, s, to, at, past }
 tok   { k, s, key, to, past, token, tokens?, eos, trace, ttl, fed?, head?, link? }
-err   { k, s, key, to, from, msg, busy?, nospec?, ttl }
+filled { k, s, key, to, past, n, trace, ttl }      a prefill chunk reached the end
+err   { k, s, key, to, from, past, msg, busy?, nospec?, ttl }
 fix   { k, s, key, to, from, at, rows, ttl }       a hand-off was repaired
 free  { k, s, to, ttl }                             the session is over; drop its KV
 halt  { k, s, key, to, ttl }                        stop feeding this session's loop
@@ -380,11 +383,20 @@ halt  { k, s, key, to, ttl }                        stop feeding this session's 
   back in, `head` is who to send a `halt` to, and `link` is the timing of the
   head's hand-off to the entry.
 - `busy` marks a capacity refusal, which nothing repairs or rebuilds.
+- `fill`: a prefill chunk other than the prompt's last (see Sessions and
+  generation). The head runs no LM head for it and answers `filled`.
+- `err.past` is the failed job's `past`. The enqueuer drops an `err` below
+  where its current prompt starts: a prefill chunk of an earlier turn, still
+  in flight when that turn failed.
+- `ack.past` is the acked job's `past`. Several prefill chunks can cross a
+  boundary in a row, and an ack for an earlier one must not end the wait for
+  the latest.
 
 **Who may answer.** Session ids are guessable, so an answer is checked twice.
 `key` is a random secret the enqueuer mints with each session. Every job
-carries it, every `tok`, `err`, `fix` and `halt` must echo it, and an answer
-with the wrong key is dropped. A `tok` is also only relayed or accepted from a
+carries it, every `tok`, `filled`, `err`, `fix` and `halt` must echo it, and an
+answer with the wrong key is dropped. A `tok` or `filled` is also only relayed
+or accepted from a
 link to a peer that could have produced or carried it: a holder of the last
 position, or a hub (`Mesh.mayAnswer`). The sender is identified by the link a
 message arrived on, not by a header field. A `free` is acted on only from a
@@ -412,7 +424,8 @@ history, and the prompt wrapping:
    transcript for base models). Qwen's thinking mode is off by default and
    rendered folded when on.
 2. The prompt is sent in chunks of `T_MAX` (64) tokens, then one job per
-   decoded token (see the closed loop below).
+   decoded token (see the closed loop below). Every chunk runs as one GPU
+   pass. The prompt's chunks are pipelined (see Prefill).
 3. The reply ends on end-of-text, on the token budget, on a full context
    (`N_MAX`, 4096), on Stop, or when `turn.js` sees the stop sequence, in which
    case the tokens past the cut are rewound out of the context. A
@@ -459,6 +472,40 @@ therefore costs the peers' own hops instead of a UK↔Thailand round trip.
   opening, or one that has no context for the penalties after a repair moved
   it. In each case the enqueuer feeds that token itself and asks again. The
   Decoding setting (closed loop / round trip) switches the loop off.
+
+**Prefill** (`route.js` `sendFills()`). Every chunk of a prompt but the last is
+a prefill chunk (`fill: true`). Up to `PREFILL_WINDOW` (4) of them are in
+flight at once, so the peers on a path work on different chunks at the same
+time instead of waiting for each chunk's round trip. The last chunk follows as
+soon as the last prefill chunk is sent; it is the ordinary job that samples
+the first token and opens the loop.
+
+- **The last chunk commits the prompt.** Links are ordered and a runner runs a
+  session's jobs in order, so its answer means every chunk before it ran. A
+  lost chunk makes the next one fail `Runner.#checkFed`, which comes back as an
+  `err`. So `history` gains the whole prompt with that answer, and a failure
+  rebuilds with all of it. A rebuild sends its context the same way.
+- **No LM head for a prefill chunk.** The head runs no final norm, LM head or
+  sampling for it and reads nothing back. It still fills the MTP head's KV and
+  keeps its last row for the next job, then answers `filled`. The `filled`
+  answers only pace the window and report progress.
+- **The head samples one row.** A job other than a verify runs the final norm
+  and the LM head on its last row only, not on all of its rows.
+- **Repairs.** A local repair replays the boundary log up to the job it
+  re-sends, which covers any earlier chunks still in flight, and its `fix`
+  tells the enqueuer to stop waiting for them.
+- **A refused prompt.** A prompt refused for capacity partway through leaves
+  the chunks already sent (at most the window) to run on the peers before the
+  one that refused.
+- **Other chats.** Each prefill chunk can sit in a runner's queue ahead of
+  other chats' decode jobs, which is why the window is small. Runners take
+  queued jobs first come first served; `Runner.#next()` is where a policy that
+  runs other chats' decode jobs ahead of prefill chunks would go.
+- **Next for prefill speed:** the prefill GEMM. `matmulTiledSrc` and
+  `matmulTiledQ8Src` (`kernels.js`) are plain 16x16 shared-memory tiles, so a
+  64-row chunk reads each weight four times from memory, with no register
+  tiling or double buffering. pooled's register-tiled, double-buffered GEMM
+  made its prefill pass 1.64x faster.
 
 **Sampling** happens on the peer holding the head, which has the logits but no
 token ids. Each job's `opts` carry a short repetition summary (`jobOpts()`,
@@ -550,7 +597,11 @@ running are not held up behind it. One that has waited `WAIT_MS` (30 s) is
 refused with a `busy` error, as is a job that needs KV pages nobody idle can
 give up, and nothing repairs or rebuilds a `busy`. A hop whose link to the next peer is
 backed up refuses the same way: the peer is there, and a replay or a rebuild
-would only add to the queue that is full. When a chat is deleted, the enqueuer
+would only add to the queue that is full. So does a runner holding jobs for
+`MAX_QUEUE` (32) sessions, for a new one, or `MAX_SESSION_QUEUE` (8) jobs of
+one session. After a refusal, the same prompt's next chunk (already on its way)
+finds the cache behind it; it is refused as `busy` too, not as an evicted
+cache, so no repair runs a prompt the enqueuer has given up on. When a chat is deleted, the enqueuer
 releases its own cache and sends `free` along the pinned chain; idle eviction
 covers any `free` that never arrives. Starting a new chat or switching away
 frees nothing: the old chat is parked, and its caches stay until idle eviction
@@ -651,7 +702,9 @@ Known gaps:
   `SESSIONS` caps concurrent chats however the middle is split.
 - Reachability is not in the roster, so depth counted over peers that cannot
   reach each other is optimistic.
-- One job queue per runner, first come first served.
+- One job queue per runner, first come first served, so a long prompt's
+  prefill chunks delay other chats' decode jobs on the same peers (by at most
+  `PREFILL_WINDOW` chunks each).
 - A session waiting for a frame at one peer is idle at the peers before it, and
   can lose its frame there if it waits past `IDLE_MS`; its next job then comes
   back `no longer cached` and the chat is rebuilt.

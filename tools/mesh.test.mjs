@@ -81,7 +81,7 @@ const RECURRENT = /^R\d+$/;
 // The proxy Runner. Every guard under test is the real Runner's. The proxy
 // adds the toy forward pass and one ledger assertion that the real Runner
 // cannot make, because it never sees more than one job's context.
-function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null) {
+function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null, sessions = null) {
     // Each peer has its own GPU and trace. With a shared trace, a replay into
     // one peer while another is working would be recorded as one run.
     const { device, setFill, resetTrace, takeTrace, passes } = makeGpu();
@@ -97,7 +97,7 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null
         // always be taken, and the fuzz expects refusals to be immediate.
         // Waiting is tested in tools/stage.test.mjs.
         { lo, hi, have, nMax: 4 * T_MAX, tMax: T_MAX, slots, idleMs, waitMs: 0,
-          ...(specSlots != null && { specSlots }) });
+          ...(specSlots != null && { specSlots }), ...(sessions != null && { sessions }) });
 
     // `${session}|${tag}` -> the prefix fold, one entry per token position.
     // Stored by position, like the KV cache it models, so re-running a
@@ -319,7 +319,7 @@ class World {
     // every departure the mesh can absorb is absorbed, and a budget would make
     // it fail for reasons unrelated to routing.
     constructor({ maxRepairs, maxFixes, maxLocalReplay, hybrid = false, hybridRouter = hybrid,
-                  idleMs = 0, ackRate = Infinity, toyVocab = null } = {}) {
+                  idleMs = 0, ackRate = Infinity, toyVocab = null, prefillWindow } = {}) {
         // How many distinct tokens the toy model samples. A small one makes
         // replies repeat, so prompt lookup finds drafts and some are accepted.
         this.toyVocab = toyVocab;
@@ -342,6 +342,8 @@ class World {
         // When low, no context is short enough to repair locally, so a
         // departure goes to the enqueuer's rebuild.
         this.maxLocalReplay = maxLocalReplay;
+        // Prefill chunks of one prompt in flight (route.js PREFILL_WINDOW).
+        this.prefillWindow = prefillWindow;
         this.peers = [];          // the roster, shared by reference with every Mesh
         this.tabs = new Map();    // id -> { net, router, runner }
         this.zombies = new Set(); // peers whose links look open and drop everything
@@ -357,7 +359,7 @@ class World {
     // `lo === null` is a spectator: in the mesh, linked to the entry point,
     // never routed a job.
     join(id, lo = null, hi = null, { have = hi, slots = SLOTS, ready = true, closedLoop = true,
-                                     specSlots = null } = {}) {
+                                     specSlots = null, sessions = null } = {}) {
         const net = new Mesh({});
         net.ready.catch(() => {});          // never welcomed (the WebSocket is a stub)
         Object.assign(net, {
@@ -367,7 +369,7 @@ class World {
         });
 
         const runner = lo == null ? null
-            : peerRunner(this, id, lo, hi, have, slots, this.idleMs, specSlots);
+            : peerRunner(this, id, lo, hi, have, slots, this.idleMs, specSlots, sessions);
         const tab = { id, net, runner, repairs: 0, fixes: [], sessions: [],
                       progress: [], cancelled: false };
 
@@ -412,6 +414,7 @@ class World {
             ...(this.maxRepairs === undefined ? {} : { maxRepairs: this.maxRepairs }),
             ...(this.maxFixes === undefined ? {} : { maxFixes: this.maxFixes }),
             ...(this.maxLocalReplay === undefined ? {} : { maxLocalReplay: this.maxLocalReplay }),
+            ...(this.prefillWindow === undefined ? {} : { prefillWindow: this.prefillWindow }),
         });
         tab.router.eos = -1;      // no toy token is end-of-text
 
@@ -436,7 +439,7 @@ class World {
                          opts: sent.opts, loop: !!sent.loop, fed: sent.fed, auto: !!sent.auto,
                          drafts: sent.drafts, rowOpts: sent.rowOpts, tokens: sent.tokens,
                          nospec: !!sent.nospec,
-                         rb: !!sent.rb });
+                         rb: !!sent.rb, fill: !!sent.fill });
         const slow = this.slowLinks.get(`${from}>${to}`);
         const later = (fn) => {
             if (!slow) return queueMicrotask(fn);
@@ -583,13 +586,19 @@ class World {
 }
 
 // Prefill in T_MAX chunks, then decode, like respond() in peer.js but without
-// the tokenizer, the streaming or the turn cut.
+// the tokenizer, the streaming or the turn cut. The chunks go one job at a
+// time, or with `whole` as one prompt the router pipelines (sendFills()), as
+// engine.js sends it. `onChunk` gets each prefill chunk's answer.
 async function generate(tab, promptIds, budget, hooks = {}) {
     const opts = { temp: 0, topK: 0, ...hooks.opts };
     const out = [];
     let tok = null;
-    for (let i = 0; i < promptIds.length; i += T_MAX) {
-        ({ token: tok } = await tab.router.submit(promptIds.slice(i, i + T_MAX), opts));
+    if (hooks.whole) {
+        ({ token: tok } = await tab.router.submit(promptIds, opts, { onChunk: hooks.onChunk }));
+    } else {
+        for (let i = 0; i < promptIds.length; i += T_MAX) {
+            ({ token: tok } = await tab.router.submit(promptIds.slice(i, i + T_MAX), opts));
+        }
     }
     // A session is minted on a chat's first job. Record it when it appears.
     if (tab.router.session !== tab.sessions.at(-1)) tab.sessions.push(tab.router.session);
@@ -1349,11 +1358,12 @@ console.log('\nrecover() reports progress as the rebuild proceeds');
 
 console.log('\ncancelling a rebuild stops it before it finishes');
 {
-    // The Stop button during a rebuild. Cancellation is checked between
-    // chunks, so the test cancels on the first progress call, after one chunk
-    // has been accepted.
-    const LONG = Array.from({ length: T_MAX + 5 }, (_, i) => (i * 7) % 29);
-    const w = new World({ maxFixes: 0 });
+    // The Stop button during a rebuild. Cancellation is checked before each
+    // prefill chunk is sent, so the test cancels on the first progress call,
+    // after one chunk has been answered. With one chunk in flight at a time,
+    // the next is not sent yet.
+    const LONG = Array.from({ length: 2 * T_MAX + 5 }, (_, i) => (i * 7) % 29);
+    const w = new World({ maxFixes: 0, prefillWindow: 1 });
     w.join(0, 0, 4);
     w.join(1, 4, N);
     w.join(2, 4, N);
@@ -1949,11 +1959,11 @@ const CONTROL_OF = (hybrid) => (hybrid ? CONTROL_H : CONTROL_F);
 // history.
 async function streamed(tab, promptIds, budget, hooks = {}) {
     const opts = { ...GREEDY, ...hooks.opts };
-    const last = Math.floor((promptIds.length - 1) / T_MAX) * T_MAX;
+    const last = hooks.whole ? 0 : Math.floor((promptIds.length - 1) / T_MAX) * T_MAX;
     for (let i = 0; i < last; i += T_MAX) {
         await tab.router.submit(promptIds.slice(i, i + T_MAX), opts);
     }
-    const stream = tab.router.decode(promptIds.slice(last), opts, { budget });
+    const stream = tab.router.decode(promptIds.slice(last), opts, { budget, onChunk: hooks.onChunk });
     tab.stream = stream;
     hooks.onStream?.(stream);
     const out = [];
@@ -2596,6 +2606,14 @@ console.log('\nclosed loop: only the loop the enqueuer opened last may feed a se
     }
 }
 
+// Pin a runner's speed (ms per position, fixed ms per job) as its acks report
+// it, whatever its jobs measure.
+function fixSpeed(tab, p, o) {
+    for (const [k, v] of [['msPerPos', p], ['overheadMs', o]]) {
+        Object.defineProperty(tab.runner.real, k, { get: () => v, set: () => {}, configurable: true });
+    }
+}
+
 console.log('\nload-aware routing: sessions spread across peers that overlap');
 {
     const prompts = [PROMPT, [9, 8, 7, 6], [21, 3], [5, 5, 4, 3]];
@@ -2635,6 +2653,11 @@ console.log('\nload-aware routing: sessions spread across peers that overlap');
         const p1 = w.join(1, 2, N, { slots: 5 });
         for (const t of [p0, p1]) for (let i = 0; i < 2; i++) await t.runner.real.warmup(t.runner.lo, t.runner.lo + 1);
         ok('busy: warm-ups gave both peers a speed', p0.runner.msPerPos > 0 && p1.runner.msPerPos > 0);
+        // On the stub GPU a measured speed is this process's scheduling noise,
+        // and with two equal speeds every session's balanced cut is the same.
+        // So the speeds are fixed: peer 1, holding the head, is the slower.
+        fixSpeed(p0, 0.05, 0.03);
+        fixSpeed(p1, 0.1, 0.03);
         for (const id of [0, 1]) w.slow(id, 1);
         await streamed(w.join(99), prompts[0], 10);
         const cutsAt0 = recordCuts(p0);
@@ -2805,7 +2828,8 @@ async function fuzzOne(seed) {
     const spec = rand() < 0.5;
     const toyVocab = rand() < 0.5 ? int(2, 5) : null;
     const vocab = toyVocab ?? D.vocab;
-    const w = new World({ hybrid, maxRepairs: thrash ? 3 : 200, idleMs: thrash ? 0 : 25, toyVocab });
+    const w = new World({ hybrid, maxRepairs: thrash ? 3 : 200, idleMs: thrash ? 0 : 25, toyVocab,
+                          prefillWindow: int(1, 4) });
     const ranges = randomMesh(rand, { deep: rand() < 0.7 });
     ranges.forEach(([lo, hi], i) => w.join(i, lo, hi, { slots, closedLoop: rand() > 0.15,
         specSlots: rand() < 0.2 ? int(0, 2) : null }));
@@ -2842,20 +2866,28 @@ async function fuzzOne(seed) {
             const action = pick(['none', 'none', 'stop', 'cut']);
             const k = int(1, budget);
             const killAt = rand() < 0.3 ? int(0, budget - 1) : -1;
+            // The prompt as one job the router pipelines, or one chunk at a
+            // time. Sometimes a peer leaves while its prefill chunks are in
+            // flight.
+            const whole = rand() < 0.5;
+            const killFill = whole && rand() < 0.2;
             const before = [...a.router.history];
 
-            const between = (n) => {
-                if (n !== killAt) return;
+            const killOne = () => {
                 const victims = workers.filter((id) => w.tabs.has(id) && !askerIds.has(id) && w.survivable(id));
                 if (victims.length) w.kill(pick(victims));
             };
+            const between = (n) => { if (n === killAt) killOne(); };
+            let chunks = 0;
+            const onChunk = () => { if (killFill && chunks++ === 0) killOne(); };
 
             let reply, err = null;
             try {
                 reply = loop
-                    ? await streamed(a, prompt, budget, { between, ...(spec && { opts: { spec } }),
+                    ? await streamed(a, prompt, budget, { between, whole, onChunk, ...(spec && { opts: { spec } }),
                         ...(action === 'stop' && { stopAfter: k }), ...(action === 'cut' && { breakAfter: k }) })
-                    : await generate(a, prompt, action === 'none' ? budget : Math.min(k, budget), { between });
+                    : await generate(a, prompt, action === 'none' ? budget : Math.min(k, budget),
+                                     { between, whole, onChunk });
             } catch (e) { err = e; }
 
             const history = [...a.router.history];
@@ -3091,6 +3123,193 @@ for (const slots of [3, 1]) {
         got, controls);
     eq('  no ledger violations', w.violations, []);
     ok('  nothing left running', await quiet(w));
+}
+
+// --- Pipelined prefill ---
+//
+// A prompt longer than T_MAX goes as prefill chunks, several in flight, then
+// its last chunk (route.js sendFills()). The toy model does not depend on how
+// the context was chunked, so the reply must be the one-chunk-at-a-time
+// reference's.
+
+const LONG_PROMPT = Array.from({ length: 3 * T_MAX + 10 }, (_, i) => (i * 13 + 5) % D.vocab);
+
+// The most prefill chunks `asker` had unanswered at once, read off the wire.
+// Each `filled` is counted on its last hop, to the asker.
+function inFlight(w, asker) {
+    let open = 0, most = 0;
+    for (const m of w.wire) {
+        if (m.k === 'job' && m.fill && m.from === asker.id && m.pos === 0) most = Math.max(most, ++open);
+        else if (m.k === 'filled' && m.to === asker.id) open--;
+    }
+    return most;
+}
+
+console.log('\npipelined prefill: every cut gives the reference reply and context, both ways');
+for (const hybrid of [false, true]) {
+    const control = await generate(chain([0, N], {}, { hybrid }).asker, LONG_PROMPT, BUDGET);
+    let bad = [], n = 0, overlapped = 0;
+    for (const cuts of everyCut()) {
+        for (const loop of [false, true]) {
+            const { w, asker } = chain(cuts, {}, { hybrid });
+            const got = loop ? await streamed(asker, LONG_PROMPT, BUDGET, { whole: true })
+                             : await generate(asker, LONG_PROMPT, BUDGET, { whole: true });
+            n++;
+            const label = `${cuts.join('-')} ${loop ? 'loop' : 'round trip'}`;
+            const fills = w.wire.filter((m) => m.k === 'job' && m.fill && m.pos === 0).length;
+            if (JSON.stringify(got) !== JSON.stringify(control)) bad.push(`${label}: ${JSON.stringify(got)}`);
+            else if (JSON.stringify(asker.router.history) !== JSON.stringify([...LONG_PROMPT, ...control])) {
+                bad.push(`${label}: history`);
+            } else if (fills !== 3) bad.push(`${label}: ${fills} prefill chunks, not 3`);
+            else if (w.violations.length) bad.push(`${label}: ${w.violations[0]}`);
+            if (inFlight(w, asker) > 1) overlapped++;
+            if (asker.router.fills.size) bad.push(`${label}: prefill chunks still awaited`);
+        }
+    }
+    ok(`${hybrid ? 'hybrid' : 'full attention'}: every chain matches (${n} runs)`,
+        bad.length === 0, `${bad.length} wrong, e.g. ${bad[0]}\n        want ${JSON.stringify(control)}`);
+    ok('  and the chunks really overlapped', overlapped === n, `${overlapped} of ${n}`);
+}
+
+console.log('\npipelined prefill: the window bounds the chunks in flight');
+for (const prefillWindow of [1, 2, 4]) {
+    const { w, asker } = chain([0, 3, 6, N], {}, { prefillWindow });
+    for (const id of [0, 1, 2]) w.slow(id, 1);
+    const got = await streamed(asker, LONG_PROMPT, BUDGET, { whole: true });
+    eq(`window ${prefillWindow}: the reference reply`, got,
+        await generate(chain([0, N]).asker, LONG_PROMPT, BUDGET));
+    eq(`  at most ${Math.min(prefillWindow, 3)} chunks in flight`, inFlight(w, asker), Math.min(prefillWindow, 3));
+    eq('  no ledger violations', w.violations, []);
+}
+
+console.log('\npipelined prefill: the head runs no LM head for a prefill chunk');
+{
+    const { w, asker } = chain([0, 4, N]);
+    const answers = [];
+    await generate(asker, LONG_PROMPT, 2, { whole: true, onChunk: (a) => answers.push(a) });
+    eq('each prefill chunk was answered `filled`, without a token',
+        w.wire.filter((m) => m.k === 'filled' && m.to === asker.id).map((m) => [m.past, m.n]),
+        [[0, T_MAX], [T_MAX, T_MAX], [2 * T_MAX, T_MAX]]);
+    eq('and onChunk saw each one', answers.map((a) => a.n), [T_MAX, T_MAX, T_MAX]);
+    ok('with a trace from each peer on the path', answers.every((a) => a.trace.length === 2));
+    eq('only the last chunk and the decode jobs were answered with a token',
+        w.wire.filter((m) => m.k === 'tok' && m.to === asker.id).map((m) => m.past),
+        [3 * T_MAX, LONG_PROMPT.length, LONG_PROMPT.length + 1]);
+}
+
+console.log('\npipelined prefill: a peer that leaves mid-prefill costs no token');
+for (const [label, world] of [['local repair', {}], ['rebuild', { maxFixes: 0 }],
+                              ['hybrid, rebuild', { hybrid: true, maxFixes: 0 }]]) {
+    for (const loop of [false, true]) {
+        const control = await generate(chain([0, N], {}, world).asker, LONG_PROMPT, BUDGET);
+        const w = new World({ maxRepairs: 200, ...world });
+        w.join(0, 0, 3);
+        w.join(1, 3, 6);
+        w.join(2, 3, 6);
+        w.join(3, 6, N);
+        const asker = w.join(100);
+        let first = true;
+        const onChunk = () => {
+            if (!first) return;
+            first = false;
+            w.kill([1, 2].find((id) => w.tabs.get(id).runner.real.live.size > 0));
+        };
+        let got, err = null;
+        try {
+            got = loop ? await streamed(asker, LONG_PROMPT, BUDGET, { whole: true, onChunk })
+                       : await generate(asker, LONG_PROMPT, BUDGET, { whole: true, onChunk });
+        } catch (e) { err = e; }
+        const name = `${label}, ${loop ? 'loop' : 'round trip'}`;
+        ok(`${name}: the turn completes`, err === null, err?.message);
+        eq(`  with the reference reply`, got, control);
+        if (!world.maxFixes && world.maxFixes !== undefined) ok('  by a rebuild', asker.repairs > 0);
+        else ok('  repaired where it broke, without a rebuild', asker.repairs === 0 && asker.fixes.length > 0,
+                `${asker.repairs} rebuilds, ${asker.fixes.length} fixes`);
+        eq('  no ledger violations', w.violations, []);
+        ok('  nothing left running', await quiet(w));
+    }
+}
+
+console.log('\npipelined prefill: a silent peer mid-prefill is detected by its acks');
+{
+    const control = await generate(chain([0, N]).asker, LONG_PROMPT, BUDGET);
+    const w = new World({ maxRepairs: 200 });
+    w.join(0, 0, 3);
+    w.join(1, 3, 6);
+    w.join(2, 3, 6);
+    w.join(3, 6, N);
+    const asker = w.join(100);
+    let first = true;
+    const onChunk = () => {
+        if (!first) return;
+        first = false;
+        w.zombie([1, 2].find((id) => w.tabs.get(id).runner.real.live.size > 0));
+    };
+    const got = await streamed(asker, LONG_PROMPT, BUDGET, { whole: true, onChunk });
+    eq('the reference reply', got, control);
+    eq('no ledger violations', w.violations, []);
+}
+
+console.log('\npipelined prefill: speculative decoding fills the MTP head from prefill chunks too');
+for (const hybrid of [false, true]) {
+    const world = { hybrid, toyVocab: 3 };
+    const prompt = Array.from({ length: 2 * T_MAX + 7 }, (_, i) => [1, 2, 0][i % 3]);
+    const control = await streamed(chain([0, N], {}, world).asker, prompt, 30);
+    const { w, asker } = chain([0, 3, 6, N], {}, world);
+    const got = await streamed(asker, prompt, 30, { whole: true, opts: SPEC });
+    eq(`${hybrid ? 'hybrid' : 'full attention'}: plain decoding's reply`, got, control);
+    eq('  and context', asker.router.history, [...prompt, ...control]);
+    ok('  prefill chunks carried ids to the head', w.wire.some((m) => m.k === 'job' && m.fill && m.pos > 0));
+    eq('  no ledger violations', w.violations, []);
+}
+
+console.log('\npipelined prefill: a late error from an earlier turn is not this turn\'s');
+{
+    // A turn that fails partway through its prompt leaves prefill chunks in
+    // flight, and their errors can arrive during the chat's next turn, under
+    // the same session. One below where that turn's prompt starts is dropped.
+    // The same error at the prompt's own position is still taken.
+    const first = Array.from({ length: 70 }, (_, i) => (i * 5 + 1) % D.vocab);
+    const second = LONG_PROMPT.slice(0, 2 * T_MAX + 3);
+    for (const loop of [false, true]) {
+        for (const lateErr of [true, false]) {
+            const { w, asker } = chain([0, 4, N], {}, { maxRepairs: 200 });
+            await generate(asker, first, 2, { whole: true });
+            const at = asker.router.ctxLen;
+            const { session: s, key } = asker.router.conversation;
+            const run = loop ? streamed(asker, second, 3, { whole: true })
+                             : generate(asker, second, 3, { whole: true });
+            asker.router.route({ k: 'err', s, key, to: asker.id, from: 0, past: lateErr ? at - 1 : at,
+                                 msg: 'a refusal' }, null, null, 0);
+            await run;
+            const name = `${loop ? 'loop' : 'round trip'}, ${lateErr ? 'a late error' : 'an error for this prompt'}`;
+            if (lateErr) eq(`${name}: no rebuild`, asker.repairs, 0);
+            else ok(`${name}: rebuilds`, asker.repairs > 0);
+            eq('  the context gained the prompt and the reply', asker.router.ctxLen, at + second.length + 3);
+            eq('  no ledger violations', w.violations, []);
+        }
+    }
+}
+
+console.log('\npipelined prefill: other chats keep decoding while one prefills');
+{
+    const w = new World({ maxRepairs: 200 });
+    w.join(0, 0, 3, { slots: 5 });
+    w.join(1, 3, 6, { slots: 5 });
+    w.join(2, 6, N, { slots: 5 });
+    for (const id of [0, 1, 2]) w.slow(id, 1);
+    const short = [PROMPT, [9, 8, 7, 6]];
+    const controls = [];
+    for (const p of [...short, LONG_PROMPT]) controls.push(await generate(chain([0, N]).asker, p, 10));
+    const askers = [w.join(100), w.join(101), w.join(102)];
+    const got = await Promise.all([
+        streamed(askers[0], short[0], 10),
+        streamed(askers[1], short[1], 10),
+        streamed(askers[2], LONG_PROMPT, 10, { whole: true }),
+    ]);
+    eq('every reply is its own', got, controls);
+    eq('no ledger violations', w.violations, []);
+    ok('nothing left running', await quiet(w));
 }
 
 console.log(`\nclosed loop: the fuzz: ${FUZZ} random scenarios  (--fuzz-seed ${FUZZ_SEED})`);

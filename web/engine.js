@@ -34,6 +34,10 @@ const GROW_RETRY_MS = [15_000, 300_000];
 // status note and the pill print the same number the same way.
 const gib = (b) => `${(b / 2 ** 30).toFixed(2)} GiB`;
 
+// A prefill chunk's answer, as a profile sample (web/profile.js).
+const keepChunk = (samples, a) => samples.push({ kind: 'prefill', n: a.n, rt: a.rt,
+    ...(a.link && { link: a.link }), trace: a.trace ?? [] });
+
 export class ContextFullError extends Error {
     constructor(needed, room) {
         super(`this prompt needs ${needed} tokens and only ${room} are left in the ` +
@@ -682,17 +686,11 @@ export class Engine {
         const keep = (kind, n, a) => samples.push({ kind, n, rt: a.rt, loop: true, closed: a.closed,
             ...(a.link && { link: a.link }), trace: a.trace ?? [] });
 
-        // Every chunk but the last is plain prefill. The last opens the loop.
+        // The router sends every chunk but the last as prefill, several in
+        // flight. The last opens the loop.
         const last = Math.floor((promptIds.length - 1) / T_MAX) * T_MAX;
-        for (let i = 0; i < last; i += T_MAX) {
-            const chunk = promptIds.slice(i, i + T_MAX);
-            const r = await this.#router.submit(chunk, opts);
-            samples.push({ kind: 'prefill', n: chunk.length, rt: r.rt,
-                           ...(r.link && { link: r.link }), trace: r.trace ?? [] });
-            this.#emit('change');
-        }
-
-        const stream = this.#router.decode(promptIds.slice(last), opts, { budget });
+        const onChunk = (a) => { keepChunk(samples, a); this.#emit('change'); };
+        const stream = this.#router.decode(promptIds, opts, { budget, onChunk });
         this.#stream = stream;
         if (this.#stopRequested) stream.halt();
         const genIds = [];
@@ -727,14 +725,14 @@ export class Engine {
             samples.push({ kind, n, rt: r.rt, ...(r.link && { link: r.link }), trace: r.trace ?? [] });
             return r;
         };
-        // Prefill: T_MAX tokens per job. Every job returns a sampled token.
-        // Only the last chunk's is the first token of the reply.
+        // Prefill: the router sends every chunk but the last as prefill,
+        // several in flight. The last chunk's token is the first of the reply.
         let tok = null, eos = false, trace = null;
-        for (let i = 0; i < promptIds.length; i += T_MAX) {
-            const chunk = promptIds.slice(i, i + T_MAX);
-            ({ token: tok, eos } = keep('prefill', chunk.length, await this.#router.submit(chunk, opts)));
-            this.#emit('change');
-        }
+        const last = Math.floor((promptIds.length - 1) / T_MAX) * T_MAX;
+        const onChunk = (a) => { keepChunk(samples, a); this.#emit('change'); };
+        ({ token: tok, eos } = keep('prefill', promptIds.length - last,
+                                    await this.#router.submit(promptIds, opts, { onChunk })));
+        this.#emit('change');
         let answered = performance.now();
 
         const genIds = [];

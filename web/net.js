@@ -13,7 +13,7 @@
 //
 // See docs/architecture.md (Joining, Private meshes, Links, Wire format).
 
-import { holders, holding, covers, minDepth, served, coverage } from './split.js';
+import { holders, holding, covers, minDepth, served, coverage, PROTOCOL } from './split.js';
 import { GLOBAL } from './room.js';
 
 // Fallback ICE list. The signaling server sends the real list, TURN included,
@@ -224,7 +224,7 @@ export const SEND_CEILING = 12 * 1024 * 1024;
 // an answer per token, and a small model decodes at hundreds of tokens a
 // second per chat (the tiny test model: ~280). The limit is about ten times
 // that. Routing a header takes microseconds. The GPU is protected separately
-// by Runner's MAX_QUEUE.
+// by Runner's MAX_QUEUE and MAX_SESSION_QUEUE.
 //
 // A dropped message is handled like any lost message: its ack never arrives
 // and the sender repairs around this tab.
@@ -370,7 +370,7 @@ export class Mesh {
             if (gone || ws !== this.ws) return;
             this.#kick();
             // `join` is the first message on every socket: it names the mesh.
-            this.#ws({ type: 'join', v: 1, room: this.room.joinToken,
+            this.#ws({ type: 'join', v: PROTOCOL, room: this.room.joinToken,
                        ...(this.chats && { chats: this.chats }),
                        ...(this.askSessions && { sessions: this.askSessions }) });
         });

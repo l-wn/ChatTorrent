@@ -16,7 +16,7 @@
 //
 //   node tools/stage.test.mjs
 
-import { Runner, MAX_QUEUE } from '../web/model/stage.js';
+import { Runner, MAX_QUEUE, MAX_SESSION_QUEUE } from '../web/model/stage.js';
 import { device, D, L, N, SINGLE, BLOCK_TENSORS, marker, weightsFor, pieceFor,
          resetTrace, takeTrace, makeGpu, DH, LAYER_TYPES, hybridWeightsFor } from './stub-gpu.mjs';
 
@@ -492,6 +492,59 @@ console.log('\nreplay: the KV is written, nothing is sampled');
     eq('and is logged like one', mid.logs.get('b').get(4).len, 2);
 }
 
+console.log('\na prefill chunk: the KV is written, nothing is sampled');
+{
+    const gpu = makeGpu();
+    const r = new Runner(gpu.device, D, weightsFor(0, N), { lo: 0, hi: N, nMax: 64, tMax: 8, slots: 2, idleMs: 0 });
+    const job = (s, past, n, extra = {}) =>
+        ({ k: 'job', s, pos: 0, past, n, ids: Array(n).fill(1), ...extra });
+    const reads = [];
+    gpu.setFill((n) => { reads.push(n); return null; });
+    gpu.resetTrace();
+    const done = await r.run(job('a', 0, 8, { fill: true }), null);
+    gpu.setFill(null);
+    eq('a prefill chunk reaching the end of the line advances the cursor', done.at, N);
+    ok('and comes back `filled`, with neither a token nor hidden state',
+        done.filled === true && done.token === undefined && done.hidden === undefined);
+    eq('having dispatched no norm and no LM head', gpu.takeTrace(), ['wte', ...SINGLE.slice(1, 1 + L)]);
+    eq('and read nothing back', reads, []);
+    const next = await r.run(job('a', 8, 3, { opts: { temp: 0 } }), null);
+    ok('the job after it finds the KV rows it wrote', next.token !== undefined);
+
+    const mid = new Runner(gpu.device, D, weightsFor(0, 4), { lo: 0, hi: 4, nMax: 64, tMax: 8, slots: 2, idleMs: 0 });
+    const on = await mid.run(job('b', 0, 2, { fill: true }), null);
+    ok('a prefill chunk stopping short of the end is an ordinary job',
+        on.at === 4 && on.hidden?.length === 2 * D.hidden && !on.filled);
+    let err = null;
+    await r.run(job('c', 0, 3, { fill: true, drafts: [1, 1] }), null).catch((e) => { err = e; });
+    ok('and one carrying drafts is refused', /cannot carry drafts/.test(err?.message ?? ''), err?.message);
+}
+
+console.log('\nafter a capacity refusal, the same prompt\'s next chunk is refused too, not cold');
+{
+    // Four pages of four tokens. Chat `a` holds three and is not idle, so
+    // chat `b` gets one page and is refused for the next. Its chunk after
+    // that, already sent, finds the cache behind it.
+    const r = new Runner(device, D, weightsFor(0, N), { lo: 0, hi: N, nMax: 16, tMax: 4, slots: 1,
+                                                        sessions: 3, pageTokens: 4, idleMs: 1e6 });
+    const job = (s, past, n = 4) => ({ k: 'job', s, pos: 0, past, n, ids: Array(n).fill(1), opts: {} });
+    for (let p = 0; p < 12; p += 4) await r.run(job('a', p), null);
+    await r.run(job('b', 0), null);
+    const err = (j) => r.run(j, null).then(() => null, (e) => e);
+    const page = await err(job('b', 4));
+    ok('a chunk that needs a page none is free for is refused for capacity', page?.busy === true, page?.message);
+    const cold = r.counts.cold;
+    const next = await err(job('b', 8));
+    ok('the chunk after it is refused for capacity too', next?.busy === true, next?.message);
+    eq('and not counted cold', r.counts.cold, cold);
+    const other = await err(job('c', 4));
+    ok('a chat with no refusal here is still cold', other && !other.busy && /no longer cached/.test(other.message),
+        other?.message);
+    const behind = await err(job('b', 0));
+    ok('and a job of the refused chat at or below its cache is not refused for it', behind === null || !behind.busy,
+        behind?.message);
+}
+
 // --- Timing: model/gpuprof.js on the job path ---
 
 console.log('\ntiming: a profiled job dispatches exactly what an unprofiled one does');
@@ -728,7 +781,7 @@ console.log('\na chat with no frame waits in line for one, first come first serv
     {
         const { r, job, order } = make({ idleMs: 40, waitMs: 2000 });
         await job('a', 0);
-        r.queue = r.queue.then(() => sleep(80));     // a busy GPU, longer than idleMs
+        r.schedule(() => sleep(80));                  // a busy GPU, longer than idleMs
         const b = job('b', 0);                        // the newcomer, first in line
         let err = null;
         await job('a', 1).catch((e) => { err = e; });
@@ -821,12 +874,15 @@ console.log('\na job that does not fit the buffers is refused before any dispatc
 console.log('\na flooded runner refuses with `busy` instead of queueing without end');
 {
     const r = runner(0, N);
-    const job = (i) => r.run({ k: 'job', s: 'f', pos: 0, past: 0, n: 1, ids: [1], opts: {} }, null)
+    const job = (s = 'f') => r.run({ k: 'job', s, pos: 0, past: 0, n: 1, ids: [1], opts: {} }, null)
         .then(() => null, (e) => e);
     // Queued synchronously, so none has finished when the next arrives.
-    const all = await Promise.all(Array.from({ length: MAX_QUEUE + 3 }, (_, i) => job(i)));
-    const refused = all.filter((e) => e?.busy);
-    eq(`everything past ${MAX_QUEUE} is refused as busy`, refused.length, 3);
+    const one = await Promise.all(Array.from({ length: MAX_SESSION_QUEUE + 3 }, () => job()));
+    eq(`one session: everything past ${MAX_SESSION_QUEUE} jobs is refused as busy`,
+        one.filter((e) => e?.busy).length, 3);
+    const many = await Promise.all(Array.from({ length: MAX_QUEUE + 3 }, (_, i) => job(`s${i}`)));
+    eq(`many sessions: everything past ${MAX_QUEUE} sessions is refused as busy`,
+        many.filter((e) => e?.busy).length, 3);
     ok('and a job after the backlog drains runs', (await job()) === null);
 }
 
@@ -1072,8 +1128,12 @@ console.log('\nthe MTP draft head: a head holding it drafts after the sample');
     const drafted = await r.run(job(6, 1, { mtp: true, auto: true, loop: { id: 1, left: 5, spec: true } }), null);
     ok(`a speculative loop job comes back with ${drafted.mtp?.length} drafts`,
         Array.isArray(drafted.mtp) && drafted.mtp.length === 7, JSON.stringify(drafted.mtp));
+    gpu.resetTrace();
+    const pre = await r.run(job(7, 8, { mtp: true, fill: true }), null);
+    ok('a prefill chunk fills the head\'s KV too, and drafts nothing',
+        pre.filled === true && gpu.takeTrace().includes('M') && pre.mtp === undefined);
     // nMax is 64: after a sample at 60, drafts fit at 61 and 62 only.
-    for (let p = 7; p < 60; p += 8) await r.run(job(p, Math.min(8, 60 - p), { mtp: true }), null);
+    for (let p = 15; p < 60; p += 8) await r.run(job(p, Math.min(8, 60 - p), { mtp: true }), null);
     const far = await r.run(job(60, 1, { mtp: true, auto: true, loop: { id: 1, left: 5, spec: true } }), null);
     eq('the drafts stop short of the context window', far.mtp?.length, 2);
 }

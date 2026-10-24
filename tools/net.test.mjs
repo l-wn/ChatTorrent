@@ -12,6 +12,7 @@ import { webcrypto, createHmac } from 'node:crypto';
 // In a Node 18 module, WebCrypto is not a global as it is in a browser.
 globalThis.crypto ??= webcrypto;
 const { openRoom, newSecret } = await import('../web/room.js');
+const { PROTOCOL } = await import('../web/split.js');
 
 let pass = 0, fail = 0;
 const ok = (name, cond, detail = '') => {
@@ -1029,7 +1030,7 @@ function connect(room = null, extra = {}) {
         const t = setTimeout(() => r('open'), 2000);
         ws.on('close', (code) => { clearTimeout(t); r(code); });
     });
-    if (room !== false) ws.on('open', () => ws.send(JSON.stringify({ type: 'join', v: 1, room, ...extra })));
+    if (room !== false) ws.on('open', () => ws.send(JSON.stringify({ type: 'join', v: PROTOCOL, room, ...extra })));
     ws.on('message', (d) => {
         const m = JSON.parse(d);
         msgs.push(m);
@@ -1375,6 +1376,10 @@ console.log('\nsignal-server: joining a mesh');
     rude.ws.on('open', () => rude.send({ type: 'capacity', cap: 10 }));
     eq('a first message that is not a join is refused', await rude.closed, 4001);
 
+    const old = connect(false);
+    old.ws.on('open', () => old.send({ type: 'join', v: PROTOCOL - 1, room: null }));
+    eq('a join from a page with another protocol is refused', await old.closed, 4001);
+
     for (const [what, token] of [['a short token', 'abc'], ['a token with a bad character', '!'.repeat(43)],
                                  ['a token that is not a string', 42]]) {
         const bad = connect(token);
@@ -1658,7 +1663,7 @@ console.log('\nsignal-server: chats in memory');
     let ws = FakeWS.all.at(-1);
     ws.open();
     eq('the first frame on the socket is the join, with the room\'s token',
-        ws.sent[0], { type: 'join', v: 1, room: room.joinToken });
+        ws.sent[0], { type: 'join', v: PROTOCOL, room: room.joinToken });
     ok('and the secret itself is never sent', !JSON.stringify(ws.sent).includes(secret));
     ws.deliver(welcome(5, true));
     await m.ready;
@@ -1739,7 +1744,7 @@ console.log('\nsignal-server: chats in memory');
     ok('a dropped socket is reopened', FakeWS.all.length === before + 1);
     ws = FakeWS.all.at(-1);
     ws.open();
-    eq('and its first frame is the same join', ws.sent[0], { type: 'join', v: 1, room: room.joinToken });
+    eq('and its first frame is the same join', ws.sent[0], { type: 'join', v: PROTOCOL, room: room.joinToken });
     m.stop();
 
     console.log('\nMesh: fails closed');
@@ -1760,7 +1765,7 @@ console.log('\nsignal-server: chats in memory');
         const p = new Mesh({});
         const s1 = FakeWS.all.at(-1);
         s1.open();
-        eq('a global tab sends a join with no room', s1.sent[0], { type: 'join', v: 1, room: null });
+        eq('a global tab sends a join with no room', s1.sent[0], { type: 'join', v: PROTOCOL, room: null });
         s1.deliver(welcome(1, true));
         let why = null;
         await p.ready.catch((e) => { why = e.message; });

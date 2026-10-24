@@ -19,6 +19,11 @@ import { SPEC_COLS, N_MAX } from './split.js';
 // message too big for one datachannel send.
 export const T_MAX = 64;
 
+// Prefill chunks of one prompt in flight at once, before the last chunk. The
+// peers on a path then work on different chunks at the same time. Each chunk
+// can sit in a runner's queue ahead of other chats' jobs, so this stays small.
+export const PREFILL_WINDOW = 4;
+
 // A peer's load, as reported in its acks, is used for this long.
 const LOAD_TTL_MS = 10_000;
 
@@ -144,6 +149,7 @@ export function makeRouter({
     maxRepairs = MAX_REPAIRS,
     maxFixes = MAX_FIXES,
     maxLocalReplay = MAX_LOCAL_REPLAY,
+    prefillWindow = PREFILL_WINDOW,
     // Whether this peer, as the head, runs the closed loop. When off, it
     // answers loop jobs without feeding. Tests use this.
     closedLoop = true,
@@ -155,6 +161,8 @@ export function makeRouter({
     const acks = new Map();        // `${session}|${cursor}` -> { timer, to }: the hop
                                     // that has not yet acked a job
     const pending = new Map();     // session -> { resolve, reject, timer }
+    const fills = new Map();       // session -> a prompt's prefill chunks in flight
+                                    // (sendFills())
     const links = new Map();       // `${session}|${cursor}` -> { rtt, send }: timing of
                                     // the last hand-off across that boundary
     const loads = new Map();       // peer -> { w, p, at }: its active work in positions,
@@ -217,9 +225,9 @@ export function makeRouter({
         if (mine) return deliver(h, payload, from);
         if (h.to != null && !net.has(h.to)) return;   // its addressee left
 
-        // Relay a token only from a peer that could have sampled or carried it.
-        if (h.k === 'tok' && from != null && !net.mayAnswer(from)) {
-            console.warn(`dropped a tok for peer ${h.to} from peer ${from}, which cannot answer`);
+        // Relay an answer only from a peer that could have produced or carried it.
+        if ((h.k === 'tok' || h.k === 'filled') && from != null && !net.mayAnswer(from)) {
+            console.warn(`dropped a ${h.k} for peer ${h.to} from peer ${from}, which cannot answer`);
             return;
         }
 
@@ -388,7 +396,7 @@ export function makeRouter({
     // queue empties into SCTP before the bytes arrive.
     function armAck(key, h, payload, raw, to) {
         clearAck(key);   // a new send at this boundary replaces any earlier wait
-        const wait = { to, sentAt: performance.now(), queued: net.buffered?.(to) ?? 0 };
+        const wait = { to, past: h.past, sentAt: performance.now(), queued: net.buffered?.(to) ?? 0 };
         const bytes = raw?.byteLength ?? payload?.byteLength ?? 0;
         const first = ackTimeout + bytes / ackRate * 1000;
         const expire = () => {
@@ -491,6 +499,7 @@ export function makeRouter({
     function forget(s) {
         drop(s);
         own.delete(s);
+        fills.get(s)?.fail(Object.assign(new Error('the chat was closed'), { cancelled: true }));
         const job = pending.get(s);
         if (!job) return;
         clearTimeout(job.timer);
@@ -562,6 +571,13 @@ export function makeRouter({
         return false;
     }
 
+    // The error an `err` answer reports.
+    function errOf(h) {
+        const err = new Error(`peer ${h.from ?? ''}: ${h.msg}`);
+        if (h.busy) err.busy = true;
+        return err;
+    }
+
     // This message cannot be sent on. For a job, answer the sender with an
     // `err` now so it does not wait for the timeout. An undeliverable answer
     // is dropped.
@@ -578,7 +594,7 @@ export function makeRouter({
         // Back one hop, to the peer that handed the job over. `h.from` covers
         // the enqueuer's own job.
         const back = upstream.get(`${h.s}|${h.pos}`) ?? h.from;
-        route({ k: 'err', s: h.s, key: h.key, to: back, from: net.id, msg: why,
+        route({ k: 'err', s: h.s, key: h.key, to: back, from: net.id, past: h.past, msg: why,
                 busy: busy || undefined });
     }
 
@@ -592,7 +608,7 @@ export function makeRouter({
             if (from != null && !h.replay) {
                 const r = runner();
                 const round = (x) => Math.round(x * 100) / 100;
-                net.send(from, { k: 'ack', s: h.s, to: from, at: h.pos,
+                net.send(from, { k: 'ack', s: h.s, to: from, at: h.pos, past: h.past,
                                  ...(Number.isFinite(r?.load) && {
                                      w: r.load, n: r.active, q: round(r.queueMs),
                                      ...(r.msPerPos != null && { p: round(r.msPerPos) }),
@@ -612,8 +628,9 @@ export function makeRouter({
             const key = `${h.s}|${h.at}`;
             const w = acks.get(key);
             // Ignore an ack from a peer other than the one being waited on
-            // (the wait can be re-armed for another peer after a repair).
-            if (w && w.to === from) {
+            // (the wait can be re-armed for another peer after a repair), or
+            // for an earlier prefill chunk than the one being waited on.
+            if (w && w.to === from && (h.past === undefined || h.past === w.past)) {
                 // The receiver acks before any GPU work, so this is the hop's
                 // network round trip. It is reported on the next job across
                 // this boundary (runJob), since this job's trace has left.
@@ -655,12 +672,33 @@ export function makeRouter({
         // Another peer repaired a hand-off for this chat. Handled before the
         // lookup below because the job is still in flight.
         if (h.k === 'fix') {
+            const f = fills.get(h.s);
+            if (f && h.key === f.key) f.fixed(h);
             if (h.s === conv.session && h.key === conv.key) onFix(h);
             return;
         }
 
-        if (h.k === 'tok' && from != null && !net.mayAnswer(from)) {
-            return console.warn(`dropped a tok from peer ${from}, which cannot answer`);
+        if ((h.k === 'tok' || h.k === 'filled') && from != null && !net.mayAnswer(from)) {
+            return console.warn(`dropped a ${h.k} from peer ${from}, which cannot answer`);
+        }
+
+        // A prefill chunk reached the end of the line.
+        if (h.k === 'filled') {
+            const f = fills.get(h.s);
+            if (f && h.key === f.key) f.answer(h);
+            return;
+        }
+
+        // An `err` for a job below where the current prompt started is late:
+        // a prefill chunk of an earlier turn of this chat, still in flight
+        // when that turn failed. It is not about the jobs now waiting.
+        const late = (from) => h.k === 'err' && h.past < from;
+
+        // An error stops the prompt's remaining prefill chunks. The job or
+        // stream it belongs to handles it below.
+        if (h.k === 'err') {
+            const f = fills.get(h.s);
+            if (f && h.key === f.key && !late(f.from)) f.fail(errOf(h));
         }
 
         // An answer in a reply this tab is streaming. Handled synchronously
@@ -670,6 +708,7 @@ export function makeRouter({
             if (h.key !== stream.key) {
                 return console.warn(`dropped a ${h.k} for ${h.s} with the wrong key`);
             }
+            if (late(stream.from)) return console.warn(`dropped a late err for ${h.s} at ${h.past}: ${h.msg}`);
             return h.k === 'tok' ? accept(stream, h) : failed(stream, h);
         }
 
@@ -684,14 +723,11 @@ export function makeRouter({
         if (job && h.k === 'tok' && h.past !== undefined && h.past !== job.past) {
             return console.warn(`dropped a late tok for ${h.s} (past ${h.past}, waiting on ${job.past})`);
         }
+        if (job && late(job.from)) return console.warn(`dropped a late err for ${h.s} at ${h.past}: ${h.msg}`);
         if (job) {
             pending.delete(h.s);
             clearTimeout(job.timer);
-            if (h.k === 'err') {
-                const err = new Error(`peer ${h.from ?? ''}: ${h.msg}`);
-                if (h.busy) err.busy = true;
-                job.reject(err);
-            }
+            if (h.k === 'err') job.reject(errOf(h));
             else job.resolve(h);
             return;
         }
@@ -700,9 +736,10 @@ export function makeRouter({
 
         // An `err` about a hand-off this peer made downstream: a dead next hop
         // or an evicted cache. This peer holds the log for that boundary, so
-        // it tries a local repair. `outbound` names the boundary and the job
-        // to re-send. The job's payload is the log's tail (one job per session
-        // is in flight).
+        // it tries a local repair. `outbound` names the boundary and the last
+        // job sent across it, which is re-sent with the log's tail as its
+        // payload. The replay before it covers any earlier prefill chunks
+        // still in flight.
         //
         // Skipped for this tab's own sessions: either the timeout fired and
         // recover() is rebuilding, or the chat is parked and left to idle
@@ -753,6 +790,10 @@ export function makeRouter({
         // A session that ran here before keeps its cut.
         const cut = r.cuts?.get(h.s)?.get(pos);
         if (cut !== undefined) return cut;
+        // So does a later prefill chunk of a session whose first is still
+        // queued here. It is not counted as another session.
+        const prior = planned.get(h.s);
+        if (prior?.pos === pos) return prior.cut;
 
         // Every position I could stop at and who can pick it up there, e.g.
         // `{ 11: [c], 12: [d], 13: [q, f], 15: [] }`. Walk back from the
@@ -778,7 +819,7 @@ export function makeRouter({
         const me = loadOf(net.id);
         const them = ok.map((c) => loadOf(c.who));
         const take = (c) => {
-            planned.set(h.s, { n: c.at - pos, at: performance.now() });
+            planned.set(h.s, { n: c.at - pos, at: performance.now(), pos, cut: c.at });
             assign(c.who, net.reach(c.who, c.at));
             return c.at;
         };
@@ -871,6 +912,11 @@ export function makeRouter({
                 // Packing and sending time on this tab, stored with the RTT.
                 if (!h.replay) put(links, out, { ...links.get(out), send: round(performance.now() - t3) });
             }
+            else if (r.filled) {
+                // A prefill chunk reached the end of the line. The answer only
+                // paces the enqueuer: the prompt's last chunk is what commits it.
+                route({ k: 'filled', s: h.s, key: h.key, to: h.from, past: h.past, n: h.n, trace });
+            }
             // Neither: a replay reached the end of the line. Nobody is waiting.
         } catch (err) {
             // A duplicate of a loop job the session is already past. Nobody is
@@ -883,7 +929,7 @@ export function makeRouter({
             // nothing on the way can repair it, and in the closed loop the
             // entry's upstream is the head, so walking back would loop.
             route({ k: 'err', s: h.s, key: h.key, to: err.nospec ? h.from : from ?? h.from, from: net.id,
-                    msg: err.message, busy: err.busy || undefined,
+                    past: h.past, msg: err.message, busy: err.busy || undefined,
                     nospec: err.nospec || undefined });
         }
     }
@@ -1028,14 +1074,18 @@ export function makeRouter({
                  ctx: [...c.history, ...ids] };
     }
 
-    // One job per session is in flight at a time, so the session id matches
-    // the answer to the request.
+    // One answered job per session is in flight at a time, so the session id
+    // matches the answer to the request. A prompt's prefill chunks before it
+    // are tracked by sendFills().
     //
     // The answer comes back with `rt`, the time from submit to answer on this
     // tab's clock, and `link`, the timing of this tab's own hand-off at
     // position 0. `prof` asks every peer on the path to time the job on its
     // GPU (model/gpuprof.js).
-    function submitJob(ids, past, opts, loop = null) {
+    // `prompt`: the whole prompt `ids` ends, for the repetition summary when
+    // its earlier chunks are not yet in the history. `from`: where that
+    // prompt starts; an `err` below it is late (see deliver()).
+    function submitJob(ids, past, opts, loop = null, prompt = ids, from = past) {
         const s = conv.session, k = conv.key;
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
@@ -1049,10 +1099,10 @@ export function makeRouter({
                 rt: Math.round((performance.now() - t0) * 100) / 100,
                 ...(links.has(`${s}|0`) && { link: links.get(`${s}|0`) }),
             });
-            pending.set(s, { resolve: answer, reject, timer, key: k, past });
+            pending.set(s, { resolve: answer, reject, timer, key: k, past, from });
             route({
                 k: 'job', s, key: k, from: net.id, pos: 0, past, n: ids.length, ids,
-                opts: optsFor(ids, opts),
+                opts: optsFor(prompt, opts),
                 prof: opts.prof || undefined,
                 ...(loop && { loop }),
                 // The MTP head fills its KV from every job, prefill included.
@@ -1070,7 +1120,10 @@ export function makeRouter({
     //
     // A job that fails for good abandons its session (abandon()). Jobs of it
     // may be running, so the session is not used again.
-    async function submit(ids, opts) {
+    //
+    // `ids` may be a whole prompt of any length (see sendPrompt()). `onChunk`
+    // gets the answer to each of its prefill chunks.
+    async function submit(ids, opts, { onChunk = null } = {}) {
         const c = conv;
         if (c.history.length && (c.session == null || c.stale)) {
             return settle(c, rebuild(ids, opts, c.stale ? 'rewind' : 'resume'));
@@ -1078,7 +1131,7 @@ export function makeRouter({
         if (c.session == null) newSession(c);
         let r;
         try {
-            r = await submitJob(ids, c.history.length, opts);
+            r = await sendPrompt(c, ids, opts, { onChunk });
         } catch (err) {
             // A capacity refusal is thrown to the caller. The context is still
             // cached and a rebuild would need more capacity. The caller waits
@@ -1089,6 +1142,115 @@ export function makeRouter({
         c.history.push(...ids);
         c.parked = false;
         return r;
+    }
+
+    // --- Prefill: a prompt longer than one job ---
+    //
+    // A prompt is sent in T_MAX chunks. Every chunk but the last is a prefill
+    // chunk (`fill`): the head samples nothing and answers `filled`, and up
+    // to `prefillWindow` of them are in flight at once. The last chunk is an
+    // ordinary job, sent right after the last prefill chunk. Links are
+    // ordered and runners run a session's jobs in order, so its answer means
+    // every chunk before it ran. A lost chunk makes the next one fail
+    // Runner.#checkFed, which comes back as an `err`. So `history` gains the
+    // whole prompt with that answer, and a failure rebuilds with all of it.
+
+    // Where a prompt of `n` tokens starts its last chunk.
+    const commitAt = (n) => Math.floor((n - 1) / T_MAX) * T_MAX;
+
+    // Send `ids` as prefill chunks at `past0`, holding at most
+    // `prefillWindow` unanswered. `sent` resolves once the last is sent, and
+    // rejects on an `err` for the session, a chunk's timeout, cancellation,
+    // or the session being forgotten. Those after the last is sent set
+    // `error`. Call `close()` once the last chunk is answered or has failed.
+    //
+    // `cancellable`: a rebuild checks isCancelled() before each chunk.
+    function sendFills(c, ids, past0, opts, { onChunk = null, cancellable = false } = {}) {
+        const s = c.session, key = c.key;
+        const waiting = new Map();     // past -> { n, t0, timer }
+        let wake = null, error = null, closed = false;
+        const poke = () => { const w = wake; wake = null; w?.(); };
+        const close = () => {
+            if (closed) return;
+            closed = true;
+            for (const w of waiting.values()) clearTimeout(w.timer);
+            waiting.clear();
+            if (fills.get(s) === f) fills.delete(s);
+            poke();
+        };
+        const done = (past) => {
+            const w = waiting.get(past);
+            if (!w) return null;
+            clearTimeout(w.timer);
+            waiting.delete(past);
+            return w;
+        };
+        const f = {
+            key,
+            from: past0,
+            answer(h) {
+                const w = done(h.past);
+                if (!w) return;
+                onChunk?.({ n: w.n, rt: Math.round((performance.now() - w.t0) * 100) / 100,
+                            trace: h.trace ?? [],
+                            ...(links.has(`${s}|0`) && { link: links.get(`${s}|0`) }) });
+                poke();
+            },
+            // A local repair replayed every row before `rows`. A replay is
+            // not answered, so those chunks are no longer awaited.
+            fixed(h) {
+                for (const past of [...waiting.keys()]) if (past < h.rows) done(past);
+                poke();
+            },
+            fail(err) {
+                if (closed) return;
+                error = err;
+                close();
+            },
+        };
+        fills.set(s, f);
+
+        const sent = (async () => {
+            for (let i = 0; i < ids.length; i += T_MAX) {
+                while (!closed && waiting.size >= prefillWindow) await new Promise((res) => { wake = res; });
+                if (!closed && cancellable && isCancelled()) {
+                    f.fail(Object.assign(new Error('rebuild cancelled'), { cancelled: true }));
+                }
+                if (closed) throw error ?? new Error('the prompt was stopped');
+                const chunk = ids.slice(i, i + T_MAX);
+                const past = past0 + i;
+                const timer = setTimeout(() => f.fail(new Error(
+                    `no answer from the mesh after ${jobTimeout / 1000}s. A peer probably left.`)), jobTimeout);
+                waiting.set(past, { n: chunk.length, t0: performance.now(), timer });
+                // No sampler settings: nothing is sampled. `ids` reach the
+                // head only for the MTP head (`mtp`).
+                route({
+                    k: 'job', s, key, from: net.id, pos: 0, past, n: chunk.length, ids: chunk,
+                    fill: true,
+                    prof: opts.prof || undefined,
+                    ...(opts.spec && { mtp: true }),
+                });
+            }
+            if (closed) throw error ?? new Error('the prompt was stopped');
+        })();
+        // `error`: why the chunks failed, which may be after the last was sent.
+        return { sent, close, get error() { return error; } };
+    }
+
+    // Send a prompt at the end of `c`'s history: its prefill chunks, then the
+    // last chunk as the job that answers. Resolves with that answer. The
+    // caller adds `ids` to the history.
+    async function sendPrompt(c, ids, opts, { onChunk = null, cancellable = false } = {}) {
+        const past = c.history.length, cut = commitAt(ids.length);
+        if (!cut) return submitJob(ids, past, opts);
+        const pre = sendFills(c, ids.slice(0, cut), past, opts, { onChunk, cancellable });
+        try {
+            await pre.sent;
+            if (pre.error) throw pre.error;
+            return await submitJob(ids.slice(cut), past + cut, opts, null, ids, past);
+        } finally {
+            pre.close();
+        }
     }
 
     // Await a rebuild. If it fails, abandon what it left behind.
@@ -1151,9 +1313,9 @@ export function makeRouter({
     // the failed job owed. This costs a full prefill, so onRepair and
     // onProgress report it.
     //
-    // `finish`, from a stream, sends the last chunk itself as the job that
-    // reopens the loop. It resolves once the stream has taken its answer and
-    // added the chunk to the history.
+    // `finish`, from a stream, sends the context itself, its last chunk as the
+    // job that reopens the loop. It resolves once the stream has taken that
+    // answer and added the context to the history.
     async function rebuild(ids, opts, reason, err = null, finish = null) {
         const c = conv;
         const ctx = [...c.history, ...ids];
@@ -1164,25 +1326,24 @@ export function makeRouter({
         if (c.session != null) (err ? forget : retire)(c.session);
         newSession(c);
         c.parked = c.stale = false;
-        // History is refilled chunk by chunk, so after a partial failure it
-        // matches what the new session's runners hold.
+        // The history is empty until the context's last chunk is answered,
+        // so after a failure it matches what the new session's runners hold.
         c.history.length = 0;
 
+        // Progress counts the prefill chunks answered so far.
+        let fed = 0;
+        const onChunk = (a) => { fed += a.n; onProgress(fed, ctx.length); onChange(); };
         let r = null;
         try {
-            for (let i = 0; i < ctx.length; i += T_MAX) {
-                // Checked between chunks only.
-                if (isCancelled()) throw Object.assign(new Error('rebuild cancelled'), { cancelled: true });
-                const chunk = ctx.slice(i, i + T_MAX);
-                if (finish && i + T_MAX >= ctx.length) {
-                    r = await finish(chunk);
-                } else {
-                    r = await submitJob(chunk, c.history.length, opts);
-                    c.history.push(...chunk);
-                }
-                onProgress(c.history.length, ctx.length);
-                onChange();
+            if (isCancelled()) throw Object.assign(new Error('rebuild cancelled'), { cancelled: true });
+            if (finish) {
+                r = await finish(ctx, onChunk);
+            } else {
+                r = await sendPrompt(c, ctx, opts, { onChunk, cancellable: true });
+                c.history.push(...ctx);
             }
+            onProgress(c.history.length, ctx.length);
+            onChange();
         } catch (e) {
             // The chat's history before this turn, for abandon() to restore.
             e.history = ctx.slice(0, ctx.length - ids.length);
@@ -1210,9 +1371,12 @@ export function makeRouter({
     // is sent a halt in case it is running. A head that does not close the
     // loop answers with `fed` unset, and the stream feeds that token itself.
 
-    function decode(ids, opts, { budget }) {
+    //
+    // `ids` may be a whole prompt of any length (see sendPrompt()). `onChunk`
+    // gets the answer to each of its prefill chunks.
+    function decode(ids, opts, { budget, onChunk = null }) {
         const st = {
-            c: conv, opts, budget,
+            c: conv, opts, budget, onChunk,
             s: null, key: null,
             sent: 0,              // generated tokens handed to the mesh to feed
             feeding: null,        // the ids of the job whose answer is awaited
@@ -1223,6 +1387,9 @@ export function makeRouter({
             queue: [], waiters: [], timer: null,
             at: performance.now(),
             first: null,          // rebuild()'s wait on the chunk that reopens the loop
+            fills: null,          // the prompt's prefill chunks in flight (sendFills())
+            from: 0,              // the history's length at the last send(); an
+                                  // `err` below it is late (see deliver())
         };
         begin(st, ids);
         return streamOf(st);
@@ -1236,15 +1403,15 @@ export function makeRouter({
             return restart(st, ids, c.stale ? 'rewind' : 'resume', null);
         }
         if (c.session == null) newSession(c);
-        send(st, ids);
+        send(st, ids, false, { onChunk: st.onChunk });
     }
 
     // A failed rebuild is retried while the turn's repair budget lasts.
     // settle() has dropped the partial session and restored the history.
     function restart(st, ids, reason, err) {
-        const reopen = (chunk) => new Promise((resolve, reject) => {
+        const reopen = (ctx, onChunk) => new Promise((resolve, reject) => {
             st.first = { resolve, reject };
-            send(st, chunk);
+            send(st, ctx, false, { onChunk, cancellable: true });
         });
         settle(st.c, rebuild(ids, st.opts, reason, err, reopen)).catch((e) => {
             if (st.done) return;
@@ -1254,27 +1421,46 @@ export function makeRouter({
         });
     }
 
-    // One job of the stream: the prompt's chunk, or a token the head did not
-    // feed. `left` is how many tokens the head may feed after it.
+    // One job of the stream: the prompt, or a token the head did not feed.
+    // A prompt longer than T_MAX goes as prefill chunks first, and its last
+    // chunk is the job (see sendFills()). `left` is how many tokens the head
+    // may feed after it.
     // `rb`: re-sending a token whose verify job was refused (`nospec`), so
     // the peers that ran the verify roll it back.
-    function send(st, ids, rb = false) {
+    function send(st, ids, rb = false, { onChunk = null, cancellable = false } = {}) {
         const c = st.c;
         st.s = c.session;
         st.key = c.key;
         st.feeding = ids;
-        st.expect = c.history.length;
+        const past = c.history.length, cut = commitAt(ids.length);
+        st.expect = past + cut;
+        st.from = past;
         streams.set(st.s, st);
-        arm(st);
         const opts = st.nospec ? { ...st.opts, spec: false } : st.opts;
-        route({
-            k: 'job', s: st.s, key: st.key, from: net.id, pos: 0, past: st.expect,
-            n: ids.length, ids, opts: optsFor(ids, opts, c),
-            prof: opts.prof || undefined,
-            loop: loopFor(ids, opts, st.budget - st.sent, c),
-            ...(rb && { rb }),
-            ...(st.opts.spec && { mtp: true }),
-        });
+        const job = () => {
+            arm(st);
+            // The summary and the loop's context cover the whole prompt.
+            route({
+                k: 'job', s: st.s, key: st.key, from: net.id, pos: 0, past: st.expect,
+                n: ids.length - cut, ids: ids.slice(cut), opts: optsFor(ids, opts, c),
+                prof: opts.prof || undefined,
+                loop: loopFor(ids, opts, st.budget - st.sent, c),
+                ...(rb && { rb }),
+                ...(st.opts.spec && { mtp: true }),
+            });
+        };
+        if (!cut) return job();
+        const pre = sendFills(c, ids.slice(0, cut), past, opts, { onChunk, cancellable });
+        st.fills = pre;
+        // Either may come after the stream has failed and moved on.
+        const fail = (e) => { if (st.fills === pre && !st.done) failed(st, e); };
+        pre.sent.then(() => (pre.error ? fail(pre.error) : st.fills === pre && !st.done && job()), fail);
+    }
+
+    // The prompt's prefill chunks are no longer awaited.
+    function settleFills(st) {
+        st.fills?.close();
+        st.fills = null;
     }
 
     // Per-answer timeout. Acks and errors detect most failures first.
@@ -1293,6 +1479,7 @@ export function makeRouter({
             return;
         }
         clearTimeout(st.timer);
+        settleFills(st);
         const c = st.c;
         // A verify job's answer: the drafts it accepted are part of the
         // context (and of the reply) as well as the job's own first id.
@@ -1346,6 +1533,7 @@ export function makeRouter({
     function failed(st, h) {
         if (st.done) return;
         clearTimeout(st.timer);
+        settleFills(st);
         // A peer had no room to verify drafts. Nothing broke: re-send the
         // token the head fed, plain, and decode the rest of the turn plain.
         if (h.nospec && !st.first) {
@@ -1400,6 +1588,7 @@ export function makeRouter({
     function finish(st, reason, error = null) {
         if (st.done) return;
         st.done = true;
+        settleFills(st);
         st.reason = reason;
         st.error = error;
         clearTimeout(st.timer);
@@ -1457,7 +1646,7 @@ export function makeRouter({
     }
 
     // Whether a reply is being generated in this conversation.
-    const busy = (c) => (c.session != null && pending.has(c.session))
+    const busy = (c) => (c.session != null && (pending.has(c.session) || fills.has(c.session)))
         || [...streams.values()].some((st) => st.c === c && !st.done);
 
     // Make `c` the active conversation. Nothing is freed or forgotten. The
@@ -1519,7 +1708,7 @@ export function makeRouter({
         resetRepairs() { repairs = 0; },   // per turn, not per session
 
         // Live maps, for tests and diagnostics.
-        plan, hops, routes, upstream, outbound, fixes, acks, pending, links, heading, streams,
+        plan, hops, routes, upstream, outbound, fixes, acks, pending, fills, links, heading, streams,
 
         get session() { return conv.session; },
         get conversation() { return conv; },
