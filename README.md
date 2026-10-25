@@ -2,7 +2,7 @@
 
 <img src="site/favicon.svg" alt="" width="72" height="72" />
 
-# ChatTorrent
+# ClusterChat
 
 **Run a 27B open model on the graphics cards your group already has, in the browser.**<br />
 Everyone lends part of their GPU. Everyone gets their own chat.
