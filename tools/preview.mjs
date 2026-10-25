@@ -19,7 +19,7 @@ const TYPES = {
     '.webmanifest': 'application/manifest+json', '.png': 'image/png', '.jpg': 'image/jpeg',
 };
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; " +
-    "connect-src 'self' https://weights.chattorrent.net; manifest-src 'self'; object-src 'none'; " +
+    "connect-src 'self' https://weights.clusterchat.io; manifest-src 'self'; object-src 'none'; " +
     "base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 const isFile = async (p) => { try { return (await stat(p)).isFile(); } catch { return false; } };

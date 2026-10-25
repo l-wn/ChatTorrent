@@ -66,7 +66,7 @@ caddy run --config Caddyfile.dev
 ```
 
 `./start.sh dev` does the same in one step, reading `CHAT_PASS_HASH` (and
-anything else) from `~/.config/chattorrent/env` (see *Configuration*).
+anything else) from `~/.config/clusterchat/env` (see *Configuration*).
 
 Then open:
 
@@ -143,7 +143,7 @@ Any other reverse proxy works too, as long as it passes WebSocket upgrades on
 
 **Run the signaling server** on `127.0.0.1:8080` (`node signal-server.js`)
 with at least `ALLOWED_ORIGINS=https://<your-domain>`. Its default is
-`https://chattorrent.net`, which your pages won't match.
+`https://clusterchat.io`, which your pages won't match.
 
 **Set up TURN.** By default `/chat` links tabs only through a TURN relay, and
 the signaling server hands each peer the credentials in its welcome. Without
@@ -177,11 +177,11 @@ and `restart` rebuild `dist/` first). You write the units yourself:
 
 | unit | runs |
 |---|---|
-| `chattorrent-signal` | `node signal-server.js`, `WorkingDirectory=` the repo |
-| `chattorrent-caddy` | `caddy run`, `WorkingDirectory=` the repo (picks up `Caddyfile`) |
-| `chattorrent-cloudflared` | `cloudflared tunnel --config ~/.cloudflared/config.yml run` |
+| `clusterchat-signal` | `node signal-server.js`, `WorkingDirectory=` the repo |
+| `clusterchat-caddy` | `caddy run`, `WorkingDirectory=` the repo (picks up `Caddyfile`) |
+| `clusterchat-cloudflared` | `cloudflared tunnel --config ~/.cloudflared/config.yml run` |
 
-The first two load `EnvironmentFile=%h/.config/chattorrent/env`.
+The first two load `EnvironmentFile=%h/.config/clusterchat/env`.
 
 ## 6. Host the weights
 
@@ -224,7 +224,7 @@ without a hard reload.
 
 ## Configuration
 
-The deploy reads `~/.config/chattorrent/env` (mode 600, outside the repo),
+The deploy reads `~/.config/clusterchat/env` (mode 600, outside the repo),
 plain `KEY=value` lines:
 
 ```bash
@@ -244,7 +244,7 @@ Signaling server environment:
 |---|---|---|
 | `PORT` | 8080 | |
 | `HOST` | 127.0.0.1 | `0.0.0.0` to accept sockets directly rather than only through the proxy |
-| `ALLOWED_ORIGINS` | `https://chattorrent.net` | comma-separated page origins that may open a socket; any `localhost` port is always allowed |
+| `ALLOWED_ORIGINS` | `https://clusterchat.io` | comma-separated page origins that may open a socket; any `localhost` port is always allowed |
 | `MAX_CONN_PER_IP` | 16 | sockets per client address, by Cloudflare's `CF-Connecting-IP` (uncapped without it) |
 | `WEIGHTS_URL` | from `checkpoint.json` | override the checkpoint URL |
 | `MANIFEST` | `./<url>/manifest.json` for a same-origin URL | the server's own copy of the manifest |
@@ -261,7 +261,7 @@ Signaling server environment:
 | `MAX_PRIVATE_CTX` | 32768 | cap on a private mesh creator's "Chat length" |
 
 Caddy environment: `WEIGHTS_ORIGIN` (default
-`https://weights.chattorrent.net`), and for `Caddyfile.dev`, `CHAT_PASS_HASH`
+`https://weights.clusterchat.io`), and for `Caddyfile.dev`, `CHAT_PASS_HASH`
 and `SIGNAL_PORT` (default 8081).
 
 ## Troubleshooting

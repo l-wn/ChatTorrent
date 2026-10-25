@@ -7,12 +7,12 @@
 // the composer and reads the transcript. It uses only what a visitor can see
 // and press, so it runs against production unmodified.
 //
-//   node tools/load.mjs --url https://chattorrent.net/chat --users 8 --ramp 60
+//   node tools/load.mjs --url https://clusterchat.io/chat --users 8 --ramp 60
 //   node tools/load.mjs --users 16 --turns 3 --think 20 --leave 0.2 --out a.jsonl
 //   node tools/load.mjs --users 70 --turns 0 --stay       who is turned away at the cap
 //   node tools/load.mjs --summarize a.jsonl b.jsonl       merge runs from several machines
 //
-//   --url URL          the chat page (default https://chattorrent.net/chat). A
+//   --url URL          the chat page (default https://clusterchat.io/chat). A
 //                      local one needs ?direct=1, since it has no relay
 //   --users N          visitors who only prompt (they answer "no" to the GPU
 //                      question, so a tab uses no GPU and one machine can run many)
@@ -65,7 +65,7 @@ const argv = process.argv.slice(2);
 const has = (f) => argv.includes(`--${f}`);
 const opt = (f, d) => { const i = argv.indexOf(`--${f}`); return i < 0 ? d : argv[i + 1]; };
 
-const URL_       = opt('url', 'https://chattorrent.net/chat');
+const URL_       = opt('url', 'https://clusterchat.io/chat');
 const USERS      = Number(opt('users', 4));
 const RAMP       = Number(opt('ramp', 30));
 const TURNS      = Number(opt('turns', 2));

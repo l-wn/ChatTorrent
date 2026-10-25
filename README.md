@@ -12,8 +12,8 @@ Everyone lends part of their GPU. Everyone gets their own chat.
 [![WebRTC](https://img.shields.io/badge/WebRTC-relay%20only-0b0b0c)](docs/architecture.md)
 [![Model](https://img.shields.io/badge/model-Qwen3.8--27B%20q8-0b0b0c)](#what-it-can-run)
 
-[**Start a private cluster**](https://chattorrent.net/create) ·
-[Try the public demo](https://chattorrent.net/chat) ·
+[**Start a private cluster**](https://clusterchat.io/create) ·
+[Try the public demo](https://clusterchat.io/chat) ·
 [How it works](#how-it-works) ·
 [Docs](#documentation)
 
@@ -79,7 +79,7 @@ now: the browser holding the head loads it with `?mtp=1`. The method is in
 
 ```bash
 # One visitor, six turns. Add --greedy and --prompts copy for the other rows.
-node tools/load.mjs --url https://chattorrent.net/chat --users 1 --turns 6 --tokens 128 --spec
+node tools/load.mjs --url https://clusterchat.io/chat --users 1 --turns 6 --tokens 128 --spec
 ```
 
 ## How it works
@@ -110,7 +110,7 @@ the asking browser rebuilds the chat from its token history.
 ## Private clusters
 
 A private cluster is for a group: friends, a lab, a club. Start one at
-[chattorrent.net/create](https://chattorrent.net/create). You choose how much
+[clusterchat.io/create](https://clusterchat.io/create). You choose how much
 GPU to lend and how many replies can run at once, then share the invite link.
 
 - **The invite code never reaches the server.** It lives in the link's
@@ -167,6 +167,7 @@ You need Node.js, Python 3, [Caddy](https://caddyserver.com/) and a browser
 with WebGPU.
 
 ```bash
+git clone https://github.com/l-wn/ClusterChat && cd ClusterChat
 npm install
 pip install -r tools/requirements.txt
 

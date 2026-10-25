@@ -28,7 +28,7 @@
     <p><strong>What "cluster" means on this page.</strong> A cluster is a group of browser tabs that are open on ClusterChat at the same time and run the AI model together, each on its own graphics card. Your tab is in one cluster at a time. There is one public cluster, the <strong>public demo</strong>, which anyone can join by opening the chat page. Anyone can also start a <strong>private cluster</strong>, which only people who have its invite link can join.</p>
 
     <h2>Who runs ClusterChat</h2>
-    <p>ClusterChat is a personal, non-commercial project run by lwn, who is the "controller" of the little personal data it handles. For anything on this page, contact <a href="mailto:contact@chattorrent.net">contact@chattorrent.net</a>.</p>
+    <p>ClusterChat is a personal, non-commercial project run by lwn, who is the "controller" of the little personal data it handles. For anything on this page, contact <a href="mailto:contact@clusterchat.io">contact@clusterchat.io</a>.</p>
     <p>Your data can be handled by two quite different groups, and this notice keeps them apart:</p>
     <ul>
       <li><strong>ClusterChat</strong>: lwn, and the three things lwn runs:
@@ -85,7 +85,7 @@
     <p>A private cluster's invite link holds the cluster's secret code after the <code>#</code>. If you type your name when sharing it, the name is added there too, so people who open your link see "Ana invited you". Browsers never send the part after the <code>#</code> to any server, so ClusterChat never receives the code or the name. Anyone you send the link to, and anyone they pass it on to, can read both.</p>
 
     <h3>If you contribute your GPU</h3>
-    <p>Your browser only uses your graphics card if you choose to on the setup screen, and only up to the amount you pick. You can change this later under Contribute. It then downloads part of the AI model from <code>weights.chattorrent.net</code> (hosted on Cloudflare, which sees your IP address when you download). Other tabs in your cluster learn a random ID and name for your tab and which part of the model it holds, nothing more. If someone turns on the optional profiling tool in Settings, the name of your graphics card (e.g. "NVIDIA GeForce GTX 1070 Ti") is shown to them for the requests your tab helped run.</p>
+    <p>Your browser only uses your graphics card if you choose to on the setup screen, and only up to the amount you pick. You can change this later under Contribute. It then downloads part of the AI model from <code>weights.clusterchat.io</code> (hosted on Cloudflare, which sees your IP address when you download). Other tabs in your cluster learn a random ID and name for your tab and which part of the model it holds, nothing more. If someone turns on the optional profiling tool in Settings, the name of your graphics card (e.g. "NVIDIA GeForce GTX 1070 Ti") is shown to them for the requests your tab helped run.</p>
     <p>While your tab helps run other people's chats, it holds their KV cache in your graphics card's memory, as described in <a href="#kv-cache">The KV cache</a>. It's never saved to disk, and closing the tab clears it.</p>
 
     <h2 id="recipients">Who else receives data</h2>
@@ -109,7 +109,7 @@
     </ul>
 
     <h2>Your rights</h2>
-    <p>Under UK data protection law you have the right to ask what personal data is held about you, to have it corrected or deleted, and to object to how it's used. In practice, the only thing ClusterChat holds about you after you disconnect is the relay server's record of your IP address, for 7 days. Your chats are in your own browser, where you can delete them yourself. Other tabs in your cluster may still hold your chat's KV cache for a while; ClusterChat can't reach it, and it's cleared as described in <a href="#kv-cache">The KV cache</a>. If you have a question or a request, email <a href="mailto:contact@chattorrent.net">contact@chattorrent.net</a>.</p>
+    <p>Under UK data protection law you have the right to ask what personal data is held about you, to have it corrected or deleted, and to object to how it's used. In practice, the only thing ClusterChat holds about you after you disconnect is the relay server's record of your IP address, for 7 days. Your chats are in your own browser, where you can delete them yourself. Other tabs in your cluster may still hold your chat's KV cache for a while; ClusterChat can't reach it, and it's cleared as described in <a href="#kv-cache">The KV cache</a>. If you have a question or a request, email <a href="mailto:contact@clusterchat.io">contact@clusterchat.io</a>.</p>
     <p>You can also complain to the Information Commissioner's Office: <a href="https://ico.org.uk/make-a-complaint/" rel="noopener">ico.org.uk/make-a-complaint</a>.</p>
 
     <h2>Children</h2>

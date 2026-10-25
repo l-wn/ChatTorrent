@@ -1,10 +1,10 @@
-# Production: https://chattorrent.net, reached only through the Cloudflare
+# Production: https://clusterchat.io, reached only through the Cloudflare
 # tunnel, which terminates TLS at the edge. Serves only dist/. `npm run build`
 # (tools/build-site.mjs) builds it from an allowlist, so the repo, its
 # dotfiles and the dev pages are not reachable. Local development uses
 # Caddyfile.dev.
 #
-# Environment (EnvironmentFile= in the chattorrent-caddy unit):
+# Environment (EnvironmentFile= in the clusterchat-caddy unit):
 #   WEIGHTS_ORIGIN   where the weights are fetched from, for the CSP
 
 {
@@ -23,7 +23,7 @@
 		# Report-only until a full session shows no violations. Then rename it
 		# to Content-Security-Policy. connect-src 'self' covers the same-origin
 		# wss.
-		Content-Security-Policy-Report-Only "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' {$WEIGHTS_ORIGIN:https://weights.chattorrent.net}; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+		Content-Security-Policy-Report-Only "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' {$WEIGHTS_ORIGIN:https://weights.clusterchat.io}; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 	}
 }
 

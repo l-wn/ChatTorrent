@@ -29,7 +29,7 @@ const HOST = process.env.HOST || '127.0.0.1';
 // for local runs and the test harness. A client with no Origin is not a
 // browser (the Node tests) and could send any Origin, so it is allowed.
 const ALLOWED_ORIGINS = new Set((process.env.ALLOWED_ORIGINS
-    ?? 'https://chattorrent.net')
+    ?? 'https://clusterchat.io')
     .split(',').map((o) => o.trim()).filter(Boolean));
 const LOCAL_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
 const originAllowed = (origin) => !origin || ALLOWED_ORIGINS.has(origin) || LOCAL_ORIGIN.test(origin);
@@ -76,7 +76,7 @@ function checkUrl(url, where) {
 // `||`, not `??`: an empty `WEIGHTS_URL=` in .env must not override the file.
 const WEIGHTS_URL = process.env.WEIGHTS_URL
     || readCheckpoint()
-    || 'https://weights.chattorrent.net/smollm2';
+    || 'https://weights.clusterchat.io/smollm2';
 
 // The manifest for that checkpoint: read from disk for a same-origin
 // `/weights/<dir>` (Caddy serves the repo root), fetched otherwise. MANIFEST

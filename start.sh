@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Start the public deploy: signal server, Caddy, Cloudflare tunnel. systemd
-# supervises the processes; this script drives the three `chattorrent-*` user
+# supervises the processes; this script drives the three `clusterchat-*` user
 # units. start and restart rebuild dist/ first, so the site serves current
 # code. See `./start.sh help`, and docs/deploying.md for the units and
 # .env.
 
 set -euo pipefail
 
-UNITS=(chattorrent-signal chattorrent-caddy chattorrent-cloudflared)
+UNITS=(clusterchat-signal clusterchat-caddy clusterchat-cloudflared)
 
 usage() {
     cat <<EOF
@@ -34,7 +34,7 @@ start() {
     echo
     status
     echo
-    echo "https://chattorrent.net/chat"
+    echo "https://clusterchat.io/chat"
 }
 
 stop()    { systemctl --user stop "${UNITS[@]}"; }
@@ -46,14 +46,14 @@ status() {
     done
 }
 
-logs() { journalctl --user -u chattorrent-signal -u chattorrent-caddy -u chattorrent-cloudflared -f; }
+logs() { journalctl --user -u clusterchat-signal -u clusterchat-caddy -u clusterchat-cloudflared -f; }
 
 # Values are read literally, not sourced: a bcrypt hash contains `$`.
 load_env() {
     local k v
     while IFS='=' read -r k v; do
         [[ $k =~ ^[A-Z_][A-Z0-9_]*$ ]] && export "$k=$v"
-    done < "$HOME/.config/chattorrent/env"
+    done < "$HOME/.config/clusterchat/env"
 }
 
 # The dev signaling server is separate from the deploy's, so dev tabs do not
@@ -73,9 +73,9 @@ dev() {
 deploy() {
     cd "$(dirname "$0")"
     [[ -n ${DEPLOY_HOST:-} ]] || load_env
-    [[ -n ${DEPLOY_HOST:-} ]] || { echo "set DEPLOY_HOST=user@host in ~/.config/chattorrent/env" >&2; exit 1; }
-    git ls-files -z | rsync -a --from0 --files-from=- ./ "$DEPLOY_HOST:Code/ChatTorrent/"
-    ssh "$DEPLOY_HOST" 'cd Code/ChatTorrent && npm ci --omit=dev --no-audit --no-fund > /dev/null && XDG_RUNTIME_DIR=/run/user/$(id -u) ./start.sh restart'
+    [[ -n ${DEPLOY_HOST:-} ]] || { echo "set DEPLOY_HOST=user@host in ~/.config/clusterchat/env" >&2; exit 1; }
+    git ls-files -z | rsync -a --from0 --files-from=- ./ "$DEPLOY_HOST:Code/ClusterChat/"
+    ssh "$DEPLOY_HOST" 'cd Code/ClusterChat && npm ci --omit=dev --no-audit --no-fund > /dev/null && XDG_RUNTIME_DIR=/run/user/$(id -u) ./start.sh restart'
 }
 
 case "${1:-start}" in
