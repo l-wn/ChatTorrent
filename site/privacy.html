@@ -21,9 +21,11 @@
   </header>
   <main>
     <h1>Privacy notice</h1>
-    <p class="updated">Last updated: 30 September 2026</p>
+    <p class="updated">Last updated: 25 October 2026</p>
 
     <p>ChatTorrent keeps as little about you as it can: no accounts, no cookies, no analytics, and your chats are saved only in your own browser. The one thing to know: <strong>the AI model runs in other people's browsers, so they can see what you send it.</strong> Don't send anything private.</p>
+
+    <p><strong>What "cluster" means on this page.</strong> A cluster is a group of browser tabs that are open on ChatTorrent at the same time and run the AI model together, each on its own graphics card. Your tab is in one cluster at a time. There is one public cluster, the <strong>public demo</strong>, which anyone can join by opening the chat page. Anyone can also start a <strong>private cluster</strong>, which only people who have its invite link can join.</p>
 
     <h2>Who runs ChatTorrent</h2>
     <p>ChatTorrent is a personal, non-commercial project run by lwn, who is the "controller" of the little personal data it handles. For anything on this page, contact <a href="mailto:contact@chattorrent.net">contact@chattorrent.net</a>.</p>
@@ -36,7 +38,7 @@
           <li><strong>the relay server</strong>, which passes the encrypted traffic between tabs on, so they don't learn each other's IP addresses.</li>
         </ul>
         Whenever this notice says what ChatTorrent does or doesn't store, it means these, and only these.</li>
-      <li><strong>The mesh</strong>: every browser tab open on ChatTorrent, yours included. The AI runs here, on visitors' own graphics cards, not on any server. The other tabs belong to other people, and ChatTorrent doesn't control them. The mesh does see and hold what you send while it works on it (see <a href="#mesh">What other people in the mesh can see</a>).</li>
+      <li><strong>Your cluster</strong>: every browser tab in the same cluster as yours, yours included. The AI runs here, on visitors' own graphics cards, not on any server. The other tabs belong to other people, and ChatTorrent doesn't control them. The cluster does see and hold what you send while it works on it (see <a href="#cluster">What other people in your cluster can see</a>).</li>
     </ul>
     <p>Outside companies supply the infrastructure; see <a href="#recipients">Who else receives data</a>.</p>
 
@@ -45,15 +47,16 @@
     <p>When you open ChatTorrent, the connection server sees your IP address. It uses it for one thing: limiting how many connections a single address can open at once, so nobody can flood the service. It's held in memory only while you're connected, and it isn't written to any log. The site is reached through Cloudflare, which also sees your IP address as part of delivering it (see "Who else receives data" below). The legal basis is a legitimate interest in keeping the service running and protecting it from abuse.</p>
     <p>Connections between tabs go through the relay server, so other people's tabs don't see your IP address. The relay does: it records the address, time and a random ID for each connection, to spot and block misuse, and deletes these records after 7 days. The one exception is if you open the site with <code>?direct=1</code> at the end of the address, a developer option that connects tabs directly and so shows your address to the tabs you connect to.</p>
 
-    <h2 id="mesh">What other people in the mesh can see</h2>
-    <p>There's no central server running the AI. Your message and the reply are processed by the browsers of other people connected to the same mesh, on their graphics cards, and <strong>they can in principle see or record what passes through them</strong>.</p>
+    <h2 id="cluster">What other people in your cluster can see</h2>
+    <p>There's no central server running the AI. Your message and the reply are processed by the browsers of other people in the same cluster, on their graphics cards, and <strong>they can in principle see or record what passes through them</strong>.</p>
     <ul>
-      <li>In the <strong>global mesh</strong>, those people are strangers.</li>
-      <li>In a <strong>private mesh</strong>, they're only people who have that mesh's invite link.</li>
+      <li>In the <strong>public demo</strong>, those people are strangers.</li>
+      <li>In a <strong>private cluster</strong>, they're only people who have that cluster's invite link.</li>
     </ul>
     <p>Some tabs receive your words directly. Other tabs receive information derived from your words, which isn't your text word for word but can be turned back into it. Every tab that helps run your chat keeps some of this in memory between messages (see <a href="#kv-cache">The KV cache</a> below), so treat all of it as though it were your chats.</p>
-    <p>Between tabs, your messages travel encrypted through the relay server, which passes them on but can't read them. So lwn and ChatTorrent's servers never see, store or have access to your messages: only the mesh does.</p>
-    <p>Please don't send anything sensitive or personal, especially in the global mesh.</p>
+    <p>Between tabs, your messages travel encrypted through the relay server, which passes them on but can't read them. So lwn and ChatTorrent's servers never see, store or have access to your messages: only your cluster does.</p>
+    <p>Everyone in your cluster also sees a random name for your tab, such as "amber-otter", which the connection server makes up when you join, and whether your tab is lending its graphics card. The name isn't linked to you and changes every time you join.</p>
+    <p>Please don't send anything sensitive or personal, especially in the public demo.</p>
 
     <h3 id="kv-cache">The KV cache</h3>
     <p>An AI model rereads the whole conversation every time it writes the next word. So that it doesn't start from scratch each time, every tab that runs part of the model keeps notes on the conversation so far in its graphics card's memory. These notes are called the KV cache.</p>
@@ -69,37 +72,44 @@
     <h3>In your browser</h3>
     <p>Your browser keeps these, and never sends them anywhere:</p>
     <ul>
-      <li><strong>Your saved chats</strong>, so you can come back to them. Delete them with "Forget this mesh's chats" in the chat list, or by clearing this site's data in your browser.</li>
-      <li><strong>Whether the chat list is shown or hidden.</strong></li>
+      <li><strong>Your saved chats</strong>, so you can come back to them. Delete them with "Forget these chats" in the chat list, or by clearing this site's data in your browser.</li>
+      <li><strong>Your answer on the setup screen</strong>: that you agreed to the terms when you pressed "Join and chat" or "Create cluster", and how much of your graphics card you chose to lend, so the slider starts there next time.</li>
+      <li><strong>Which clusters this tab has joined</strong>, as a short code for each rather than the invite itself, so the setup screen isn't shown again when you reload. This is forgotten when you close the tab.</li>
+      <li><strong>If you start a cluster</strong>: that this tab started it, and the room capacity you chose. Also forgotten when you close the tab.</li>
+      <li><strong>The name you type for your invite link</strong>, for that cluster in this tab only. It's forgotten when you close the tab.</li>
+      <li><strong>Whether the chat list and the list of computers are shown or hidden.</strong></li>
     </ul>
     <p>They're only there because you asked for what they do, so no consent banner is needed. ChatTorrent uses no cookies, analytics, advertising or tracking of any kind.</p>
 
+    <h3>In an invite link</h3>
+    <p>A private cluster's invite link holds the cluster's secret code after the <code>#</code>. If you type your name when sharing it, the name is added there too, so people who open your link see "Ana invited you". Browsers never send the part after the <code>#</code> to any server, so ChatTorrent never receives the code or the name. Anyone you send the link to, and anyone they pass it on to, can read both.</p>
+
     <h3>If you contribute your GPU</h3>
-    <p>Your browser only uses your graphics card if you choose to in the welcome popup, and only up to the amount you pick. It then downloads part of the AI model from <code>weights.chattorrent.net</code> (hosted on Cloudflare, which sees your IP address when you download). Other tabs in the mesh learn a random ID for your tab and which part of the model it holds, nothing more. If someone turns on the optional profiling tool in Settings, the name of your graphics card (e.g. "NVIDIA GeForce GTX 1070 Ti") is shown to them for the requests your tab helped run.</p>
+    <p>Your browser only uses your graphics card if you choose to on the setup screen, and only up to the amount you pick. You can change this later under Contribute. It then downloads part of the AI model from <code>weights.chattorrent.net</code> (hosted on Cloudflare, which sees your IP address when you download). Other tabs in your cluster learn a random ID and name for your tab and which part of the model it holds, nothing more. If someone turns on the optional profiling tool in Settings, the name of your graphics card (e.g. "NVIDIA GeForce GTX 1070 Ti") is shown to them for the requests your tab helped run.</p>
     <p>While your tab helps run other people's chats, it holds their KV cache in your graphics card's memory, as described in <a href="#kv-cache">The KV cache</a>. It's never saved to disk, and closing the tab clears it.</p>
 
     <h2 id="recipients">Who else receives data</h2>
     <ul>
       <li><strong>Cloudflare</strong> delivers the website and hosts the AI model's files. It sees IP addresses as part of this. <a href="https://www.cloudflare.com/privacypolicy/" rel="noopener">Cloudflare's privacy policy</a>.</li>
       <li><strong>Hetzner</strong> hosts ChatTorrent's relay server, in the EU. It provides the machine only and doesn't use the data for anything else. <a href="https://www.hetzner.com/legal/privacy-policy/" rel="noopener">Hetzner's privacy policy</a>.</li>
-      <li><strong>Other people in your mesh</strong> run the model, as described above.</li>
+      <li><strong>Other people in your cluster</strong> run the model, as described above.</li>
     </ul>
     <p>No data is sold or shared with anyone else.</p>
 
     <h2>Transfers outside the UK</h2>
-    <p>ChatTorrent's relay server is in the EU, which UK law recognises as protecting personal data adequately. Cloudflare operates worldwide, so your IP address may be processed outside the UK. Cloudflare protects such transfers with the safeguards UK law requires; its privacy policy has the details. Other people in the mesh can be anywhere in the world, and your messages reach whichever of them are running the model at the time.</p>
+    <p>ChatTorrent's relay server is in the EU, which UK law recognises as protecting personal data adequately. Cloudflare operates worldwide, so your IP address may be processed outside the UK. Cloudflare protects such transfers with the safeguards UK law requires; its privacy policy has the details. Other people in your cluster can be anywhere in the world, and your messages reach whichever of them are running the model at the time.</p>
 
     <h2>How long data is kept</h2>
     <ul>
       <li><strong>Your IP address</strong>: on the connection server, only while you're connected; in the relay server's records, 7 days.</li>
-      <li><strong>Your messages</strong>: never stored by ChatTorrent. The mesh holds them while it works on them, and the people in it could keep what passes through their tabs, which ChatTorrent can't control.</li>
+      <li><strong>Your messages</strong>: never stored by ChatTorrent. Your cluster holds them while it works on them, and the people in it could keep what passes through their tabs, which ChatTorrent can't control.</li>
       <li><strong>The KV cache</strong> other tabs hold for your chat: in their memory only, never on disk. See <a href="#kv-cache">The KV cache</a> for when it's cleared.</li>
-      <li><strong>Saved chats and settings</strong>: in your browser, until you delete them.</li>
+      <li><strong>Saved chats, your setup answer and settings</strong>: in your browser, until you delete them. What this tab remembers for one session (clusters joined, a started cluster's settings, your invite name) is forgotten when you close the tab.</li>
       <li><strong>Cloudflare</strong> keeps its own records according to its privacy policy.</li>
     </ul>
 
     <h2>Your rights</h2>
-    <p>Under UK data protection law you have the right to ask what personal data is held about you, to have it corrected or deleted, and to object to how it's used. In practice, the only thing ChatTorrent holds about you after you disconnect is the relay server's record of your IP address, for 7 days. Your chats are in your own browser, where you can delete them yourself. Other tabs in the mesh may still hold your chat's KV cache for a while; ChatTorrent can't reach it, and it's cleared as described in <a href="#kv-cache">The KV cache</a>. If you have a question or a request, email <a href="mailto:contact@chattorrent.net">contact@chattorrent.net</a>.</p>
+    <p>Under UK data protection law you have the right to ask what personal data is held about you, to have it corrected or deleted, and to object to how it's used. In practice, the only thing ChatTorrent holds about you after you disconnect is the relay server's record of your IP address, for 7 days. Your chats are in your own browser, where you can delete them yourself. Other tabs in your cluster may still hold your chat's KV cache for a while; ChatTorrent can't reach it, and it's cleared as described in <a href="#kv-cache">The KV cache</a>. If you have a question or a request, email <a href="mailto:contact@chattorrent.net">contact@chattorrent.net</a>.</p>
     <p>You can also complain to the Information Commissioner's Office: <a href="https://ico.org.uk/make-a-complaint/" rel="noopener">ico.org.uk/make-a-complaint</a>.</p>
 
     <h2>Children</h2>
