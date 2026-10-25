@@ -13,6 +13,7 @@
 // unchanged:
 //
 //   chat.html            web/peer.html, served at /chat
+//   create.html          web/create.html, served at /create
 //   *.js, model/, dev/   the modules chat.html imports
 //   checkpoint.json      which checkpoint to load
 //   everything in site/  404.html, favicon, robots.txt, site.css, and any
@@ -29,7 +30,7 @@ const DIST = join(ROOT, 'dist');
 
 // Published path (in dist/) -> source file. Pages from web/ are listed here. A
 // page added to site/ needs no entry.
-const PAGES = { 'chat.html': join(WEB, 'peer.html') };
+const PAGES = { 'chat.html': join(WEB, 'peer.html'), 'create.html': join(WEB, 'create.html') };
 
 // Never copied to dist/, even if imported. Guards against a stray import of a
 // file that must stay private.

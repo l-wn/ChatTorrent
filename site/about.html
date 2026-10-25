@@ -4,80 +4,182 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>About · ChatTorrent</title>
-  <meta name="description" content="A free AI chatbot run by its users: a large language model split across visitors' browsers, on their own graphics cards." />
-  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-  <link rel="stylesheet" href="/site.css" />
+  <meta name="description" content="ChatTorrent runs a large open AI model on the graphics cards of the people using it, in their browsers. Everyone gets their own chat, and nobody has to stay online." />
+  <link rel="icon" href="favicon.svg?v=3" type="image/svg+xml" />
+  <link rel="stylesheet" href="tokens.css" />
+  <link rel="stylesheet" href="site.css" />
+  <script src="js/toc.js" defer></script>
 </head>
-<body>
+<body class="page">
 <!--
-  ABOUT THIS PAGE
-
-  Served at /about.
-  What ChatTorrent is, how it works and why it exists, for someone who has
-  never heard of it. Linked from the welcome popup ("How it works"), the site
-  header and the credit ribbon.
+  Served at /about. What ChatTorrent is, how it works and why it exists, for
+  someone who has never heard of it. Linked from the site header, the app's
+  welcome dialog and every footer.
 -->
   <header class="site-header">
-    <a class="brand" href="/"><img src="/favicon.svg" alt="" />ChatTorrent</a>
-    <nav>
-      <a href="/chat">Chat</a>
-      <a href="/about" aria-current="page">About</a>
-      <a href="/privacy">Privacy</a>
-      <a href="/terms">Terms</a>
-    </nav>
+    <div class="wrap">
+      <a class="brand" href="/" aria-label="ChatTorrent home"><span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>ChatTorrent</a>
+      <nav aria-label="Main">
+        <a href="/about" aria-current="page">About</a>
+        <a href="https://github.com/l-wn/ChatTorrent" rel="noopener">GitHub</a>
+      </nav>
+    </div>
   </header>
+
   <main>
-    <h1>What is ChatTorrent?</h1>
-    <p>ChatTorrent is a free AI chatbot that runs on its users' computers. There's no data centre behind it: visitors lend part of their graphics card, and together their browsers run one large AI model that everyone can chat with.</p>
+    <p class="eyebrow">About</p>
+    <h1>An AI chat your group runs together.</h1>
+    <p class="lede">ChatTorrent runs a large open AI model, Qwen3.8 27B, on the graphics cards of the people using it. There's no data centre behind it. Everyone in a cluster lends part of their GPU, and together their browsers run one model that each of them can chat with.</p>
+
+    <ul class="facts">
+      <li><strong>Everyone gets their own chat.</strong> Conversations are separate, and several can run at the same time.</li>
+      <li><strong>Nobody has to stay.</strong> There's no host. Each piece of the model can be held by more than one computer, so when someone leaves, the others carry on and pick up what they held.</li>
+      <li><strong>Nothing to install.</strong> It runs in a browser tab.</li>
+    </ul>
 
     <h2>How it works</h2>
-    <p>The AI model ChatTorrent runs, Qwen3.8-27B, is about 27 GB: too big for most single computers. So it's cut into pieces, and every visitor who chooses to contribute downloads one or more of them onto their graphics card.</p>
+    <p>The model is about 27 GB, too big for most single graphics cards. So it's cut into pieces, and each computer that lends its GPU downloads some of them.</p>
+
     <figure class="diagram">
-      <img src="/mesh.jpg" width="651" height="570" alt="Several browsers, each open at chattorrent.net/chat and holding a different number of blocks of the model, linked to one another by WebRTC connections through the relay server. On the right, the signalling server brings a new browser into the mesh.">
-      <figcaption>Each browser holds some blocks of the model and passes the work on to the next. The signalling server introduces new browsers to the mesh.</figcaption>
+      <svg class="about-diagram" viewBox="0 0 680 300" role="img" aria-labelledby="diagram-t diagram-d">
+        <title id="diagram-t">Four browsers sharing one model</title>
+        <desc id="diagram-d">Ana's laptop and Lab PC 3 each hold pieces 1 to 6. Ben's gaming PC and Mia's desktop each hold pieces 7 to 12. Ben's message runs on Ana's laptop, then his own PC. Mia's runs on Lab PC 3, then her desktop. All four connect to a signalling server and a relay.</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto">
+            <path d="M0 0 L8 4 L0 8 z" class="d-signal-fill" />
+          </marker>
+        </defs>
+
+        <g class="d-browser" transform="translate(0 20)">
+          <rect width="150" height="100" rx="4" />
+          <text x="12" y="24" class="d-name">Ana's laptop</text>
+          <g class="d-pieces" transform="translate(12 46)">
+            <rect x="0" width="8" height="14" class="on" /><rect x="10.5" width="8" height="14" class="on" /><rect x="21" width="8" height="14" class="on" /><rect x="31.5" width="8" height="14" class="on" /><rect x="42" width="8" height="14" class="on" /><rect x="52.5" width="8" height="14" class="on" />
+            <rect x="63" width="8" height="14" /><rect x="73.5" width="8" height="14" /><rect x="84" width="8" height="14" /><rect x="94.5" width="8" height="14" /><rect x="105" width="8" height="14" /><rect x="115.5" width="8" height="14" />
+          </g>
+          <text x="12" y="84" class="d-mono">pieces 1-6</text>
+        </g>
+        <g class="d-browser" transform="translate(176 20)">
+          <rect width="150" height="100" rx="4" />
+          <text x="12" y="24" class="d-name">Ben's gaming PC</text>
+          <g class="d-pieces" transform="translate(12 46)">
+            <rect x="0" width="8" height="14" /><rect x="10.5" width="8" height="14" /><rect x="21" width="8" height="14" /><rect x="31.5" width="8" height="14" /><rect x="42" width="8" height="14" /><rect x="52.5" width="8" height="14" />
+            <rect x="63" width="8" height="14" class="on" /><rect x="73.5" width="8" height="14" class="on" /><rect x="84" width="8" height="14" class="on" /><rect x="94.5" width="8" height="14" class="on" /><rect x="105" width="8" height="14" class="on" /><rect x="115.5" width="8" height="14" class="on" />
+          </g>
+          <text x="12" y="84" class="d-mono">pieces 7-12</text>
+        </g>
+        <g class="d-browser" transform="translate(352 20)">
+          <rect width="150" height="100" rx="4" />
+          <text x="12" y="24" class="d-name">Lab PC 3</text>
+          <g class="d-pieces" transform="translate(12 46)">
+            <rect x="0" width="8" height="14" class="on" /><rect x="10.5" width="8" height="14" class="on" /><rect x="21" width="8" height="14" class="on" /><rect x="31.5" width="8" height="14" class="on" /><rect x="42" width="8" height="14" class="on" /><rect x="52.5" width="8" height="14" class="on" />
+            <rect x="63" width="8" height="14" /><rect x="73.5" width="8" height="14" /><rect x="84" width="8" height="14" /><rect x="94.5" width="8" height="14" /><rect x="105" width="8" height="14" /><rect x="115.5" width="8" height="14" />
+          </g>
+          <text x="12" y="84" class="d-mono">pieces 1-6</text>
+        </g>
+        <g class="d-browser" transform="translate(528 20)">
+          <rect width="150" height="100" rx="4" />
+          <text x="12" y="24" class="d-name">Mia's desktop</text>
+          <g class="d-pieces" transform="translate(12 46)">
+            <rect x="0" width="8" height="14" /><rect x="10.5" width="8" height="14" /><rect x="21" width="8" height="14" /><rect x="31.5" width="8" height="14" /><rect x="42" width="8" height="14" /><rect x="52.5" width="8" height="14" />
+            <rect x="63" width="8" height="14" class="on" /><rect x="73.5" width="8" height="14" class="on" /><rect x="84" width="8" height="14" class="on" /><rect x="94.5" width="8" height="14" class="on" /><rect x="105" width="8" height="14" class="on" /><rect x="115.5" width="8" height="14" class="on" />
+          </g>
+          <text x="12" y="84" class="d-mono">pieces 7-12</text>
+        </g>
+
+        <!-- Each message's path: two hops, one per half of the model. -->
+        <line x1="150" y1="73" x2="174" y2="73" class="d-flow" marker-end="url(#arrow)" />
+        <line x1="502" y1="73" x2="526" y2="73" class="d-flow" marker-end="url(#arrow)" />
+
+        <!-- The two servers, linked to every browser. -->
+        <g class="d-bus">
+          <line x1="75" y1="120" x2="75" y2="170" /><line x1="251" y1="120" x2="251" y2="170" />
+          <line x1="427" y1="120" x2="427" y2="170" /><line x1="603" y1="120" x2="603" y2="170" />
+          <line x1="75" y1="170" x2="603" y2="170" />
+          <line x1="230" y1="170" x2="230" y2="204" /><line x1="450" y1="170" x2="450" y2="204" />
+        </g>
+        <g class="d-server" transform="translate(130 204)">
+          <rect width="200" height="72" rx="4" />
+          <text x="14" y="26" class="d-name">Signalling server</text>
+          <text x="14" y="50" class="d-mono">introduces new browsers</text>
+        </g>
+        <g class="d-server" transform="translate(350 204)">
+          <rect width="200" height="72" rx="4" />
+          <text x="14" y="26" class="d-name">Relay</text>
+          <text x="14" y="50" class="d-mono">passes on encrypted traffic</text>
+        </g>
+      </svg>
+      <figcaption>Two chats at once. Ben's message runs on Ana's laptop, then his own PC. Mia's runs on Lab PC 3, then her desktop. If Ana leaves, Lab PC 3 still holds her pieces.</figcaption>
     </figure>
-    <p>When you send a message, it passes from browser to browser, each running its own piece of the model, until the last one produces the next word of the reply. That repeats for every word. It's like a torrent, except that instead of sharing pieces of a file, people share the work of running the model.</p>
-    <p>People come and go all the time, so the mesh rearranges itself as they do: several browsers can hold the same piece, and when one leaves, another carries on. A new browser starts with a small piece and takes on more while it's idle, up to the limit its owner chose.</p>
-    <p>You can chat without contributing anything. Contributing is what keeps the model running, though, so if your computer has a graphics card to spare, please consider it.</p>
+
+    <p>When you send a message, it passes from browser to browser. Each one runs its pieces of the model and hands the result on, until the last one picks the next word of the reply. That repeats for every word. It's like a torrent, except people share the work of running a model instead of the pieces of a file.</p>
+    <p>People come and go, so the cluster rearranges itself. A new computer starts with a few pieces and takes on more while it's idle, up to the limit its owner chose. You can also join just to chat, without lending anything.</p>
+
+    <h2>Private clusters and the public demo</h2>
+    <p>A private cluster is for a group: friends, a lab, a club. Only people with its link can join, and only their computers run its chats. Start one from the <a href="/">home page</a> and share the link.</p>
+    <p>The public demo is a cluster anyone can join. It's there to try ChatTorrent, so don't send it anything personal.</p>
+    <aside class="callout" aria-label="Privacy">
+      <p class="callout-label">Privacy</p>
+      <p><strong>Your chat is separate, not secret.</strong> The computers in your cluster process it. Invite people you trust.</p>
+      <p class="small">The <a href="/privacy">privacy notice</a> explains exactly who sees what.</p>
+    </aside>
 
     <h2>The technology</h2>
     <ul>
       <li><strong>WebGPU</strong> lets a web page use your graphics card. ChatTorrent's model code is written from scratch for it: no AI libraries, no plugins, nothing to install.</li>
-      <li><strong>WebRTC</strong> lets browsers talk to each other. It carries the model's working data from one browser to the next, encrypted, through a relay so that nobody learns anyone else's IP address.</li>
+      <li><strong>WebRTC</strong> lets browsers talk to each other. It carries the model's working data from one browser to the next, encrypted, through a relay, so nobody learns anyone else's IP address.</li>
       <li><strong>Two small servers</strong> help out. One introduces browsers to each other, and the other relays their encrypted traffic. Neither runs the AI or can read your messages.</li>
     </ul>
-    <p>All of it is open source: the code is on <a href="https://github.com/l-wn/ChatTorrent" rel="noopener">GitHub</a>.</p>
+    <p>All of it is open source. The code is on <a href="https://github.com/l-wn/ChatTorrent" rel="noopener">GitHub</a>.</p>
 
     <h2>Why it exists</h2>
-    <p>ChatTorrent is an experiment that explores the question: Can large AI models be run by ordinary people, on consumer hardware, freely and privately?</p>
-    <p>In a world where AI is dominated by large, private, data centers - or really expensive GPUs - ChatTorrent aims to bring control back and make private AI more affordable.</p>
-
+    <p>ChatTorrent is an experiment that explores a question: can large AI models be run by ordinary people, on consumer hardware, freely and privately?</p>
+    <p>In a world where AI is dominated by large, private data centres, or really expensive GPUs, ChatTorrent aims to bring control back and make private AI more affordable.</p>
     <ul>
-      <li><strong>A more democratic AI.</strong> No company gatekeeps AI deciding who can use what and how. The model runs by the people using it, the code is open source, and anybody can host their own private instance.</li>
-      <li><strong>A more accessible AI.</strong> It's free. There is no account or subscription, and works in any browser. A school, library, friend group or community can pool a few graphics cards together and run their own models.</li>
-      <li><strong>Your own everyday hardware, put to use.</strong> It takes advantage of all the GPUs that ordinary people (predominantly gamers) already own. It puts those computers to work rather than relying on more data centers.</li>
-      <li><strong>Your own data.</strong> No accounts and no companies collecting your data so they can sell you more things. In a private mesh, only those you trust could see anything you send - you may prompt in peace.</li>
+      <li><strong>A more democratic AI.</strong> No company gatekeeps AI, deciding who can use what and how. The model is run by the people using it, the code is open source, and anybody can host their own private instance.</li>
+      <li><strong>A more accessible AI.</strong> It's free, with no account or subscription. A library, a friend group or a community can pool a few graphics cards and run their own model.</li>
+      <li><strong>Your own everyday hardware, put to use.</strong> It takes advantage of the GPUs that ordinary people, mostly gamers, already own. It puts those computers to work rather than relying on more data centres.</li>
+      <li><strong>Your own data.</strong> No accounts, and no companies collecting your data to sell you more things. In a private cluster, only the people you invite could see anything you send.</li>
     </ul>
+
+    <h2 id="needs">What you need</h2>
+    <p>About 27 GB of GPU memory across the group. Any mix that adds up works: three 10 GB gaming PCs, six 5 GB laptops, or a 24 GB desktop and a 4 GB laptop. A little extra on top means anyone can leave without stopping the chats.</p>
+    <table class="browsers">
+      <thead><tr><th scope="col">Browser</th><th scope="col">Can lend its GPU on</th></tr></thead>
+      <tbody>
+        <tr><th scope="row">Chrome, Edge 113+</th><td>Windows, macOS, ChromeOS, Android. Linux may need WebGPU switched on in chrome://flags.</td></tr>
+        <tr><th scope="row">Safari 26+</th><td>macOS, iPhone, iPad</td></tr>
+        <tr><th scope="row">Firefox</th><td>Windows (141+), Apple silicon Macs (145+)</td></tr>
+      </tbody>
+    </table>
+    <p class="small">Any modern browser can join to chat without lending.</p>
 
     <h2>What to expect</h2>
     <ul>
-      <li><strong>It's slower</strong> than commercial chatbots: a few words a second when the mesh is healthy, and it needs enough people contributing to run at all.</li>
-      <li><strong>It isn't private in the global mesh.</strong> Your messages are processed in strangers' browsers, so don't send anything sensitive. For more privacy, create a private mesh and share its link only with people you trust. The <a href="/privacy">privacy notice</a> explains exactly who sees what.</li>
+      <li><strong>It's slower</strong> than commercial chatbots: a few words a second when the cluster is healthy, and it needs enough GPU memory between its members to run at all.</li>
       <li><strong>It can be wrong.</strong> Like any AI, it makes mistakes. Check anything important.</li>
     </ul>
 
-    <p>Yes, as you can probably tell, this project used a lot of help from LLMs. It allowed me to create it - and to be honest, even attempt it - way faster than I otherwise would have been able to. The idea, architecture & design choices were all mine, and AI focussed on implementation and domain specific knowledge.</p>
+    <h2>A note from me</h2>
+    <p>Yes, as you can probably tell, this project used a lot of help from LLMs. It allowed me to build it, and to be honest even attempt it, way faster than I otherwise could have. The idea, architecture and design choices were all mine, and AI focused on implementation and domain-specific knowledge.</p>
     <p>Thanks for checking out my project :)</p>
-    <p><a href="/chat">Start chatting</a></p>
+
+    <div class="actions">
+      <a class="btn btn-primary" href="/create">Start a private cluster</a>
+      <a class="btn" href="/chat">Try the public demo <span class="tag">public</span></a>
+    </div>
   </main>
-  <footer class="ribbon">
-    <span>ChatTorrent</span>
-    <span>by lwn</span>
-    <a href="/about">about</a>
-    <a href="https://github.com/l-wn/ChatTorrent" target="_blank" rel="noopener">source</a>
-    <a href="/privacy">privacy</a>
-    <a href="/terms">terms</a>
-    <a href="/terms#conduct">code of conduct</a>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <nav aria-label="Footer">
+        <span>Open source, by lwn</span>
+        <a href="https://github.com/l-wn/ChatTorrent" rel="noopener">GitHub</a>
+        <a href="/about">About</a>
+        <a href="/privacy">Privacy</a>
+        <a href="/terms">Terms</a>
+      </nav>
+    </div>
   </footer>
 </body>
 </html>

@@ -64,7 +64,7 @@ dev() {
     PORT=8081 node signal-server.js &
     local sig=$!
     trap 'kill $sig 2>/dev/null' EXIT
-    echo "dev: http://localhost:8001/web/peer.html?direct=1"
+    echo "dev: http://localhost:8001/ (the chat: http://localhost:8001/chat?direct=1)"
     caddy run --config Caddyfile.dev
 }
 

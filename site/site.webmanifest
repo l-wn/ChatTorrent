@@ -3,7 +3,7 @@
   "short_name": "ChatTorrent",
   "start_url": "/chat",
   "display": "standalone",
-  "background_color": "#0f1115",
-  "theme_color": "#0f1115",
-  "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml" }]
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "icons": [{ "src": "/favicon.svg?v=3", "sizes": "any", "type": "image/svg+xml" }]
 }

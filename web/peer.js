@@ -1,16 +1,19 @@
 // A peer in the mesh: the DOM layer around one Engine (web/engine.js), which
 // joins the mesh, holds and grows a range, and generates tokens. This file
 // boots the page, wires events, picks the chat format, and renders the
-// transcript, the chat list, the status pills and the block map.
+// transcript, the chat list, the health line, the Contribute drawer and the
+// piece bar. The page calls a mesh a "cluster" and a peer a "computer".
 
 import { dimsFromManifest } from './model/loader.js';
 import { Engine, ContextFullError } from './engine.js';
-import { positions, coverage, holders, holding, describeRange, N_MAX } from './split.js';
+import { positions, coverage, holders, holding, describeRange, storedBytes, N_MAX } from './split.js';
 import { chatFormat, stopRe } from './prompt.js';
 import { runTurn } from './turn.js';
 import { makeMessage } from './message.js';
 import { summarize, formatLine, formatText } from './profile.js';
-import { readInvite, openRoom, newSecret, inviteUrl } from './room.js';
+import { readInvite, openRoom, inviteUrl, cleanName, NAME_MAX, nameKey, creatorKey, chatsKey, sessionsKey } from './room.js';
+import { saveChoice } from './welcome.js';
+import { PROBLEMS, classify, report } from './errors.js';
 import { openHistory, idbBackend, memoryBackend, newRecord, groupByDay } from './history.js';
 
 // The turn wrapper and the regex that cuts a runaway reply, from the
@@ -23,8 +26,18 @@ let engine = null;
 const state = { busy: false };
 
 // This tab's invite secret, or null in the global mesh. Kept only to build the
-// link for "Copy invite link" (see web/room.js).
+// invite link (see web/room.js).
 let secret = null;
+
+// The room this tab joined (null before boot or after a bad link), and
+// whether this tab lends its GPU (the welcome dialog's answer).
+let room = null;
+let lending = false;
+
+// Stored bytes of each position of the model, from the manifest, for the
+// "needs about N GB more" line. Null until the manifest is read or when it
+// lists no files.
+let posBytes = null;
 
 // The checkpoint the mesh runs, set once the manifest is read. A saved chat's
 // token ids are only valid for the tokenizer they were made with.
@@ -49,19 +62,57 @@ const cacheDom = () => {
     for (const el of document.querySelectorAll('[id]')) ui[el.id] = el;
 };
 
+// This tab's own state, at the end of the health line: "ready",
+// "generating… 12 tok · 4000 left", a rebuild. tools/load.mjs reads it.
 function setStatus(text, kind = '') {
     ui.status.textContent = text;
-    ui.status.className = `pill ${kind}`;
+    ui.status.className = kind;
+    // Shown only during a reply and on an error: otherwise the health line
+    // already says it.
+    ui.status.hidden = !(state.busy || kind === 'err');
 }
 
 function addMessage(who, text = '', cls = '') {
     const msg = makeMessage(who, text, cls);
-    ui.messages.appendChild(msg.el);
+    // In an empty chat, notes go above the invite card and example prompts.
+    const empty = /\bnote\b/.test(cls) && ui.messages.querySelector('.share, .suggest');
+    if (empty) ui.messages.insertBefore(msg.el, empty);
+    else ui.messages.appendChild(msg.el);
     scrollDown(true);
     return msg;
 }
 
 const note = (text, err = false) => addMessage('', text, `note${err ? ' err' : ''}`);
+
+// A problem in the chat: its code, one sentence and what to do (errors.js).
+// The raw error goes to the console. tools/load.mjs reads data-code.
+function problem(key, err = null) {
+    // A calm one is about this browser, not the chat: a line above the input.
+    if (PROBLEMS[key]?.calm) {
+        ui.composerNote.textContent = report(key, err);
+        ui.composerNote.hidden = false;
+        return null;
+    }
+    const msg = note(report(key, err), true);
+    msg.el.dataset.code = PROBLEMS[key]?.code ?? '';
+    return msg;
+}
+
+// Growth that stopped: the GPU being full is the normal end, shown as a
+// limit; anything else is a problem.
+function grewTo(cause, text) {
+    if (text) console.warn(text);
+    if (classify(cause, '') === 'GPU_FULL') note('Limit reached: your GPU is full. It keeps lending what it holds.');
+    else problem('GROW_FAILED', cause);
+}
+
+// Why lending could not start.
+function lendProblem(cause) {
+    const m = String(cause?.message ?? cause ?? '');
+    return !navigator.gpu || classify(cause, '') === 'NO_WEBGPU' ? 'NO_WEBGPU'
+        : /checks on .* failed on this GPU/.test(m) ? 'GPU_CHECK'
+        : 'LEND_FAILED';
+}
 
 // Insert `msg` above the reply being streamed, if there is one. A rebuild
 // happens before the reply it delays.
@@ -97,19 +148,42 @@ function handleEngineEvent(type, detail) {
             ui.bootnote.textContent = detail.text;
             if (detail.fraction != null) ui.bootbar.style.width = `${detail.fraction * 100}%`;
             break;
+        // Engine notes by code: limits and problems are shown; the rest
+        // (retries, the MTP head, growth resuming) only go to the console.
         case 'status':
-            note(detail.text, detail.error);
-            if (detail.pill) setStatus(detail.pill, 'err');
+            switch (detail.code) {
+                case 'limit':
+                    console.info(detail.text);
+                    note(`Limit reached: you're lending your full ${Math.round(detail.limit / 2 ** 30)} GB.`);
+                    break;
+                case 'grow-stopped':
+                    grewTo(detail.cause, detail.text);
+                    break;
+                case 'whole':
+                    note("You're holding the whole model.");
+                    break;
+                case 'gpu-lost':
+                    console.error(detail.text);
+                    problem('GPU_LOST', detail.cause);
+                    setStatus('GPU stopped', 'err');
+                    break;
+                case 'gpu-error':
+                    console.error(detail.text);
+                    problem('GPU_ERROR', detail.cause);
+                    break;
+                default:
+                    console.info(detail.text);
+            }
             break;
         // A rebuild of the context from this chat's token ids. The message
         // depends on the reason (route.js's rebuild()).
         case 'repair':
             rebuilding = REBUILDS[detail.reason] ?? REBUILDS.repair;
             if (detail.reason === 'resume') {
-                beforeReply(note(`Picking this chat back up: re-reading ${detail.tokens} tokens…`));
+                beforeReply(note('Picking this chat back up…'));
             } else if (detail.reason !== 'rewind') {
-                beforeReply(note(`A peer carrying this chat left (${detail.message}). Rebuilding ` +
-                    `${detail.tokens} tokens of context on the peers that are still here…`));
+                console.info('rebuild:', detail.message);
+                beforeReply(note('Someone running this chat left. Picking it back up on the computers still here…'));
             }
             setStatus(`${rebuilding}…`, 'busy');
             break;
@@ -122,16 +196,15 @@ function handleEngineEvent(type, detail) {
         // No status change: when a 'fix' arrives the local repair is done and
         // the job is in flight. Shown to explain the pause.
         case 'fix':
-            note(`A peer carrying this chat left. Peer ${detail.from} replayed ` +
-                `${detail.rows} tokens of it into another peer, so this chat did not have ` +
-                'to be rebuilt.');
+            console.info(`fix: peer ${detail.from} replayed ${detail.rows} tokens`);
+            note('Someone running this chat left. Another computer took over its part.');
             break;
     }
 }
 
 // Status pill text while a rebuild runs, by reason.
 const REBUILDS = {
-    repair: 'a peer left, rebuilding context',
+    repair: 'someone left, rebuilding context',
     resume: 'resuming chat',
     rewind: 're-reading context',
 };
@@ -144,35 +217,69 @@ let rebuilding = REBUILDS.repair;
 function refresh() {
     const net = engine.net;
 
-    // How much of the model the mesh holds.
+    // The Contribute drawer's numbers. #covered and #role keep the formats
+    // tools/load.mjs reads.
     const cov = net.coverage;
     ui.covered.textContent = net.positions
         ? `${cov.covered}/${cov.total} held` : 'model unknown';
-    ui.covered.className = `pill ${!net.positions ? '' : cov.covered === cov.total ? 'ok'
-        : cov.covered ? 'busy' : 'err'}`;
+    ui.covered.className = !net.positions ? '' : cov.covered === cov.total ? 'ok'
+        : cov.covered ? 'busy' : 'err';
     ui.covered.title = net.positions ? summarise(cov, net) : '';
 
     ui.role.textContent = roleLine(net);
 
-    ui.peers.textContent = `${net.peers.length} peer${net.peers.length === 1 ? '' : 's'}`;
     const loading = net.peers.filter((p) => holding(p) && (p.have ?? p.hi) < p.hi).length;
-    if (loading) ui.peers.textContent += ` · ${loading} loading`;
+    ui.peers.textContent = `${net.peers.length}${loading ? ` (${loading} downloading)` : ''}`
+        + (net.online ? '' : ' · offline');
 
-    // `r`: 0 cannot run, 1 runs but any departure at the thinnest position
-    // breaks it, 2 survives any single departure.
+    // The fewest ready computers holding any one piece. 0 cannot run, 1 runs
+    // but stops if that computer leaves, 2 survives anyone leaving.
     const r = cov.r;
-    ui.depth.textContent = `r ${r}`;
-    ui.depth.className = `pill ${r >= 2 ? 'ok' : r === 1 ? 'busy' : 'err'}`;
+    ui.depth.textContent = String(r);
+    ui.depth.className = r >= 2 ? 'ok' : r === 1 ? 'busy' : 'err';
 
-    // This tab's own VRAM, not the network's.
-    ui.vram.textContent = engine.runner
-        ? `${(engine.vramBytes / 2 ** 30).toFixed(2)} GiB` : '— GiB';
+    // This tab's own GPU memory, not the cluster's.
+    ui.vram.textContent = engine.runner ? `${(engine.vramBytes / 2 ** 30).toFixed(2)} GiB` : '—';
+    ui.ran.textContent = `${engine.ran.toLocaleString()} tokens`;
+    ui.ctx.textContent = `${engine.ctxLen.toLocaleString()} / ${N_MAX.toLocaleString()} tokens`;
 
     renderMap(net, cov);
-    ui.ctx.textContent = `context ${engine.ctxLen}/${N_MAX}`;
-    ui.ran.textContent = `ran ${engine.ran.toLocaleString()} tok`;
-
-    if (!net.online) ui.peers.textContent += ' · offline';
+    renderLanes(net);
+    showHealth(net, cov);
+    showLending();
+    if (net.positions) {
+        // GB of the model held, of the whole model.
+        let held = 0, total = 0;
+        for (let x = 0; x < cov.total; x++) {
+            const b = posBytes?.[x] ?? (27 * 2 ** 30) / cov.total;
+            total += b;
+            if (cov.depths[x]) held += b;
+        }
+        ui.modelHeld.textContent = `${Math.round((cov.covered / cov.total) * 100)}%`;
+        ui.modelGb.textContent = `(${Math.round(held / 2 ** 30)}/${Math.round(total / 2 ** 30)} GB)`;
+    } else {
+        ui.modelHeld.textContent = '—';
+        ui.modelGb.textContent = '';
+    }
+    ui.map.classList.toggle('full', !!net.positions && cov.covered === cov.total);
+    // For the setup screen (welcome.js): the pieces, the other computers'
+    // claims, and how many pieces this tab would hold at a given limit.
+    document.dispatchEvent(new CustomEvent('cluster', {
+        detail: {
+            L: net.positions,
+            peers: net.peers.filter((p) => p.id !== net.id).map(({ lo, hi, have }) => ({ lo, hi, have })),
+            floor: net.minBlocks,
+            // The lobby: which cluster, who else is here, and whether it runs.
+            name: !room ? 'No cluster' : room.private ? `Private cluster · ${room.tag}` : 'Public demo',
+            crowd: net.peers.filter((p) => p.id !== net.id)
+                .map((p) => ({ name: p.name ?? `GPU ${p.id}`, lending: holding(p) })),
+            running: !!net.positions && cov.covered === cov.total,
+            needGb: Math.ceil(missingBytes(cov) / 2 ** 30),
+            modelGb: (posBytes ? posBytes.reduce((x, y) => x + y, 0) : 27 * 2 ** 30) / 2 ** 30,
+            pieceGb: posBytes ? posBytes.map((b) => b / 2 ** 30) : null,
+            capacity: (gb) => engine.capacityFor(gb * 2 ** 30),
+        },
+    }));
 
     ui.authfail.hidden = !net.authFailures;
     ui.authfail.textContent = `${net.authFailures} refused link${net.authFailures === 1 ? '' : 's'}`;
@@ -197,6 +304,59 @@ function refresh() {
     setStatus(ok ? 'ready' : why, ok ? 'ok' : net.refused ? 'err' : 'busy');
     ui.input.disabled = !ok;
     ui.send.disabled = !ok;
+    const short = Math.ceil(missingBytes(cov) / 2 ** 30);
+    ui.input.placeholder = ok ? 'Ask anything'
+        : net.online && net.positions && !net.staffed
+            ? (short ? `Can't chat yet: needs ${short} GB more. Invite people, or lend yours.`
+                : "Can't chat yet: waiting for more people to lend.")
+            : 'Waiting for the cluster…';
+}
+
+// --- The health line ---
+//
+// One sentence on whether the cluster can run and whether it survives someone
+// leaving, e.g. "Running · 3 GPUs · safe if one person leaves" or "Needs about
+// 6 GB more to start".
+
+const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
+function showHealth(net, cov) {
+    let text, kind;
+    if (net.refused) {
+        text = net.refused.replace(/\bmesh\b/g, 'cluster');
+        text = text[0].toUpperCase() + text.slice(1);
+        kind = 'err';
+    } else if (!net.online) {
+        text = 'Reconnecting…';
+        kind = 'busy';
+    } else if (!net.positions) {
+        text = 'Joining…';
+        kind = '';
+    } else if (cov.covered < cov.total) {
+        const need = missingBytes(cov);
+        text = need ? `Needs ${Math.max(1, Math.ceil(need / 2 ** 30))} GB more` : 'Waiting for more people';
+        kind = 'busy';
+    } else {
+        text = 'Running';
+        kind = 'ok';
+    }
+    if (ui.health.textContent !== text) ui.health.textContent = text;
+    ui.health.dataset.state = kind;
+}
+
+// Stored bytes of the pieces nobody ready holds, or 0 when unknown.
+function missingBytes(cov) {
+    if (!posBytes) return 0;
+    let n = 0;
+    for (const [lo, hi] of cov.holes) for (let x = lo; x < hi; x++) n += posBytes[x] ?? 0;
+    return n;
+}
+
+// Bytes per position (the embedding, each block, the head) from the manifest.
+function positionBytes(manifest) {
+    const b = storedBytes(manifest);
+    if (!b) return null;
+    return [b.wte, ...b.blocks, b.norm + b.lm_head];
 }
 
 // E.g. `peer 3 · the embedding + blocks 0–5 (+3 loading)`: id, holding, and
@@ -243,6 +403,7 @@ function buildMap(n, L) {
         cell.className = 'cell';
         if (x === 0 || x === n - 1) cell.classList.add('end');
         cell.dataset.name = posName(x, L);
+        cell.style.setProperty('--i', x);
         ui.map.appendChild(cell);
         map.cells.push(cell);
     }
@@ -276,9 +437,189 @@ function renderMap(net, cov) {
 
         const who = holders(net.readyPeers, x);
         cell.title = `${cell.dataset.name}: `
-            + (who.length ? `${who.length} peer${who.length === 1 ? '' : 's'} (${who.join(', ')})`
-                : claimed.depths[x] ? 'downloading' : 'nobody');
+            + (who.length ? `held by ${plural(who.length, 'computer')} (${who.join(', ')})`
+                : claimed.depths[x] ? 'downloading' : 'missing');
     }
+}
+
+// --- The lanes: one line per computer, under the pieces it holds ---
+//
+// Keyed by peer id, so a line stays put while its numbers change, slides in
+// when a computer joins and fades out when it leaves. `hopMs` is each
+// computer's time per word on this tab's last reply; `firstSeen` is when this
+// tab first saw it.
+
+const hopMs = new Map();
+const firstSeen = new Map();
+const lanes = new Map();       // id -> { el, bar, have, label, detail }
+let openLane = null;
+
+const LANES_KEY = 'chattorrent.lanes';
+// Collapsed until opened; the choice is remembered.
+let lanesShown = (() => { try { return localStorage.getItem(LANES_KEY) === '1'; } catch { return false; } })();
+
+function wireLanes() {
+    const sync = () => {
+        ui.lanes.hidden = !lanesShown;
+        ui.chatters.hidden = !lanesShown || !ui.chattersIcons.childElementCount;
+        ui.lanesBtn.setAttribute('aria-expanded', String(lanesShown));
+    };
+    ui.lanesBtn.addEventListener('click', () => {
+        lanesShown = !lanesShown;
+        try { localStorage.setItem(LANES_KEY, lanesShown ? '1' : '0'); } catch { /* not kept */ }
+        sync();
+    });
+    sync();
+}
+
+const ago = (ms) => {
+    const m = Math.round(ms / 60000);
+    return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : `${Math.round(m / 60)} h ago`;
+};
+
+function laneBytes(net, lo, hi) {
+    let b = 0;
+    for (let x = lo; x < hi; x++) b += posBytes ? posBytes[x] ?? 0 : (27 * 2 ** 30) / (net.positions || 1);
+    return b;
+}
+
+function makeLane(id) {
+    const el = document.createElement('div');
+    el.className = 'lane entering';
+    el.setAttribute('role', 'listitem');
+    el.innerHTML = '<button type="button" class="lane-track lane-grid">' +
+        '<span class="lane-name"></span>' +
+        '<span class="lane-rail"><span class="lane-bar"><span class="lane-have"></span></span></span>' +
+        '<span class="lane-stat"></span>' +
+        '</button><div class="lane-detail" hidden></div>';
+    const lane = {
+        el,
+        bar: el.querySelector('.lane-bar'),
+        have: el.querySelector('.lane-have'),
+        name: el.querySelector('.lane-name'),
+        stat: el.querySelector('.lane-stat'),
+        detail: el.querySelector('.lane-detail'),
+    };
+    el.querySelector('.lane-track').addEventListener('click', () => {
+        openLane = openLane === id ? null : id;
+        for (const [k, l] of lanes) {
+            l.detail.hidden = k !== openLane;
+            l.el.classList.toggle('open', k === openLane);
+        }
+    });
+    requestAnimationFrame(() => el.classList.remove('entering'));
+    return lane;
+}
+
+function renderLanes(net) {
+    const L = net.positions;
+    if (!L) return;
+    const now = performance.now();
+    const holders = net.peers.filter(holding).sort((a, b) => (a.lo - b.lo) || (a.id - b.id));
+    const ids = new Set(holders.map((p) => p.id));
+    for (const p of net.peers) if (!firstSeen.has(p.id)) firstSeen.set(p.id, now);
+
+    // Lines for computers that left fade out, then go.
+    for (const [id, lane] of lanes) {
+        if (ids.has(id) || lane.el.classList.contains('leaving')) continue;
+        lane.el.classList.add('leaving');
+        setTimeout(() => { lane.el.remove(); lanes.delete(id); }, 400);
+        hopMs.delete(id);
+    }
+
+    let prev = null;
+    for (const p of holders) {
+        let lane = lanes.get(p.id);
+        if (!lane || lane.el.classList.contains('leaving')) {
+            lane?.el.remove();
+            lane = makeLane(p.id);
+            lanes.set(p.id, lane);
+        }
+        // Keep the order: sorted by where each range starts.
+        const after = prev ? prev.el.nextSibling : ui.lanes.firstChild;
+        if (lane.el !== after) ui.lanes.insertBefore(lane.el, after);
+        prev = lane;
+
+        const me = p.id === net.id;
+        const have = Math.min(p.have ?? p.hi, p.hi);
+        const name = `${p.name ?? `GPU ${p.id}`}${me ? ' (you)' : ''}`;
+        const ms = hopMs.get(p.id);
+        const loading = have < p.hi;
+        const pct = Math.round(((have - p.lo) / (p.hi - p.lo)) * 100);
+        const gb = laneBytes(net, p.lo, p.hi) / 2 ** 30;
+        const stat = loading ? `${pct}%` : ms != null ? `${Math.round(ms)} ms` : `${gb.toFixed(1)} GB`;
+
+        lane.el.classList.toggle('me', me);
+        lane.el.classList.toggle('loading', loading);
+        lane.bar.style.left = `${(p.lo / L) * 100}%`;
+        lane.bar.style.width = `${((p.hi - p.lo) / L) * 100}%`;
+        lane.have.style.width = `${((have - p.lo) / (p.hi - p.lo)) * 100}%`;
+
+        if (lane.name.textContent !== name) lane.name.textContent = name;
+        if (lane.stat.textContent !== stat) lane.stat.textContent = stat;
+        lane.stat.title = loading ? 'Downloaded so far' : ms != null ? 'Time per word on your last reply' : 'Size of its pieces';
+
+        const held = describeRange(p.lo, have, net.blocks) || 'nothing yet';
+        const lines = [
+            `Holds ${held}${loading ? ` (${pct}% downloaded)` : ''}`,
+            `${gb.toFixed(1)} GB of the model · joined ${ago(now - firstSeen.get(p.id))}`,
+        ];
+        if (ms != null) lines.push(`${Math.round(ms)} ms per word on your last reply`);
+        const detail = lines.join('\n');
+        if (lane.detail.textContent !== detail) lane.detail.textContent = detail;
+    }
+
+    // Everyone only chatting: one person icon each, under the box.
+    const chatters = net.peers.filter((p) => !holding(p));
+    ui.chatters.hidden = !chatters.length || !lanesShown;
+    ui.chattersLabel.textContent = `${chatters.length} just chatting`;
+    ui.chattersLabel.title = `${plural(chatters.length, 'person', 'people')} chatting without lending a GPU`;
+    const sig = chatters.map((p) => p.id).join(',');
+    if (ui.chattersIcons.dataset.sig !== sig) {
+        ui.chattersIcons.dataset.sig = sig;
+        ui.chattersIcons.replaceChildren(...chatters.slice(0, 60).map((p) => {
+            const i = icon(PERSON, 'person');
+            if (p.id === net.id) i.classList.add('me');
+            const who = `${p.name ?? `person ${p.id}`}${p.id === net.id ? ' (you)' : ''}`;
+            i.setAttribute('aria-label', who);
+            i.insertAdjacentHTML('afterbegin', '<title></title>');
+            i.querySelector('title').textContent = who;
+            return i;
+        }));
+        if (chatters.length > 60) ui.chattersIcons.append(`+${chatters.length - 60}`);
+    }
+
+    // The toggle: computers lending, and everyone in the cluster.
+    const label = `${holders.length}|${net.peers.length}`;
+    if (ui.lanesBtn.dataset.sig !== label) {
+        ui.lanesBtn.dataset.sig = label;
+        const everyone = document.createElement('span');
+        everyone.className = 'count';
+        everyone.textContent = plural(net.peers.length, 'person', 'people');
+        const computers = document.createElement('span');
+        computers.textContent = plural(holders.length, 'computer');
+        ui.lanesBtn.replaceChildren(icon(PERSON), everyone, icon(MONITOR), computers);
+        ui.lanesBtn.title = `${plural(net.peers.length, 'person', 'people')} in this cluster, ` +
+            `${plural(holders.length, 'computer')} lending a GPU`;
+    }
+}
+
+// Small line icons for the lanes.
+const MONITOR = '<rect x="2" y="3" width="20" height="13" rx="2"/><path d="M8 21h8M12 16v5"/>';
+const PERSON = '<circle cx="12" cy="7" r="4"/><path d="M4 21c0-4.4 3.6-8 8-8s8 3.6 8 8"/>';
+
+function icon(paths, cls = '') {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('width', '14');
+    svg.setAttribute('height', '14');
+    svg.setAttribute('fill', 'none');
+    svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('stroke-width', '2');
+    svg.setAttribute('stroke-linecap', 'round');
+    if (cls) svg.setAttribute('class', cls);
+    svg.innerHTML = paths;
+    return svg;
 }
 
 // The status text for why a prompt cannot be sent.
@@ -325,7 +666,6 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
     // The mesh comes from the URL fragment. A damaged invite stops here,
     // before any socket opens. Falling back to the global mesh would put
     // someone expecting a private mesh in the public one.
-    let room;
     try {
         secret = readInvite(location.hash);
         room = await openRoom(secret);
@@ -333,12 +673,12 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
         ui.title.textContent = 'ChatTorrent';
         ui.boot.remove();
         showMesh(null);
-        note(`This link cannot be used: ${err.message} This tab has not joined any mesh. ` +
-            `Press "Global mesh" to join the public one instead.`, true);
+        problem('BAD_LINK', err);
         setStatus('bad invite link', 'err');
         return;
     }
     showMesh(room);
+    showSide();
     openStore(room);
 
     ui.bootnote.textContent = 'connecting to the signaling server…';
@@ -355,8 +695,7 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
         console.warn('connect failed:', err);
         ui.title.textContent = 'ChatTorrent';
         ui.boot.remove();
-        note(`This tab cannot reach the mesh or the checkpoint (${err.message}), so it can ` +
-            `neither prompt the mesh nor hold blocks for it.`, true);
+        problem('NO_CONNECTION', err);
         refresh();
         return;
     }
@@ -365,32 +704,33 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
     CHAT = chatFormat(manifest);
     TURN_RE = stopRe(CHAT);
     running = { model: manifest.model ?? null, weights: engine.net.weightsUrl ?? null };
+    posBytes = positionBytes(manifest);
+    showSide();
     // A chat picked from the list during connect() is given to the engine
     // here.
     attach();
     render();
     ui.thinkingLabel.hidden = CHAT !== 'qwen';
-    ui.model.textContent = manifest.model.split('/').pop();
+    // The model's name: beside the brand in the header, and heading its bar
+    // on the pre-join card.
+    const modelName = manifest.model.split('/').pop();
+    ui.model.textContent = modelName;
     ui.model.title = `model: ${manifest.model}`;
     ui.model.hidden = false;
+    ui.stripModel.title = manifest.model;
+    ui.modelLabel.textContent = modelName;
 
     if (!engine.canPrompt) {
-        note(`This tab could not load the tokenizer and so cannot send prompts. It can ` +
-            `still hold blocks for other peers.`, true);
+        problem('NO_TOKENIZER');
     }
 
     if (engine.net.relayOnly && !engine.net.relay) {
-        note('The signaling server offers no TURN relay, and this tab only links through one ' +
-            '(so no peer ever sees its IP address). No link can open until the server is given ' +
-            'TURN_KEY_ID and TURN_API_TOKEN. Or open this page with ?direct=1 to link directly, ' +
-            'which shows your address to the peers you link to.', true);
+        // For whoever runs the server: TURN_KEY_ID and TURN_API_TOKEN are
+        // unset, and this tab only links through a relay. ?direct=1 links
+        // directly instead, showing its address to the peers it links to.
+        problem('NO_RELAY', 'the signaling server offers no TURN relay (set TURN_KEY_ID and TURN_API_TOKEN, or open with ?direct=1)');
     }
 
-    if (room.private) {
-        note(`This is a private mesh (${room.tag}). Only people with its invite link can join, ` +
-            `and only their tabs will run your chats. It works once its members' GPUs hold the ` +
-            `whole model between them. Share the link with "Copy invite link".`);
-    }
 
     refresh();
     if (engine.canPrompt) ui.input.focus();
@@ -403,32 +743,33 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
     } catch (err) {
         console.warn('placement:', err);
         ui.boot.remove();
-        note(`Spectator: this tab holds no blocks and will never be routed a job ` +
-            `(${err.message}). It can still prompt the mesh like any other tab.`, true);
+        problem('LEND_FAILED', err);
         return;
     }
 
     // The GPU is opened only after the visitor agrees in the welcome popup,
     // and only up to the amount they chose.
-    ui.bootwhat.textContent = 'waiting for your answer…';
-    ui.bootnote.textContent = 'about contributing your GPU';
+    ui.bootwhat.textContent = 'Waiting for your answer…';
+    ui.bootnote.textContent = 'about lending your GPU';
     const { contribute, limit } = await gpuConsent;
+    ui.vramlimit.value = limit;
     if (!contribute) {
         ui.boot.remove();
-        note(`Chat only: this tab is not using your GPU and holds no part of the model. ` +
-            `Reload the page to change your mind.`);
+        lending = false;
         refresh();
         return;
     }
-    ui.bootwhat.textContent = 'joining the mesh…';
-    ui.vramlimit.value = limit;
+    lending = true;
+    ui.bootwhat.textContent = 'Lending your GPU…';
 
     applyVramLimit();
     // Not awaited. serve() reports its own failures; the catch is for bugs.
     engine.serve({ blocks: blocksParam(), vram: vramParam(), at, slowMs: slowMs() })
-        .then(({ note: msg, error }) => {
+        .then(({ note: msg, code, cause }) => {
             ui.boot.remove();
-            note(msg, error);
+            if (code === 'grow-stopped') grewTo(cause, msg);
+            else if (code === 'lend-failed') { console.warn(msg); problem(lendProblem(cause), cause); }
+            else console.info(msg);
             refresh();
         })
         .catch((err) => console.error('serve:', err));
@@ -499,41 +840,37 @@ const directParam = () => new URLSearchParams(location.search).get('direct') ===
 // `?slow=ms`: wait this long between positions while downloading.
 const slowMs = () => Math.max(0, Number(new URLSearchParams(location.search).get('slow')) || 0);
 
-// The header's mesh controls. `room` null means no mesh (a damaged invite);
-// only the link back to the global mesh is shown.
-function showMesh(room) {
-    const priv = !!room?.private;
-    ui.mesh.textContent = !room ? 'no mesh' : priv ? `private mesh · ${room.tag}` : 'global mesh';
-    ui.mesh.className = `pill ${!room ? 'err' : priv ? 'private' : ''}`;
-    ui.mesh.title = !room ? 'this tab has not joined any mesh'
-        : priv ? `A private mesh. Everyone in it sees the same tag (${room.tag}); only tabs ` +
-                 'opened from its invite link can link to this one.'
-        : 'The public mesh: anyone who opens this page joins it and may run your chats.';
-    ui.newmesh.hidden = !room || priv;
+// The header's cluster controls. `r` null means no cluster (a damaged
+// invite); only the link to the public demo is shown.
+function showMesh(r) {
+    const priv = !!r?.private;
+    ui.mesh.textContent = !r ? 'no cluster' : priv ? `private · ${r.tag}` : 'public demo';
+    ui.mesh.className = `pill ${!r ? 'err' : priv ? 'private' : 'public'}`;
+    ui.mesh.title = !r ? 'This tab has not joined any cluster.'
+        : priv ? `A private cluster. Everyone in it sees the same tag (${r.tag}). Only people ` +
+                 'with its link can join, and only their computers run your chats.'
+        : 'The public demo: anyone can join, and their computers may run your chats. ' +
+          "Don't send anything personal.";
+    ui.newmesh.hidden = !r || priv;
     ui.invite.hidden = !priv;
-    ui.leave.hidden = !(priv || !room);
+    ui.leave.hidden = !(priv || !r);
     ui.leave.href = location.pathname;         // this page with no invite or query
-    ui.leave.textContent = priv ? 'Leave' : 'Global mesh';
-    ui.chatsMesh.textContent = !room ? 'no mesh' : priv ? `private mesh ${room.tag}` : 'global mesh';
-    // The limits apply when this tab creates a private mesh.
-    ui.meshchatsLabel.hidden = !room || priv;
-    ui.meshsessionsLabel.hidden = !room || priv;
+    ui.leave.textContent = priv ? 'Leave' : 'Public demo';
+    ui.chatsMesh.textContent = !r ? 'no cluster' : priv ? `private ${r.tag}` : 'public demo';
 }
 
 // Add the mesh's limit on replies at once to its pill, once the welcome has
 // brought it.
 function showChatLimit() {
     const max = engine?.net?.maxChats;
-    if (max) ui.mesh.title += ` Up to ${max} replies can generate at once.`;
+    if (max) ui.mesh.title += ` Up to ${max} replies can run at once.`;
     const kept = engine?.net?.sessions;
-    if (kept) ui.mesh.title += ` Each GPU keeps ${kept} chat${kept === 1 ? '' : 's'} in memory.`;
+    if (kept) ui.mesh.title += ` Each GPU keeps ${plural(kept, 'chat')} in memory.`;
 }
 
 // The limit on replies at once chosen when this tab created its private mesh,
 // kept in sessionStorage so the tab's reload and reconnects send it again.
 // Null for an invitee and in the global mesh.
-const chatsKey = (s) => `chattorrent:chats:${s}`;
-const sessionsKey = (s) => `chattorrent:sessions:${s}`;
 function creatorNumber(s, key) {
     if (!s) return null;
     try {
@@ -547,35 +884,32 @@ const creatorChats = (s) => creatorNumber(s, chatsKey);
 // The chats each peer keeps in memory, chosen and kept the same way.
 const creatorSessions = (s) => creatorNumber(s, sessionsKey);
 
-async function copyInvite() {
-    const url = inviteUrl(secret);
+// The invite link, with this person's name if they gave one.
+const myName = () => { try { return cleanName(sessionStorage.getItem(nameKey(secret))); } catch { return ''; } };
+const shareUrl = () => inviteUrl(secret, location, myName());
+
+async function copyText(text, button, label) {
     try {
-        await navigator.clipboard.writeText(url);
-        ui.invite.textContent = 'copied';
+        await navigator.clipboard.writeText(text);
+        button.textContent = 'Copied';
     } catch {
         // The clipboard API needs a secure origin (not plain http on a LAN).
-        window.prompt('Copy this invite link and send it only to people you trust:', url);
+        window.prompt('Copy this invite link and send it only to people you trust:', text);
     }
-    setTimeout(() => { ui.invite.textContent = 'Copy invite link'; }, 2000);
+    setTimeout(() => { button.textContent = label; }, 2000);
 }
+
+const copyInvite = () => copyText(shareUrl(), ui.invite, 'Invite');
 
 function wireEvents() {
     // A new fragment names a new mesh, and a fragment change does not reload
     // the page. Reload so the engine always matches the mesh in the URL.
     // Covers Create, a hand-edited link, and Back/Forward.
     window.addEventListener('hashchange', () => location.reload());
+    // Starting a private cluster happens on the create page.
     ui.newmesh.addEventListener('click', () => {
-        if (state.busy && !confirm('A reply is still being generated. Leave it and move to a new private mesh?')) return;
-        const fresh = newSecret();
-        const n = Number(ui.meshchats.value);
-        if (Number.isInteger(n) && n >= 1) {
-            try { sessionStorage.setItem(chatsKey(fresh), String(n)); } catch { /* no limit then */ }
-        }
-        const kept = Number(ui.meshsessions.value);
-        if (Number.isInteger(kept) && kept >= 1) {
-            try { sessionStorage.setItem(sessionsKey(fresh), String(kept)); } catch { /* the default then */ }
-        }
-        location.hash = `mesh=${fresh}`;
+        if (state.busy && !confirm('A reply is still being written. Leave it and start a private cluster?')) return;
+        location.href = '/create';
     });
     ui.invite.addEventListener('click', copyInvite);
 
@@ -600,13 +934,15 @@ function wireEvents() {
     });
     wireSettings();
     wireChats();
+    wireLanes();
+    wireSide();
 }
 
-// --- The settings drawer ---
+// --- The settings and Contribute drawers ---
 //
-// Presentation only: submitPrompt() reads the fields by id. Each field's HTML
-// value is its default, so Reset and the gear's changed-dot compare against
-// defaultValue / defaultSelected.
+// Settings is presentation only: submitPrompt() reads the fields by id. Each
+// field's HTML value is its default, so Reset and the gear's changed-dot
+// compare against defaultValue / defaultSelected.
 
 const settingFields = () => ui.settings.querySelectorAll('input, select');
 
@@ -614,23 +950,39 @@ const isDefault = (el) => el.tagName === 'SELECT'
     ? [...el.options].every((o) => o.selected === o.defaultSelected)
     : el.value === el.defaultValue;
 
-function openSettings(open) {
+// The right-hand drawers, by name: each has a button that opens it and a
+// close button. At most one is open.
+const DRAWERS = {
+    settings: { el: 'settings', button: 'settingsBtn', close: 'settingsClose' },
+    contrib: { el: 'contrib', button: 'contribBtn', close: 'contribClose' },
+};
+
+function openDrawer(name, open) {
     if (open) openChats(false);
-    ui.settings.hidden = ui.scrim.hidden = !open;
-    ui.settingsBtn.setAttribute('aria-expanded', String(open));
-    (open ? ui.settingsClose : ui.settingsBtn).focus();
+    for (const [key, d] of Object.entries(DRAWERS)) {
+        const show = open && key === name;
+        const wasOpen = !ui[d.el].hidden;
+        ui[d.el].hidden = !show;
+        ui[d.button].setAttribute('aria-expanded', String(show));
+        if (show) ui[d.close].focus();
+        else if (wasOpen && (key === name || name === null)) ui[d.button].focus();
+    }
+    ui.scrim.hidden = !open;
 }
+const openSettings = (open) => openDrawer('settings', open);
 
 function markChanged() {
     ui.settingsBtn.classList.toggle('changed', ![...settingFields()].every(isDefault));
 }
 
 function wireSettings() {
-    ui.settingsBtn.addEventListener('click', () => openSettings(ui.settings.hidden));
-    ui.settingsClose.addEventListener('click', () => openSettings(false));
-    ui.scrim.addEventListener('click', () => openSettings(false));
+    for (const [name, d] of Object.entries(DRAWERS)) {
+        ui[d.button].addEventListener('click', () => openDrawer(name, ui[d.el].hidden));
+        ui[d.close].addEventListener('click', () => openDrawer(name, false));
+    }
+    ui.scrim.addEventListener('click', () => openDrawer(null, false));
     document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && !ui.settings.hidden) openSettings(false);
+        if (e.key === 'Escape' && Object.values(DRAWERS).some((d) => !ui[d.el].hidden)) openDrawer(null, false);
     });
     ui.settings.addEventListener('input', markChanged);
     ui.settings.addEventListener('change', markChanged);
@@ -640,11 +992,37 @@ function wireSettings() {
             else el.value = el.defaultValue;
         }
         markChanged();
-        // #vramlimit has no `value` attribute, so Reset blanks it, and
-        // assigning `value` fires no `input` event. The engine is told
-        // explicitly, so it does not stay limited while the field reads blank.
-        applyVramLimit();
     });
+
+    // Lending is decided at boot, so starting or stopping saves the choice
+    // and reloads. Chats are saved, so the chat on screen comes back.
+    const relend = (contribute) => {
+        if (state.busy && !confirm('A reply is still being written. Stop it and reload?')) return;
+        saveChoice({ contribute, limit: ui.vramlimit.value.trim() });
+        location.reload();
+    };
+    ui.lendStart.addEventListener('click', () => relend(true));
+    ui.lendStop.addEventListener('click', () => relend(false));
+    ui.vramlimit.addEventListener('change', () => {
+        if (parseByteLimit(ui.vramlimit.value) != null) saveChoice({ contribute: lending, limit: ui.vramlimit.value.trim() });
+    });
+}
+
+// The Contribute drawer's lending state, and the live square on its button.
+function showLending() {
+    const canLend = !!navigator.gpu;
+    const me = engine?.net?.me;
+    const holds = lending && holding(me);
+    const limit = ui.vramlimit.value.trim();
+    ui.contribBtn.classList.toggle('lending', holds);
+    ui.lendStart.hidden = lending || !canLend;
+    ui.lendStop.hidden = !lending;
+    ui.contribState.textContent = !canLend && !lending
+        ? "This browser can't lend its GPU. Chatting works as normal."
+        : !lending ? 'Not lending. You can still chat.'
+        : !holds ? `Starting to lend${limit ? ` up to ${limit.toUpperCase()}` : ''}…`
+        : `Lending ${limit ? `up to ${limit.toUpperCase()}` : 'with no limit'}. ` +
+          `Thank you: this keeps the cluster running.`;
 }
 
 // --- The chat list ---
@@ -672,7 +1050,7 @@ function layoutChats() {
         ui.chats.hidden = false;
         ui.chats.setAttribute('role', 'complementary');
         ui.chats.removeAttribute('aria-modal');
-        if (ui.settings.hidden) ui.scrim.hidden = true;
+        if (ui.settings.hidden && ui.contrib.hidden) ui.scrim.hidden = true;
     } else {
         ui.chats.setAttribute('role', 'dialog');
         ui.chats.setAttribute('aria-modal', 'true');
@@ -763,7 +1141,7 @@ async function renderList() {
     const priv = store.mesh !== 'global';
     ui.chatsElsewhere.hidden = !(priv && elsewhere);
     ui.chatsElsewhere.textContent = `${elsewhere} chat${elsewhere === 1 ? ' is' : 's are'} saved ` +
-        'for other meshes. Your global-mesh chats are still saved. Leave this mesh to see them.';
+        'for other clusters, including the public demo. Leave this cluster to see them.';
     ui.chatsEmpty.hidden = recs.length > 0;
     ui.chatsForget.hidden = !recs.length;
 
@@ -844,7 +1222,7 @@ async function deleteChat(rec) {
 async function forgetChats() {
     const n = (await store.list()).length;
     if (state.busy || !n) return;
-    if (!confirm(`Delete all ${n} chat${n === 1 ? '' : 's'} saved for this mesh in this browser?`)) return;
+    if (!confirm(`Delete all ${n} chat${n === 1 ? '' : 's'} saved for this cluster in this browser?`)) return;
     for (const conv of convs.values()) if (engine?.conversation) engine.discard(conv);
     convs.clear();
     await store.forgetAll();
@@ -893,16 +1271,105 @@ function render() {
     ui.messages.replaceChildren(...(ui.boot?.isConnected ? [ui.boot] : []));
     for (const m of current.rec?.messages ?? []) {
         if (m.role === 'user') { addMessage('you', m.text, 'user'); continue; }
-        const out = addMessage('mesh', m.text, 'model');
+        const out = addMessage('ChatTorrent', m.text, 'model');
         if (m.reasoning != null) out.reasoning = m.reasoning;
         out.meta = m.meta ?? '';
     }
     if (current.rec && foreign()) {
-        note(`This chat was made on ${current.rec.model ?? 'another model'}; the mesh now runs ` +
-            `${running.model}. Its token ids mean nothing to this one's tokenizer, so it is ` +
-            'read-only here.');
+        note(`This chat was made on ${current.rec.model ?? 'another model'}, and the cluster now ` +
+            `runs ${running.model}, so it is read-only here.`);
+    }
+    if (!current.rec?.messages?.length) {
+        if (room?.private && !sideWide.matches) ui.messages.appendChild(shareCard());
+        ui.messages.appendChild(suggestions());
+        ui.transcript.scrollTop = 0;
+        return;
     }
     scrollDown(true);
+}
+
+// --- The invite panel, down the right side of a private cluster ---
+
+const sideWide = window.matchMedia('(min-width: 1200px)');
+
+function showSide() {
+    const on = !!room?.private && sideWide.matches;
+    ui.sidePanel.hidden = !on;
+    document.body.classList.toggle('side-open', on);
+    if (on) ui.sidePanel.replaceChildren(shareCard());
+}
+
+function wireSide() {
+    sideWide.addEventListener('change', () => { showSide(); render(); });
+}
+
+// The card shown in an empty chat in a private cluster: the invite link to
+// copy, and an optional name shown to whoever opens it.
+function shareCard() {
+    const card = document.createElement('section');
+    card.className = 'share';
+    const creator = (() => { try { return sessionStorage.getItem(creatorKey(secret)) === '1'; } catch { return false; } })();
+    const total = posBytes ? posBytes.reduce((a, b) => a + b, 0) : 0;
+    const gb = total ? Math.round(total / 2 ** 30) : 27;
+    card.innerHTML = `<h2></h2><p>Anyone with this link can join, lend their GPU and chat. Send it only to people you trust.</p>
+        <div class="share-link"><input type="text" readonly aria-label="Invite link"><button type="button" class="primary">Copy link</button></div>
+        <label class="share-name">Your name, so they see "… invited you" <input type="text" placeholder="e.g. Ana (optional)" autocomplete="off"></label>
+        <p class="small"></p>`;
+    card.querySelector('h2').textContent = creator ? 'Your private cluster is ready. Invite your group.' : 'Invite people to this cluster';
+    card.querySelector('.small').textContent = `It runs once the group lends about ${gb} GB of GPU memory in total. ` +
+        'A little extra lets people leave without stopping the chats.';
+    const link = card.querySelector('.share-link input');
+    const name = card.querySelector('.share-name input');
+    const copy = card.querySelector('.share-link button');
+    name.maxLength = NAME_MAX;
+    name.value = myName();
+    link.value = shareUrl();
+    name.addEventListener('input', () => {
+        try { sessionStorage.setItem(nameKey(secret), cleanName(name.value)); } catch { /* not kept */ }
+        link.value = shareUrl();
+    });
+    link.addEventListener('focus', () => link.select());
+    copy.addEventListener('click', () => copyText(shareUrl(), copy, 'Copy link'));
+    return card;
+}
+
+// Example prompts for an empty chat. A click puts one in the input.
+// Two of about the same length on the first row, so it centres evenly, and
+// one centred under them.
+const EXAMPLES = [
+    'Plan a cheap 3-day trip to Lisbon',
+    'Help me write a birthday message',
+    'Why is my Python script so slow?',
+];
+
+function suggestions() {
+    const box = document.createElement('section');
+    box.className = 'suggest';
+    const h = document.createElement('p');
+    h.className = 'suggest-head';
+    h.textContent = 'Try asking';
+    box.appendChild(h);
+    for (const text of EXAMPLES) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = text;
+        b.addEventListener('click', () => {
+            // While chat cannot start, point at the input's reason instead.
+            if (ui.input.disabled) {
+                ui.input.classList.remove('nudge');
+                void ui.input.offsetWidth;            // restart the animation
+                ui.input.classList.add('nudge');
+                clearTimeout(ui.input.nudgeTimer);
+                ui.input.nudgeTimer = setTimeout(() => ui.input.classList.remove('nudge'), 1400);
+                return;
+            }
+            ui.input.value = text;
+            ui.input.dispatchEvent(new Event('input'));
+            ui.input.focus();
+        });
+        box.appendChild(b);
+    }
+    return box;
 }
 
 // Save one turn to the chat's record: the messages as shown, and the token ids
@@ -919,7 +1386,7 @@ async function saveTurn(user, reply) {
         await store.save(current.rec);
     } catch (err) {
         console.warn('saving the chat:', err);
-        note(`This turn could not be saved (${err.message}).`, true);
+        problem('SAVE_FAILED', err);
     }
     renderList();
 }
@@ -955,8 +1422,8 @@ async function submitPrompt() {
     const seat = await engine.net.seat();
     if (!seat.ok) {
         setBusy(false);
-        note(`The mesh is at its limit of ${seat.max} replies at once. Try again in a moment.`, true);
-        setStatus('mesh busy', 'busy');
+        problem('REPLY_LIMIT', `the cluster's limit of ${seat.max} replies at once`);
+        setStatus('cluster busy', 'busy');
         return;
     }
 
@@ -971,16 +1438,22 @@ async function submitPrompt() {
 
     ui.stop.disabled = false;
     setStatus('generating…', 'busy');
-    const out = addMessage('mesh', '', 'model streaming');
+    ui.messages.querySelector('.share')?.remove();
+    ui.messages.querySelector('.suggest')?.remove();
+    const out = addMessage('ChatTorrent', '', 'model streaming');
+    out.meta = 'Writing…';
 
     let fed = true;
     try {
         fed = await respond(text, opts, out, reply);
     } catch (err) {
         console.error(err);
-        note(`generation failed: ${err.message}`, true);
+        let key = classify(err);
+        if (key === 'GPU_FULL' || key === 'NO_WEBGPU') key = 'REPLY_FAILED';
+        problem(key, err);
         setStatus('error', 'err');
-        reply.meta = `failed: ${err.message}`;
+        reply.meta = `Failed (${PROBLEMS[key].code})`;
+        out.meta = reply.meta;
     } finally {
         engine.net.unseat();
         out.el.classList.remove('streaming');
@@ -1014,8 +1487,7 @@ async function respond(text, opts, out, reply) {
     } catch (err) {
         if (err instanceof ContextFullError) {
             out.el.remove();
-            note(`That prompt needs ${err.needed} tokens and ${err.room} are left in the ` +
-                `${N_MAX}-token context. Start a new chat from the chat list.`, true);
+            problem('CHAT_FULL', err);
             setStatus('context full', 'err');
             return false;
         }
@@ -1032,11 +1504,21 @@ async function respond(text, opts, out, reply) {
     }
     const summary = summarize(engine.lastProfile);
     const hopsLine = formatLine(summary);
-    show('meta', `${turn.ids.length} tokens · ${turn.perTok.toFixed(0)} ms/tok · ` +
+    // Under the reply: how many GPUs ran it and how fast, in words. The token
+    // timings are the hover text; tools/load.mjs reads them from there.
+    const gpus = new Set((summary.decode?.hops ?? []).map((h) => h.id)).size;
+    for (const h of summary.decode?.hops ?? []) if (h.ms?.med != null) hopMs.set(h.id, h.ms.med);
+    const words = turn.answer.trim() ? turn.answer.trim().split(/\s+/).length : 0;
+    const secs = turn.ids.length * turn.perTok / 1000;
+    const wps = secs > 0 && words ? words / secs : 0;
+    show('meta', [gpus ? `via ${plural(gpus, 'GPU')}` : null,
+                  wps ? `${wps < 10 ? wps.toFixed(1) : wps.toFixed(0)} words/s` : null]
+        .filter(Boolean).join(' · '));
+    out.detail = `${turn.ids.length} tokens · ${turn.perTok.toFixed(0)} ms/tok · ` +
         `prefill ${turn.prefillMs.toFixed(0)} ms for ${turn.promptTokens} · ${turn.stopped}` +
-        (hopsLine ? ` · ${hopsLine}` : ''));
+        (hopsLine ? ` · ${hopsLine}` : '');
     showProfile(out.el, summary, engine.lastProfile);
-    ui.speed.textContent = turn.perTok ? `${(1000 / turn.perTok).toFixed(1)} tok/s` : '—';
+    ui.speed.textContent = turn.perTok ? `${(1000 / turn.perTok).toFixed(1)} tokens/s` : '—';
     setStatus('ready', 'ok');
     scrollDown();
     return true;
@@ -1049,17 +1531,17 @@ function showProfile(el, summary, profile) {
     if (!summary.decode && !summary.prefill) return;
     const box = document.createElement('details');
     box.className = 'prof';
-    box.innerHTML = '<summary>timing</summary><pre></pre><button type="button">copy JSON</button>';
+    box.innerHTML = '<summary>Timing</summary><pre></pre><button type="button">Copy JSON</button>';
     box.querySelector('pre').textContent = formatText(summary);
     const button = box.querySelector('button');
     button.addEventListener('click', async () => {
         const json = JSON.stringify({ at: new Date().toISOString(), summary, samples: profile.samples });
         try {
             await navigator.clipboard.writeText(json);
-            button.textContent = 'copied';
+            button.textContent = 'Copied';
         } catch {
             console.log(json);
-            button.textContent = 'copy failed, logged to the console';
+            button.textContent = 'Copy failed, logged to the console';
         }
     });
     el.appendChild(box);

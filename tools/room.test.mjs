@@ -7,8 +7,8 @@
 import { webcrypto } from 'node:crypto';
 globalThis.crypto ??= webcrypto;
 
-import { newSecret, inviteUrl, readInvite, openRoom, roomKey, GLOBAL, SECRET_BYTES,
-         unb64url } from '../web/room.js';
+import { newSecret, inviteUrl, readInvite, inviteFrom, cleanName, NAME_MAX, openRoom, roomKey,
+         GLOBAL, SECRET_BYTES, unb64url } from '../web/room.js';
 
 let pass = 0, fail = 0;
 const ok = (name, cond, detail = '') => {
@@ -52,6 +52,25 @@ console.log('\nreadInvite: fails closed');
     throws('trailing junk throws', () => readInvite(`#mesh=${s}&x=1`));
     throws('a mistyped key throws rather than landing in global', () => readInvite(`#Mesh=${s}`));
     throws('any other fragment throws rather than landing in global', () => readInvite('#hello'));
+}
+
+console.log('\nthe inviter\'s name');
+{
+    const s = newSecret();
+    const base = { href: 'https://chat.example/chat' };
+    const url = inviteUrl(s, base, 'Ana Ruiz');
+    eq('the name follows the code in the fragment', url, `https://chat.example/chat#mesh=${s}&from=Ana%20Ruiz`);
+    eq('the link still reads back as the same secret', readInvite(new URL(url).hash), s);
+    eq('and the name reads back', inviteFrom(new URL(url).hash), 'Ana Ruiz');
+    eq('no name, no from', inviteUrl(s, base, '  '), `https://chat.example/chat#mesh=${s}`);
+    eq('a link without a name has no inviter', inviteFrom(`#mesh=${s}`), '');
+    eq('the global mesh has no inviter', inviteFrom(''), '');
+    eq('a broken percent-escape is ignored', inviteFrom(`#mesh=${s}&from=%E0%A4%A`), '');
+    eq('control characters are removed and spaces collapsed', cleanName(' Ana\u0000\n  Ben '), 'Ana Ben');
+    eq('a long name is cut to NAME_MAX characters', [...cleanName('é'.repeat(80))].length, NAME_MAX);
+    eq('an empty from still reads as the invite', readInvite(`#mesh=${s}&from=`), s);
+    throws('a from with a bad code still throws', () => readInvite(`#mesh=${s.slice(0, 21)}&from=Ana`));
+    throws('a second parameter after from throws', () => readInvite(`#mesh=${s}&from=Ana&x=1`));
 }
 
 console.log('\nthe key schedule');

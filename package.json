@@ -6,7 +6,8 @@
   "scripts": {
     "signal": "node signal-server.js",
     "build": "node tools/build-site.mjs",
-    "test": "node tools/parse.test.mjs && node tools/split.test.mjs && node tools/tokenizer.test.mjs && node tools/prompt.test.mjs && node tools/room.test.mjs && node tools/history.test.mjs && node tools/sampling.test.mjs && node tools/profile.test.mjs && node tools/loader.test.mjs && node tools/stage.test.mjs && node tools/net.test.mjs && node tools/mesh.test.mjs && node tools/engine.test.mjs && node tools/grow.test.mjs",
+    "preview": "node tools/build-site.mjs > /dev/null && node tools/preview.mjs",
+    "test": "node tools/parse.test.mjs && node tools/split.test.mjs && node tools/tokenizer.test.mjs && node tools/prompt.test.mjs && node tools/room.test.mjs && node tools/markdown.test.mjs && node tools/errors.test.mjs && node tools/history.test.mjs && node tools/sampling.test.mjs && node tools/profile.test.mjs && node tools/loader.test.mjs && node tools/stage.test.mjs && node tools/net.test.mjs && node tools/mesh.test.mjs && node tools/engine.test.mjs && node tools/grow.test.mjs",
     "test:gpu": "node tools/tinymodel.mjs && node tools/mesh.gpu.test.mjs"
   },
   "dependencies": {

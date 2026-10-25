@@ -10,6 +10,26 @@ import { assign, covers, minDepth, gaps, served, SESSIONS } from './web/split.js
 
 const send = (ws, msg) => ws.readyState === 1 && ws.send(JSON.stringify(msg));
 
+// The name a peer is shown under, e.g. "amber-otter". Made here, not sent by
+// the peer, so nobody can choose what others see.
+const ADJECTIVES = ['amber', 'azure', 'brisk', 'calm', 'cedar', 'clever', 'coral', 'crisp', 'dapper',
+    'dusky', 'eager', 'fern', 'gentle', 'golden', 'hazel', 'honey', 'indigo', 'ivory', 'jade', 'jolly',
+    'keen', 'lilac', 'lucky', 'maple', 'mellow', 'misty', 'nimble', 'olive', 'plucky', 'quiet', 'rosy',
+    'russet', 'sage', 'silver', 'snowy', 'sunny', 'swift', 'tawny', 'velvet', 'witty'];
+const ANIMALS = ['badger', 'beaver', 'bison', 'crane', 'dingo', 'eagle', 'egret', 'ferret', 'finch',
+    'fox', 'gecko', 'heron', 'ibis', 'jackal', 'koala', 'lemur', 'lynx', 'magpie', 'marten', 'mole',
+    'moose', 'newt', 'ocelot', 'orca', 'otter', 'owl', 'panda', 'puffin', 'quail', 'raven', 'robin',
+    'seal', 'shrew', 'stoat', 'swan', 'tapir', 'tern', 'toad', 'vole', 'wren'];
+const pick = (list) => list[Math.floor(Math.random() * list.length)];
+
+function freshName(taken) {
+    for (let i = 0; i < 50; i++) {
+        const name = `${pick(ADJECTIVES)}-${pick(ANIMALS)}`;
+        if (!taken.has(name)) return name;
+    }
+    return `${pick(ADJECTIVES)}-${pick(ANIMALS)}-${Math.floor(Math.random() * 1000)}`;
+}
+
 export class Room {
     // `label` prefixes this room's log lines: '' for the global mesh and
     // `room <tag> ` for a private one. The tag is a hash prefix, not the token.
@@ -31,7 +51,7 @@ export class Room {
         // Peers with a reply generating: id -> the lease timer.
         this.chats = new Map();
         this.log = (line) => log(`${this.label}${line}`);
-        // id -> { ws, cap, lo, hi, have, ready, alive }. `lo`/`hi` are null
+        // id -> { ws, name, cap, lo, hi, have, ready, alive }. `lo`/`hi` are null
         // until the peer states a capacity and is placed. A peer with null
         // `lo` holds nothing.
         this.peers = new Map();
@@ -41,7 +61,8 @@ export class Room {
     get full() { return this.peers.size >= this.maxPeers; }
 
     add(id, ws) {
-        this.peers.set(id, { ws, cap: 0, lo: null, hi: null, have: null, ready: false, alive: true });
+        const name = freshName(new Set([...this.peers.values()].map((p) => p.name)));
+        this.peers.set(id, { ws, name, cap: 0, lo: null, hi: null, have: null, ready: false, alive: true });
         this.log(`+ peer ${id} (${this.peers.size} online): ${this.health()}`);
     }
 
@@ -61,7 +82,7 @@ export class Room {
     // claim and never decreasing. See served() in web/split.js.
     roster() {
         return [...this.peers].map(([id, p]) =>
-            ({ id, lo: p.lo, hi: p.hi, have: p.have, cap: p.cap, ready: p.ready }));
+            ({ id, name: p.name, lo: p.lo, hi: p.hi, have: p.have, cap: p.cap, ready: p.ready }));
     }
 
     broadcast() {

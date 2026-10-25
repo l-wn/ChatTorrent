@@ -134,14 +134,16 @@ const PROMPTS = PROMPT_SET === 'copy' ? COPY_PROMPTS : CHAT_PROMPTS;
 
 const call = (fn, arg) => `(${fn})(${JSON.stringify(arg ?? null)})`;
 
-// Tick both agreement boxes, then press one of the two answers (web/welcome.js).
+// Answer the setup screen (web/welcome.js): lend the default amount, or move
+// the slider to zero to only chat, then press "Join and chat". The screen is
+// not shown when this browser profile has answered it before.
 const answerWelcome = (contribute) => {
-    for (const id of ['agreeAge', 'agreeTerms']) {
-        const box = document.getElementById(id);
-        box.checked = true;
-        box.dispatchEvent(new Event('change'));
+    if (!document.getElementById('welcome').open) return;
+    if (!contribute) {
+        document.getElementById('lendHandle')
+            .dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true }));
     }
-    document.getElementById(contribute ? 'welcomeYes' : 'welcomeNo').click();
+    document.getElementById('welcomeYes').click();
 };
 
 // Wait until the composer is enabled, the mesh refuses this tab, or the
@@ -234,19 +236,23 @@ const turn = async ({ text, tokens, timeout, spec, greedy }) => {
     const reply = replies().length > repliesBefore ? replies().at(-1) : null;
 
     const errs = errors().slice(errsBefore).map((e) => e.textContent.trim());
+    // Each problem shown in the chat carries its code (web/errors.js).
+    const codes = errors().slice(errsBefore).map((e) => e.dataset.code ?? '');
     const told = notes().slice(notesBefore).map((e) => e.textContent);
-    // E.g. "64 tokens · 250 ms/tok · prefill 900 ms for 21 · max tokens" (peer.js).
-    const meta = reply?.querySelector('.meta').textContent ?? '';
+    // E.g. "64 tokens · 250 ms/tok · prefill 900 ms for 21 · max tokens", the
+    // hover text of the line under the reply (peer.js).
+    const meta = reply?.querySelector('.meta').title ?? '';
     const mm = /^(\d+) tokens · (\d+) ms\/tok · prefill (\d+) ms for (\d+) · ([^·]*)/.exec(meta);
 
-    const failed = errs.find((e) => /generation failed/.test(e)) ?? errs[0] ?? null;
+    // E20 a failed reply, E21 a computer with no room for another chat
+    // (stage.js's #atCapacity), E22 the cluster's limit on replies at once
+    // (signal-room.js), refused before anything reached a GPU.
+    const at = codes.findIndex((c) => c === 'E20' || c === 'E21' || c === 'E22');
+    const failed = at >= 0 ? errs[at] : errs[0] ?? null;
+    const code = at >= 0 ? codes[at] : codes[0] ?? '';
     const outcome = timedOut ? 'timeout'
-        // The mesh's limit on replies at once (signal-room.js): refused
-        // before anything reached a GPU.
-        : failed && /limit of \d+ replies/.test(failed) ? 'full'
-        // A peer with no free frame, page or queue slot (stage.js's
-        // #atCapacity). The page reports it and the visitor must ask again.
-        : failed && /try again in a moment/.test(failed) ? 'busy'
+        : code === 'E22' ? 'full'
+        : code === 'E21' ? 'busy'
         : failed || !mm ? 'error'
         : 'ok';
     return {

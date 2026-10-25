@@ -1,0 +1,88 @@
+/* Design tokens shared by the site pages (site.css) and the chat app
+   (web/app.css). Edit colours, type and spacing here. */
+
+@font-face {
+  font-family: "Instrument Sans";
+  src: url("fonts/instrument-sans.woff2") format("woff2");
+  font-weight: 400 700;
+  font-stretch: 75% 100%;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Plex Mono";
+  src: url("fonts/plex-mono-400.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Plex Mono";
+  src: url("fonts/plex-mono-500.woff2") format("woff2");
+  font-weight: 500 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  color-scheme: light;
+
+  /* Surfaces and ink */
+  --bg: #ffffff;
+  --surface: #f5f6f7;
+  --surface-2: #eceef0;
+  --ink: #0b0b0c;
+  --ink-2: #3a3d42;
+  --muted: #5a5f66;
+  --faint: #8a8f98;
+  --rule: #e3e5e8;
+  --rule-strong: #c9ccd1;
+
+  /* The one signal colour: the primary action, "you", live activity.
+     --on-signal is text on it, --signal-edge the border of a filled
+     button, --signal-ink the colour as text on white (4.5:1 or more). */
+  --signal: #7022d6;           /* deep purple */
+  --signal-hover: #5c17b8;
+  --on-signal: #ffffff;
+  --signal-edge: var(--signal);
+  --signal-ink: #6a1fcc;
+  --signal-soft: #f3ebfd;
+
+  /* People in a cluster, in join order. */
+  --p0: var(--ink);
+  --p1: var(--signal);
+  --p2: #8a8f98;
+  --p3: #c9ccd1;
+
+  /* Piece bar: how many people hold a piece. */
+  --piece-empty: #ffffff;
+  --piece-1: #8a8f98;
+  --piece-2: #3a3d42;
+
+  /* States. Red only for errors. */
+  --ok: #1f7a3a;
+  --ok-soft: #e8f3eb;
+  --warn: #9a5b00;
+  --warn-soft: #fdf3e1;
+  --err: #b42318;
+  --err-soft: #fbeae8;
+
+  /* Type */
+  --sans: "Instrument Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --t-xs: 12px;
+  --t-sm: 13px;
+  --t-base: 15px;
+  --t-md: 17px;
+  --t-lg: 20px;
+  --t-xl: 28px;
+  --t-display: clamp(40px, 6.2vw, 84px);
+
+  /* Spacing and shape */
+  --gutter: clamp(20px, 4vw, 48px);
+  --max: 1200px;
+  --r: 4px;
+  --r-lg: 8px;
+
+  --ease: cubic-bezier(.2, .7, .2, 1);
+}

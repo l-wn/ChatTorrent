@@ -58,7 +58,7 @@
 		# on every load ("no-cache" still caches, and a repeat costs a 304).
 		# A new page is therefore never loaded with stale modules.
 		# /checkpoint.json, which names the checkpoint, is treated the same.
-		@code path *.html *.js *.css *.json *.webmanifest /chat /
+		@code path *.html *.js *.css *.json *.webmanifest / /chat /create /about /privacy /terms
 		header @code Cache-Control "no-cache"
 		@static path *.svg *.txt
 		header @static Cache-Control "public, max-age=86400"

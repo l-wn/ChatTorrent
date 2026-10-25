@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ChatTorrent · Cluster your computers</title>
+  <meta name="description" content="Pool the graphics cards your group already has to run a 27B open model in the browser. Everyone gets their own chat. No server, no install, no subscription." />
+  <meta name="theme-color" content="#ffffff" />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="ChatTorrent" />
+  <meta property="og:title" content="ChatTorrent · Cluster your computers" />
+  <meta property="og:description" content="Pool your group's graphics cards to run a 27B open model in the browser. Everyone gets their own chat." />
+  <link rel="icon" href="favicon.svg?v=3" type="image/svg+xml" />
+  <link rel="manifest" href="site.webmanifest" />
+  <link rel="preload" href="fonts/instrument-sans.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="stylesheet" href="tokens.css" />
+  <link rel="stylesheet" href="site.css" />
+  <script src="js/landing.js" defer></script>
+</head>
+<body class="landing">
+<!--
+  The landing page, served at /. The pitch, the two ways in, and a scripted
+  demo (js/landing.js, never the real model). The app is at /chat;
+  /chat#new starts a private cluster.
+-->
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <div class="wrap">
+      <a class="brand" href="/" aria-label="ChatTorrent home">
+        <span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        ChatTorrent
+      </a>
+      <nav aria-label="Main">
+        <a href="/about">About</a>
+        <a href="https://github.com/l-wn/ChatTorrent" rel="noopener">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero" aria-labelledby="hero-h">
+      <canvas class="hero-net" id="heroNet" aria-hidden="true"></canvas>
+      <div class="wrap">
+        <!-- js/landing.js flies the three words in and snaps them together.
+             Without JavaScript, or with reduced motion, it is plain text. -->
+        <h1 id="hero-h" class="hero-title"><span class="hw">Cluster</span><span class="hj" aria-hidden="true"></span> <span class="hw">your</span><span class="hj" aria-hidden="true"></span> <span class="hw">computers.</span></h1>
+        <p class="lede"><span class="lede-line">Everyone brings a graphics card. Everyone gets their own&nbsp;AI&nbsp;chat.</span> Your group is the data center.</p>
+        <div class="actions">
+          <a class="btn btn-primary" href="/create">Start a private cluster</a>
+          <a class="btn" href="/chat">Try the public demo</a>
+        </div>
+        <!-- Filled only when this browser cannot lend its GPU. Its space is
+             kept either way, so the centred hero does not move when it fills. -->
+        <p class="gpucheck" id="gpucheck"></p>
+      </div>
+    </section>
+
+    <!-- The scripted demo: four browsers, four chats, one model.
+         js/landing.js fills in the windows and plays the timeline. Without
+         JavaScript the captions still tell the story. -->
+    <section class="demo-section" id="how" aria-labelledby="demo-h">
+      <div class="wrap">
+        <div class="demo-head">
+          <p class="eyebrow">How it works</p>
+          <h2 id="demo-h">Four computers. One model. Everyone gets their own chat.</h2>
+        </div>
+        <figure class="demo" id="demo">
+          <div class="demo-top" aria-hidden="true">
+            <span class="label">Cluster</span>
+            <div class="dcells" id="demoCells"></div>
+            <span class="dflag" id="demoFlag" data-state="busy">Needs 27 GB</span>
+            <button class="demo-toggle" id="demoToggle" type="button" aria-label="Pause the demo">Pause</button>
+          </div>
+          <div class="demo-frames" id="demoFrames" aria-hidden="true"></div>
+          <figcaption>
+            <ol class="demo-captions" id="demoCaptions">
+              <li data-n="01">Four people open the same link and each lend a different amount. Their pieces come together into the whole model.</li>
+              <li data-n="02">They ask whenever they like, each in their own chat. Meanwhile Ben's gaming PC takes on more pieces while it's idle.</li>
+              <li data-n="03">Ana started the cluster. She closes her laptop in the middle of her reply.</li>
+              <li data-n="04">Her pieces were already held by others, so the other chats keep going, and Mia starts a new one.</li>
+            </ol>
+          </figcaption>
+        </figure>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <nav aria-label="Footer">
+        <span>Open source, by lwn</span>
+        <a href="https://github.com/l-wn/ChatTorrent" rel="noopener">GitHub</a>
+        <a href="/about">About</a>
+        <a href="/privacy">Privacy</a>
+        <a href="/terms">Terms</a>
+      </nav>
+    </div>
+  </footer>
+</body>
+</html>

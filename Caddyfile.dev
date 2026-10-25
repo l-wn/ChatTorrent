@@ -9,7 +9,7 @@
 # does not start.
 #
 #   ./start.sh dev               # both, in the foreground; Ctrl-C stops them
-#   http://localhost:8001/web/peer.html?direct=1
+#   http://localhost:8001/chat?direct=1
 
 {
 	auto_https off
@@ -30,9 +30,18 @@
 	}
 
 	handle {
+		# Production's addresses: / is the landing page, /chat and /create
+		# the app's pages. The site pages and their assets (/tokens.css,
+		# /fonts/, /about) live in site/, and the app's relative imports
+		# from /chat resolve to the root, so both directories are tried.
+		rewrite / /site/index.html
+		rewrite /chat /web/peer.html
+		rewrite /create /web/create.html
+		try_files {path} /site{path} /site{path}.html /web{path}
+
 		@weights path *.bin *.npy
 		header @weights Cache-Control "public, max-age=2592000, immutable"
-		@code path *.html *.js *.css *.json
+		@code path *.html *.js *.css *.json *.svg *.webmanifest / /chat /create /about /privacy /terms
 		header @code Cache-Control "no-cache"
 
 		file_server {

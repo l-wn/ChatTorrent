@@ -7,69 +7,88 @@
        send. This also keeps the page's address out of every request it makes. -->
   <meta name="referrer" content="no-referrer" />
   <title>ChatTorrent</title>
-  <meta name="description" content="A large language model run by its users: each browser tab holds part of the model on its own GPU, and the tabs pass each token between them over WebRTC." />
-  <meta name="theme-color" content="#0f1115" />
+  <meta name="description" content="Your own AI, on your own computers. Pool your group's graphics cards to run a 27B open model in the browser." />
+  <meta name="theme-color" content="#ffffff" />
   <meta property="og:type" content="website" />
   <meta property="og:site_name" content="ChatTorrent" />
   <meta property="og:title" content="ChatTorrent" />
-  <meta property="og:description" content="A large language model run by its users, split across their browsers' GPUs." />
-  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <meta property="og:description" content="Pool your group's graphics cards to run a 27B open model in the browser. Everyone gets their own chat." />
+  <link rel="icon" href="/favicon.svg?v=3" type="image/svg+xml" />
   <link rel="manifest" href="/site.webmanifest" />
+  <link rel="preload" href="/fonts/instrument-sans.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="stylesheet" href="/tokens.css" />
   <link rel="stylesheet" href="./app.css" />
   <script type="module" src="./peer-start.js"></script>
 </head>
 <body>
   <header>
     <button id="chatsBtn" class="icon" aria-label="Chats" title="Chats" aria-expanded="false" aria-controls="chats">
-      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
         <path d="M4 6h16M4 12h16M4 18h16"/>
       </svg>
     </button>
-    <a class="brand" href="/" title="ChatTorrent">
-      <img src="/favicon.svg" alt="" width="22" height="22" />
+    <a class="brand" href="/" title="ChatTorrent home">
+      <span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>
       <h1 id="title">ChatTorrent</h1>
     </a>
-    <!-- The checkpoint the mesh runs, filled in once the manifest is read. -->
+    <!-- The checkpoint the cluster runs, filled in once the manifest is read. -->
     <span class="model" id="model" hidden></span>
     <span class="spacer"></span>
-    <span class="pill" id="status">booting…</span>
-    <span class="pill err" id="authfail" hidden title="Offers to link with this tab that were not sealed with this mesh's invite. They were refused; nothing was sent to them. A steady count means someone without the invite is trying to connect."></span>
-    <!-- The mesh this tab is in, always shown: the global one, or a private
-         one with the tag its members can compare. -->
-    <span class="pill" id="mesh">global mesh</span>
-    <button id="newmesh" title="Start a private mesh and move this tab into it. Only people you send its invite link to can join, and only they will run your chats.">Create private mesh</button>
-    <button id="invite" hidden title="Copy this mesh's invite link. Anyone with it can join this mesh and run its chats. Send it only to people you trust.">Copy invite link</button>
-    <a id="leave" class="button" hidden title="Leave this private mesh and join the global one">Leave</a>
+    <span class="pill err" id="authfail" hidden title="Offers to link with this tab that were not sealed with this cluster's invite. They were refused; nothing was sent to them. A steady count means someone without the invite is trying to connect."></span>
+    <!-- The cluster this tab is in: the public demo, or a private cluster with
+         the tag its members can compare. -->
+    <span class="pill" id="mesh">public demo</span>
+    <button id="invite" class="primary" hidden title="Copy this cluster's invite link. Anyone with it can join and run its chats. Send it only to people you trust.">Invite</button>
+    <button id="newmesh" class="primary" title="Start a private cluster and move this tab into it. Only people you send its link to can join, and only their computers run your chats.">Start a private cluster</button>
+    <a id="leave" class="button quiet" hidden title="Leave this private cluster and join the public demo">Leave</a>
+    <button id="contribBtn" aria-expanded="false" aria-controls="contrib" title="Lend your GPU, and see what this tab holds">Contribute</button>
     <button id="settingsBtn" class="icon" aria-label="Settings" title="Settings" aria-expanded="false" aria-controls="settings">
-      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="3"/>
         <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
       </svg>
     </button>
   </header>
 
-  <!-- The block map: one cell per position (the embedding, every block, the
-       head), lit when a ready peer holds it. Below it, live numbers for the
-       mesh and for this tab. -->
+  <!-- The model bar, as on the setup screen: one cell per piece of the
+       model, shaded by how many computers hold it, this tab's own pieces in
+       violet. Under it, one sentence on the cluster's health. #status is this
+       tab's work in progress; tools/load.mjs reads it. -->
   <div id="mapstrip">
-    <div id="map" class="map" title="the model, one cell per position: the embedding, each block, the head"></div>
-    <div class="stats">
-      <span id="role" title="this tab: its peer id, and which part of the model it holds">joining…</span>
-      <span class="spacer"></span>
-      <span class="pill" id="peers" title="tabs in this mesh">0 peers</span>
-      <span class="pill" id="covered" title="positions of the model at least one ready peer holds. A position is one unit of work: the embedding, each block, the head">— held</span>
-      <span class="pill" id="depth" title="redundancy: the fewest peers holding any one position. 0 = positions nobody holds, 1 = running but one departure from dead, 2 = survives any single peer leaving">r 0</span>
-      <span class="pill" id="vram" title="this tab's own VRAM: the weights it has uploaded, its KV pool and session state, and its scratch buffers">— GiB</span>
-      <span class="pill" id="ctx" title="tokens in this chat, of the most the model's context holds">context —</span>
-      <span class="pill" id="ran" title="tokens this tab has run for the mesh, across every session routed through it">ran 0 tok</span>
-      <span class="pill" id="speed" title="the last reply's generation speed">—</span>
+    <div class="strip">
+      <!-- Three columns, the sides the same width so the bar is centred:
+           names on the left, pieces in the middle, numbers on the right. -->
+      <div class="lane-grid flag-row">
+        <span></span>
+        <div class="strip-row">
+          <span id="health" data-state="">Joining…</span>
+          <span id="status" hidden>booting…</span>
+          <span class="spacer"></span>
+          <button id="lanesBtn" class="toggle" type="button" aria-expanded="false" aria-controls="lanes">People</button>
+        </div>
+        <span></span>
+      </div>
+      <div class="lane-grid model-row">
+        <span class="strip-label" id="stripModel">The model</span>
+        <div id="map" class="map" title="The model, one cell per piece"></div>
+        <span class="strip-nums"><span class="strip-num" id="modelHeld">—</span><span class="strip-gb" id="modelGb"></span></span>
+      </div>
+      <!-- One line per computer lending its GPU: its name, a line under the
+           pieces it holds, and its speed, in a fixed-height box that
+           scrolls. A click opens its details. -->
+      <div class="lanes" id="lanes" role="list" aria-label="Computers in this cluster"></div>
+      <!-- Everyone only chatting, one person icon each. -->
+      <div class="lane-grid chatters" id="chatters" hidden>
+        <span class="chatters-label" id="chattersLabel"></span>
+        <span class="chatters-icons" id="chattersIcons"></span>
+      </div>
     </div>
   </div>
 
   <div id="transcript">
     <div class="inner" id="messages">
       <div id="boot">
-        <div id="bootwhat">joining the mesh…</div>
+        <div id="bootwhat">Joining the cluster…</div>
         <div class="bar"><div id="bootbar"></div></div>
         <div id="bootnote"></div>
       </div>
@@ -78,47 +97,35 @@
 
   <footer>
     <div class="composer">
-      <!-- Always shown above the input: the EU AI Act (Article 50) requires a
-           chatbot to say it is one. The wording can change; it must stay
-           visible. -->
-      <p class="ai-notice" role="note">You are talking to an AI. Its replies can be wrong. Check anything important.</p>
+      <!-- Calm notes about this browser (errors.js's `calm` problems), kept
+           out of the conversation. -->
+      <p class="composer-note" id="composerNote" hidden></p>
       <div class="row">
-        <textarea id="input" rows="1" placeholder="Waiting for the mesh…" disabled></textarea>
+        <textarea id="input" rows="1" placeholder="Waiting for the cluster…" disabled></textarea>
         <button id="send" class="primary" disabled>Send</button>
         <button id="stop" hidden>Stop</button>
       </div>
       <div class="settings">
-        <label id="thinkingLabel" title="Qwen's reasoning mode - off answers faster with no &lt;think&gt; text" hidden>
-          <input type="checkbox" id="thinking" autocomplete="off"> thinking
-        </label>
-        <label title="Stop this tab's background growth once its own VRAM use would exceed this. Blank = no limit: it keeps growing until the GPU is full or this tab holds the whole model. Raising it later lets growth carry on from what this tab already holds.">VRAM limit <input id="vramlimit" type="text" placeholder="e.g. 4gb" autocomplete="off"></label>
-        <label id="meshchatsLabel" title="Replies that can generate at once in a private mesh you create with Create private mesh. Blank = no limit (the server may still cap it).">Private mesh limit <input id="meshchats" type="number" min="1" step="1" placeholder="no limit" autocomplete="off"></label>
-        <label id="meshsessionsLabel" title="Conversations each GPU in a private mesh you create keeps in memory, so pausing between messages does not force a rebuild. Each extra one costs the mesh's GPUs about 280 MB in total, so each holds a little less of the model. Blank = 8 (the server may cap it).">Chats in memory <input id="meshsessions" type="number" min="1" max="32" step="1" placeholder="8" autocomplete="off"></label>
+        <!-- Always shown under the input: the EU AI Act (Article 50) requires
+             a chatbot to say it is one. The wording can change; it must stay
+             visible. -->
+        <p class="ai-notice" role="note">You are talking to an AI. Its replies can be wrong. Check anything important.</p>
         <span class="grow"></span>
-        <span class="hint">Enter sends · Shift+Enter newline</span>
+        <label id="thinkingLabel" title="Qwen's reasoning mode. Off answers faster, with no &lt;think&gt; text" hidden>
+          <input type="checkbox" id="thinking" autocomplete="off"> Thinking
+        </label>
+        <span id="ctx" title="Tokens in this chat, of the most the model's context holds">—</span>
       </div>
     </div>
   </footer>
 
-  <!-- The credit ribbon. Every site/ page has a copy at the bottom; keep them
-       in sync. -->
-  <div class="ribbon">
-    <span>ChatTorrent</span>
-    <span>by lwn</span>
-    <a href="/about" target="_blank" rel="noopener">about</a>
-    <a href="https://github.com/l-wn/ChatTorrent" target="_blank" rel="noopener">source</a>
-    <a href="/privacy" target="_blank" rel="noopener">privacy</a>
-    <a href="/terms" target="_blank" rel="noopener">terms</a>
-    <a href="/terms#conduct" target="_blank" rel="noopener">code of conduct</a>
-  </div>
-
-  <!-- This mesh's saved chats. A drawer on a narrow screen, and from 1100px
-       wide a sidebar that stays open (peer.js's layoutChats()). Only this
-       mesh's chats are listed. A private mesh shows a count of the others,
-       not their titles. -->
+  <!-- This cluster's saved chats. A drawer on a narrow screen, and from
+       1100px wide a sidebar that stays open (peer.js's layoutChats()). Only
+       this cluster's chats are listed. A private cluster shows a count of the
+       others, not their titles. -->
   <aside id="chats" class="drawer left" role="dialog" aria-modal="true" aria-labelledby="chatsTitle" hidden>
     <div class="drawer-head">
-      <h2 id="chatsTitle">Chats · <span id="chatsMesh">global mesh</span></h2>
+      <h2 id="chatsTitle">Chats · <span id="chatsMesh">public demo</span></h2>
       <button id="chatsClose" class="icon" aria-label="Close chats" title="Close">&times;</button>
     </div>
 
@@ -126,13 +133,63 @@
       <button id="chatsNew" class="newchat">+ New chat</button>
       <p id="chatsElsewhere" class="chats-note" hidden></p>
       <div id="chatList"></div>
-      <p id="chatsEmpty" class="chats-note">No saved chats in this mesh yet. A chat is saved in this browser once you send its first message.</p>
+      <p id="chatsEmpty" class="chats-note">No saved chats in this cluster yet. A chat is saved in this browser once you send its first message.</p>
     </div>
 
     <div class="drawer-foot">
-      <button id="chatsForget" title="Delete every chat saved for this mesh in this browser">Forget this mesh's chats</button>
+      <button id="chatsForget" title="Delete every chat saved for this cluster in this browser">Forget these chats</button>
     </div>
   </aside>
+
+  <!-- Contribute, opened by the header button: lending this tab's GPU, what
+       it holds, and the cluster's numbers. tools/load.mjs reads #role,
+       #covered and #vramlimit by id and by format. -->
+  <aside id="contrib" class="drawer" role="dialog" aria-modal="true" aria-labelledby="contribTitle" hidden>
+    <div class="drawer-head">
+      <h2 id="contribTitle">Contribute</h2>
+      <button id="contribClose" class="icon" aria-label="Close" title="Close">&times;</button>
+    </div>
+
+    <div class="drawer-body">
+      <section>
+        <h3>Your GPU</h3>
+        <p id="contribState" class="lend-state">Not lending yet.</p>
+        <label class="field" title="Stop growing once this tab's own GPU memory use would pass this. Blank = no limit: it keeps taking pieces until the GPU is full or it holds the whole model.">
+          <span><span class="name">Lend up to</span><span class="desc">e.g. 4gb. Blank = no limit</span></span>
+          <input id="vramlimit" type="text" placeholder="no limit" autocomplete="off">
+        </label>
+        <div class="lend-actions">
+          <button id="lendStart" class="primary" hidden>Start lending</button>
+          <button id="lendStop" hidden>Stop lending</button>
+        </div>
+      </section>
+
+      <section>
+        <h3>This tab</h3>
+        <dl class="kv">
+          <div><dt>Holds</dt><dd id="role">joining…</dd></div>
+          <div><dt>GPU memory used</dt><dd id="vram">—</dd></div>
+          <div><dt>Work done for others</dt><dd id="ran">0 tokens</dd></div>
+          <div><dt>Last reply</dt><dd id="speed">—</dd></div>
+        </dl>
+      </section>
+
+      <section>
+        <h3>Cluster</h3>
+        <dl class="kv">
+          <div><dt>People</dt><dd id="peers">0</dd></div>
+          <div><dt>Pieces held</dt><dd id="covered" title="Pieces of the model at least one ready computer holds: the embedding, each block, the head">—</dd></div>
+          <div><dt>Copies of the rarest piece</dt><dd id="depth" title="0: something is missing. 1: runs, but stops if that computer leaves. 2 or more: anyone can leave">0</dd></div>
+        </dl>
+      </section>
+
+    </div>
+  </aside>
+
+  <!-- A private cluster's invite, down the right side on a wide screen
+       (peer.js's showSide()). On a narrower one it is a card in an empty
+       chat instead. -->
+  <aside id="sidePanel" class="side-right" aria-label="Invite people" hidden></aside>
 
   <!-- Generation settings, opened by the gear button. Each field's HTML value
        is its default: "Reset" and the gear's changed-dot read defaultValue /
@@ -220,79 +277,43 @@
     </div>
   </aside>
 
-  <!-- The welcome popup, shown on every visit (welcome.js). Its text is edited
-       here: .drawer-body holds free-form HTML (paragraphs, <h3> section
-       titles, lists, links). -->
-  <dialog id="welcome" aria-labelledby="welcomeTitle">
-    <!-- Two pages, one shown at a time (welcome.js): what ChatTorrent is and
-         its warnings, then the agreement and the GPU question. The pager at
-         the bottom moves between them. -->
-    <div class="welcome-scroll" id="welcomePage1">
-      <h2 id="welcomeTitle" tabindex="-1" autofocus>Welcome to ChatTorrent</h2>
+  <!-- The pre-join card (welcome.js), over the chat page, which shows
+       through behind it. The lobby: the cluster's name and how many are
+       connected. The widget: the model bar, with the pieces this tab would hold
+       at the amount on the slider previewed in violet. tools/load.mjs moves
+       #lendHandle and presses #welcomeYes. -->
+  <dialog id="welcome" class="setup" aria-labelledby="lobbyName">
+    <div class="setup-inner">
+      <div class="lobby">
+        <p class="lobby-name" id="lobbyName">Public demo</p>
+        <!-- The inviter's name, from the link (#mesh=…&from=Ana). -->
+        <p class="lobby-invite" id="lobbyInvite" hidden></p>
+        <p class="lobby-line" id="lobbyLine">Connecting…</p>
+      </div>
 
-      <!-- What the site is: one idea per paragraph. -->
-      <p>ChatTorrent is a chatbot using an AI model distributed across all its users, running entirely on browsers. <a href="/about" target="_blank" rel="noopener">How it works</a></p>
-
-      <!-- The warnings: each <li> is a bold title (<strong>) and its explanation. -->
-      <section class="welcome-warn" aria-labelledby="welcomeWarnTitle">
-        <h3 id="welcomeWarnTitle">Warning</h3>
-        <ul>
-          <li>
-            <strong>Everyone can see and store your messages.</strong>
-            Do not send sensitive information into an untrusted mesh. You can create your own mesh with friends you trust.
-          </li>
-          <li>
-            <strong>Your GPU is being used.</strong>
-            If you opt to contribute some of your GPU to the mesh, other people's requests will be served through you.
-          </li>
-        </ul>
-      </section>
-    </div>
-
-    <div class="welcome-scroll" id="welcomePage2" hidden>
-      <!-- The agreement: both boxes must be ticked before either answer button
-           below works (welcome.js), and the popup cannot be closed any other
-           way. The links open in a new tab, so the popup stays open. -->
-      <section class="welcome-step" aria-labelledby="welcomeAgreeTitle">
-        <h3 id="welcomeAgreeTitle" tabindex="-1">Before you continue</h3>
-        <div class="welcome-agree">
-          <label><input type="checkbox" id="agreeAge" autocomplete="off"> <span>I am 18 or over and agree to follow the <a href="/terms#conduct" target="_blank" rel="noopener">code of conduct</a></span></label>
-          <label><input type="checkbox" id="agreeTerms" autocomplete="off"> <span>I agree to the <a href="/terms" target="_blank" rel="noopener">terms of service</a> and have read the <a href="/privacy" target="_blank" rel="noopener">privacy policy</a></span></label>
+      <section class="lend-widget" aria-labelledby="modelLabel">
+        <div class="setup-row">
+          <span id="modelLabel" class="model-name">Model</span>
+          <span class="setup-num" id="modelPct">connecting…</span>
         </div>
-      </section>
-
-      <!-- The GPU question. The GPU is not used until one of these two buttons
-           is pressed. The amounts are <option>s and can be added or removed. A
-           value is anything the VRAM limit field accepts ("512mb", "4gb"),
-           and "" means no limit. -->
-      <section class="welcome-step" aria-labelledby="welcomeGpuTitle">
-        <h3 id="welcomeGpuTitle">Contribute your GPU?</h3>
-        <p>You will download part of the model which will help run other peoples chats on your GPU. You will be able to prompt either way.</p>
-        <div class="welcome-choices">
-          <button id="welcomeNo" autocomplete="off" disabled>Just chat</button>
-          <div class="welcome-yes">
-            <button id="welcomeYes" class="primary" autocomplete="off" disabled>Contribute</button>
-            <select id="welcomeAmount" aria-label="How much GPU memory to contribute" autocomplete="off">
-              <option value="2gb">2 GB</option>
-              <option value="4gb" selected>4 GB</option>
-              <option value="8gb">8 GB</option>
-              <option value="16gb">16 GB</option>
-              <option value="24gb">24 GB</option>
-              <option value="32gb">32 GB</option>
-              <option value="">no limit</option>
-            </select>
+        <div class="preview-bar" id="previewBar" aria-hidden="true"></div>
+        <div class="setup-row lend-row">
+          <span id="lendLabel">Your GPU</span>
+          <output class="setup-num" id="lendOut" for="lendHandle">4 GB</output>
+        </div>
+        <!-- Drag along the bar, or use the arrow keys on the handle. -->
+        <div class="lend-bar" id="lendBar">
+          <div class="lend-you" id="lendYou">
+            <span class="lend-handle" id="lendHandle" role="slider" tabindex="0" aria-labelledby="lendLabel"
+                  aria-valuemin="0" aria-valuemax="32" aria-valuenow="4" aria-valuetext="4 GB"></span>
           </div>
         </div>
+        <p class="setup-caption" id="previewCaption"></p>
       </section>
-    </div>
 
-    <!-- The pager, the same on both pages: ‹ 1/2 ›. An arrow that cannot be
-         used is disabled, not hidden, so the layout does not change. -->
-    <nav class="welcome-pager" aria-label="Pages">
-      <button id="welcomeBack" aria-label="Previous page">&lsaquo;</button>
-      <span id="welcomePageNo" aria-live="polite">1/2</span>
-      <button id="welcomeNext" aria-label="Next page">&rsaquo;</button>
-    </nav>
+      <button id="welcomeYes" class="primary setup-go" autocomplete="off">Join and chat</button>
+      <p class="setup-legal">By clicking Join and chat you confirm you are 18 or over and agree to follow the <a href="/terms#conduct" target="_blank" rel="noopener">code of conduct</a>, the <a href="/terms" target="_blank" rel="noopener">terms of service</a> and the <a href="/privacy" target="_blank" rel="noopener">privacy policy</a>.</p>
+    </div>
   </dialog>
 
 </body>

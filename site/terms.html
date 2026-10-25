@@ -4,18 +4,20 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Terms of use · ChatTorrent</title>
-  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-  <link rel="stylesheet" href="/site.css" />
+  <link rel="icon" href="favicon.svg?v=3" type="image/svg+xml" />
+  <link rel="stylesheet" href="tokens.css" />
+  <link rel="stylesheet" href="site.css" />
+  <script src="js/toc.js" defer></script>
 </head>
-<body>
+<body class="page">
   <header class="site-header">
-    <a class="brand" href="/"><img src="/favicon.svg" alt="" />ChatTorrent</a>
-    <nav>
-      <a href="/chat">Chat</a>
-      <a href="/about">About</a>
-      <a href="/privacy">Privacy</a>
-      <a href="/terms" aria-current="page">Terms</a>
-    </nav>
+    <div class="wrap">
+      <a class="brand" href="/" aria-label="ChatTorrent home"><span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>ChatTorrent</a>
+      <nav aria-label="Main">
+        <a href="/about">About</a>
+        <a href="https://github.com/l-wn/ChatTorrent" rel="noopener">GitHub</a>
+      </nav>
+    </div>
   </header>
   <main>
     <h1>Terms of use</h1>
@@ -64,16 +66,16 @@
     <h2>Changes and contact</h2>
     <p>These terms may be updated. If they are, the date at the top will change, and continuing to use ChatTorrent after that means you accept the new version. For any questions, email <a href="mailto:contact@chattorrent.net">contact@chattorrent.net</a>.</p>
   </main>
-  <!-- The same credit ribbon as the chat page (web/peer.html). Change one,
-       change them all: this page, the other site/ pages, and the chat. -->
-  <footer class="ribbon">
-    <span>ChatTorrent</span>
-    <span>by lwn</span>
-    <a href="/about">about</a>
-    <a href="https://github.com/l-wn/ChatTorrent" target="_blank" rel="noopener">source</a>
-    <a href="/privacy">privacy</a>
-    <a href="/terms">terms</a>
-    <a href="/terms#conduct">code of conduct</a>
+  <footer class="site-footer">
+    <div class="wrap">
+      <nav aria-label="Footer">
+        <span>Open source, by lwn</span>
+        <a href="https://github.com/l-wn/ChatTorrent" rel="noopener">GitHub</a>
+        <a href="/about">About</a>
+        <a href="/privacy">Privacy</a>
+        <a href="/terms">Terms</a>
+      </nav>
+    </div>
   </footer>
 </body>
 </html>

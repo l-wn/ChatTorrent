@@ -1,16 +1,12 @@
-/* Shared styles for the site's plain pages (404, about, privacy, terms). The
-   chat app has its own stylesheet, web/app.css, with the same colours. */
-
-:root {
-  --bg: #0f1115;
-  --panel: #171a21;
-  --line: #2a2f3a;
-  --text: #e6e8ee;
-  --muted: #8b93a7;
-  --accent: #6ea8fe;
-}
+/* Styles for the site pages: the landing page (index.html) and the plain
+   pages (about, privacy, terms, 404). Tokens are in tokens.css; the chat app
+   has its own stylesheet, web/app.css, on the same tokens. */
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
 
 body {
   margin: 0;
@@ -18,76 +14,334 @@ body {
   display: flex;
   flex-direction: column;
   background: var(--bg);
-  color: var(--text);
-  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--ink);
+  font: 400 var(--t-base)/1.6 var(--sans);
+  font-feature-settings: "ss01", "tnum" 0;
+  -webkit-font-smoothing: antialiased;
 }
 
-a { color: var(--accent); }
+a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: 3px; }
+a:hover { color: var(--signal-ink); }
+:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
 
-.site-header {
-  display: flex;
-  align-items: center;
-  gap: 1.25rem;
-  padding: .8rem 1.25rem;
-  background: var(--panel);
-  border-bottom: 1px solid var(--line);
-}
-/* The credit ribbon, matching the chat page's (web/app.css .ribbon). */
-.ribbon {
-  flex: none;
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: .1rem .6rem;
-  padding: .3rem 1rem;
-  font-size: 11px;
-  color: var(--muted);
-  background: var(--bg);
-  border-top: 1px solid var(--line);
-}
-/* inline-block, so a link's underline and colour do not extend to the dot. */
-.ribbon > * + *::before { content: "·"; display: inline-block; margin-right: .6rem; color: #4a5162; }
+h1, h2, h3 { font-weight: 600; letter-spacing: -0.02em; line-height: 1.1; margin: 0; }
+p { margin: 0; }
 
-.site-header .brand {
-  display: flex;
-  align-items: center;
-  gap: .5rem;
-  color: var(--text);
-  font-weight: 600;
-  text-decoration: none;
+.skip {
+  position: absolute; left: -999px; top: 8px;
+  background: var(--ink); color: var(--bg); padding: 8px 12px; border-radius: var(--r);
+  z-index: 10;
 }
-.site-header .brand img { width: 22px; height: 22px; }
-.site-header nav { display: flex; gap: 1rem; margin-left: auto; }
-.site-header nav a { color: var(--muted); text-decoration: none; }
-.site-header nav a:hover, .site-header nav a[aria-current="page"] { color: var(--text); }
+.skip:focus { left: 8px; }
 
-main {
-  flex: 1;
-  width: 100%;
-  max-width: 44rem;
-  margin: 0 auto;
-  padding: 3rem 1.25rem;
-}
-
-h1 { font-size: 1.6rem; margin: 0 0 .75rem; }
+.wrap { width: 100%; max-width: var(--max); margin: 0 auto; padding: 0 var(--gutter); }
+.small { font-size: var(--t-sm); color: var(--muted); }
 .muted { color: var(--muted); }
 
-/* The legal pages (privacy.html, terms.html). */
-main h2 { font-size: 1.15rem; margin: 2rem 0 .5rem; }
-main h3 { font-size: 1rem; margin: 1.25rem 0 .4rem; }
-main li + li { margin-top: .3rem; }
-.updated { color: var(--muted); font-size: 14px; margin-top: 0; }
-/* An unwritten placeholder, styled to stand out. Nothing with this class
-   should reach the live site. */
-.todo {
-  color: #1a1206;
-  background: #e0a458;
-  border-radius: 4px;
-  padding: 0 .3rem;
-  font-weight: 600;
+/* --- The brand mark: three pieces, the last one signal orange --- */
+
+.brand {
+  display: inline-flex; align-items: baseline; gap: .45em;
+  font-weight: 600; font-size: 19px; letter-spacing: -0.015em;
+  color: var(--ink); text-decoration: none;
+}
+.brand:hover { color: var(--ink); }
+/* The pieces are as tall as the wordmark's capitals (Instrument Sans caps
+   are 0.73em) and sit on its baseline, so the two line up at any size. */
+.mark { display: inline-flex; align-items: flex-end; gap: .1em; height: .73em; }
+.mark i { width: .27em; height: .73em; background: var(--ink); border-radius: .07em; }
+.mark i:last-child { background: var(--signal); }
+
+/* --- Header and footer --- */
+
+.site-header {
+  position: sticky; top: 0; z-index: 5;
+  background: rgba(255, 255, 255, .94);
+  border-bottom: 1px solid var(--rule);
+}
+@supports (backdrop-filter: blur(1px)) {
+  .site-header { background: rgba(255, 255, 255, .82); backdrop-filter: saturate(1.4) blur(10px); }
+}
+.site-header .wrap { display: flex; align-items: center; gap: 28px; height: 60px; }
+.site-header nav { display: flex; gap: 24px; margin-left: auto; font-size: var(--t-sm); }
+.site-header nav a { color: var(--muted); text-decoration: none; }
+.site-header nav a:hover, .site-header nav a[aria-current="page"] { color: var(--ink); }
+
+.site-footer { border-top: 1px solid var(--rule); margin-top: auto; }
+.site-footer .wrap { padding-top: 24px; padding-bottom: 28px; }
+.site-footer nav { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px 24px; font-size: var(--t-sm); color: var(--faint); }
+.site-footer nav a { color: var(--muted); text-decoration: none; }
+.site-footer nav a:hover { color: var(--ink); }
+
+/* --- Buttons --- */
+
+.btn {
+  display: inline-flex; align-items: center; gap: 10px;
+  height: 44px; padding: 0 18px;
+  font: 500 var(--t-base)/1 var(--sans);
+  color: var(--ink); background: var(--bg);
+  border: 1px solid var(--ink); border-radius: var(--r);
+  text-decoration: none; cursor: pointer;
+  transition: background .15s var(--ease), color .15s var(--ease), border-color .15s var(--ease);
+}
+.btn:hover { background: var(--surface); color: var(--ink); }
+.btn-primary { background: var(--signal); border-color: var(--signal-edge); color: var(--on-signal); }
+.btn-primary:hover { background: var(--signal-hover); border-color: var(--signal-edge); color: var(--on-signal); }
+.btn-sm { height: 34px; padding: 0 14px; font-size: var(--t-sm); }
+.tag {
+  font: 500 10px/1 var(--mono); text-transform: uppercase; letter-spacing: .06em;
+  padding: 4px 6px; border-radius: 3px;
+  color: var(--muted); background: var(--surface-2);
 }
 
-/* A diagram on a plain page (about.html): a white drawing on the dark page. */
-.diagram { margin: 1.25rem 0; }
-.diagram img { display: block; width: 100%; height: auto; border-radius: 6px; }
-.diagram figcaption { color: var(--muted); font-size: 14px; margin-top: .4rem; }
+/* --- Landing page: a centred hero, then the demo --- */
+
+.landing main { flex: 1; }
+
+/* The hero takes the first screen less about 300px, so the demo's heading
+   and the top of its window show below it as something to scroll to. */
+.hero {
+  display: flex; flex-direction: column; justify-content: center;
+  min-height: max(440px, calc(100vh - 300px));
+  min-height: max(440px, calc(100svh - 300px));
+  text-align: center; padding: 56px 0 48px;
+}
+.hero { position: relative; overflow: hidden; isolation: isolate; }
+.hero > .wrap { position: relative; z-index: 1; }
+/* The network canvas (js/landing.js), faded out behind the headline. */
+.hero-net {
+  position: absolute; inset: 0; z-index: 0;
+  width: 100%; height: 100%;
+  pointer-events: none;
+  -webkit-mask-image: radial-gradient(ellipse 46% 52% at 50% 50%, transparent 35%, #000 100%);
+  mask-image: radial-gradient(ellipse 46% 52% at 50% 50%, transparent 35%, #000 100%);
+}
+.hero h1 { font-size: clamp(44px, 7.4vw, 104px); letter-spacing: -0.04em; line-height: .98; font-weight: 600; }
+.lede { margin: 28px auto 0; font-size: clamp(17px, 1.6vw, 21px); line-height: 1.5; color: var(--muted); max-width: 46rem; }
+/* The first two sentences on one line, the third under them; wrapping
+   normally on narrow screens. */
+@media (min-width: 820px) { .lede-line { display: block; white-space: nowrap; } }
+.actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 12px; margin-top: 40px; }
+.hero .btn { height: 52px; padding: 0 24px; font-size: 16px; }
+.gpucheck { margin: 20px auto 0; max-width: 34rem; min-height: 3em; font: 400 var(--t-xs)/1.5 var(--mono); color: var(--warn); }
+
+/* The demo's band: full width, a step darker than the page. */
+.demo-section {
+  background: var(--surface);
+  border-top: 1px solid var(--rule);
+  padding: 36px 0 clamp(64px, 9vw, 120px);
+}
+.demo-head { text-align: center; margin-bottom: 24px; }
+.eyebrow { font: 500 var(--t-xs)/1 var(--mono); text-transform: uppercase; letter-spacing: .08em; color: var(--signal-ink); margin-bottom: 10px; }
+.demo-head h2 { font-size: clamp(22px, 2.4vw, 30px); letter-spacing: -0.02em; line-height: 1.15; }
+
+/* Steps, proof points and the honesty callout, on the about page */
+.callout {
+  margin-top: 40px; max-width: 40rem;
+  border: 1px solid var(--ink); border-left: 6px solid var(--signal); border-radius: var(--r);
+  padding: 20px 24px;
+}
+.callout-label { font: 500 var(--t-xs)/1 var(--mono); text-transform: uppercase; letter-spacing: .06em; color: var(--signal-ink); margin-bottom: 10px; }
+.callout p + p { margin-top: 8px; }
+.callout strong { font-weight: 600; }
+
+/* --- The demo (js/landing.js): four browsers, four chats, one model --- */
+
+.demo { margin: 0; }
+.demo-top {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 12px 18px;
+  border: 1px solid var(--ink); border-bottom: 0; border-radius: var(--r-lg) var(--r-lg) 0 0;
+  padding: 16px 20px; background: var(--bg);
+}
+.label { font: 500 var(--t-xs)/1 var(--mono); text-transform: uppercase; letter-spacing: .06em; color: var(--faint); }
+.dflag { font: 500 var(--t-xs)/1 var(--mono); text-transform: uppercase; letter-spacing: .06em; color: var(--ink-2); white-space: nowrap; }
+.dflag::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 8px; border-radius: 50%; background: #d08a1c; vertical-align: 1px; }
+.dflag[data-state="ok"]::before { background: var(--ok); }
+.demo-toggle {
+  font: 500 var(--t-xs)/1 var(--mono); text-transform: uppercase; letter-spacing: .06em;
+  background: none; border: 1px solid var(--rule-strong); border-radius: var(--r); color: var(--muted);
+  padding: 7px 10px; cursor: pointer;
+}
+.demo-toggle:hover { border-color: var(--ink); color: var(--ink); }
+
+/* Piece bars: pale missing, dark held, violet that window's own pieces. */
+.dcells { display: grid; grid-template-columns: repeat(32, minmax(0, 1fr)); gap: 2px; }
+.dcells i { height: 10px; border-radius: 2px; background: var(--surface-2); transition: background .25s var(--ease); }
+.dcells i[data-state="held"] { background: var(--ink-2); }
+.dcells i[data-state="you"] { background: var(--signal); }
+.dbar-cluster .dcells i { height: 18px; }
+/* The cluster bar, once full: the app's slow violet wave. */
+@keyframes dwave {
+  0%, 70%, 100% { box-shadow: inset 0 0 0 40px rgba(112, 34, 214, 0); }
+  80% { box-shadow: inset 0 0 0 40px rgba(112, 34, 214, .55); }
+}
+.dbar-cluster.full .dcells i { animation: dwave 3.2s ease-in-out infinite; animation-delay: calc(var(--i, 0) * 28ms); }
+.dbar-cluster.paused .dcells i { animation-play-state: paused; }
+
+/* A word passing through the pieces: a soft violet light gliding along a
+   bar, one per chat. It fades in and out, so it never blinks. */
+.dbar { position: relative; overflow: hidden; border-radius: 3px; }
+.dglow {
+  position: absolute; top: -4px; bottom: -4px;
+  width: calc(100% / 32 * 5);
+  background: radial-gradient(closest-side, rgba(182, 132, 245, .95), rgba(112, 34, 214, .45) 55%, rgba(112, 34, 214, 0));
+  mix-blend-mode: screen;
+  opacity: 0;
+  transition: opacity .45s var(--ease);
+  pointer-events: none;
+}
+.dglow.on { opacity: 1; }
+/* A computer working on someone's chat: a small light in its title bar. */
+.dbusy { margin-left: auto; width: 7px; height: 7px; border-radius: 50%; background: var(--signal); opacity: 0; box-shadow: 0 0 0 0 rgba(112, 34, 214, .4); transition: opacity .5s var(--ease), box-shadow .5s var(--ease); }
+.dbusy.on { opacity: 1; box-shadow: 0 0 0 4px rgba(112, 34, 214, .15); }
+
+/* The four browser windows. */
+.demo-frames {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px;
+  border: 1px solid var(--ink); border-radius: 0 0 var(--r-lg) var(--r-lg);
+  background: var(--rule); overflow: hidden;
+}
+.dframe { display: flex; flex-direction: column; min-width: 0; min-height: 380px; background: var(--bg); transition: opacity .25s var(--ease), filter .7s var(--ease); }
+.dframe.waiting { opacity: .25; }
+.dframe.closed { opacity: .35; filter: grayscale(1); }
+.dframe-bar { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--rule); font-size: var(--t-sm); font-weight: 600; }
+.dframe-bar svg { width: 14px; height: 14px; flex: none; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; color: var(--muted); }
+.dframe-hold { padding: 11px 14px 10px; border-bottom: 1px solid var(--rule); }
+.dhold-line { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 8px; font: 400 11px/1.3 var(--mono); color: var(--muted); }
+.dframe-body { flex: 1; padding: 14px; display: flex; flex-direction: column; gap: 10px; font-size: var(--t-sm); line-height: 1.5; overflow: hidden; }
+.dq { align-self: flex-end; max-width: 92%; padding: 7px 10px; border-radius: 9px 9px 2px 9px; background: var(--surface-2); color: var(--ink); }
+.da { color: var(--ink-2); }
+.dcaret { display: inline-block; width: 7px; height: 13px; margin-left: 2px; vertical-align: -2px; background: var(--signal); }
+.dmeta { font: 400 11px/1 var(--mono); color: var(--faint); }
+
+.demo figcaption { margin-top: 20px; }
+.demo-captions { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 24px; }
+.demo-captions li { font-size: var(--t-sm); color: var(--faint); border-top: 2px solid var(--rule); padding-top: 10px; transition: color .4s var(--ease), border-color .4s var(--ease); }
+.demo-captions li::before { content: attr(data-n); display: block; font: 500 var(--t-xs)/1 var(--mono); margin-bottom: 8px; }
+.demo-captions li.now { color: var(--ink); border-top-color: var(--signal); }
+.demo.static .demo-captions li { color: var(--ink-2); }
+
+/* --- Plain pages (about, privacy, terms, 404) --- */
+
+.page main { flex: 1; width: 100%; max-width: 44rem; margin: 0 auto; padding: 72px var(--gutter) 96px; }
+.page main h1 { font-size: clamp(32px, 4.4vw, 48px); letter-spacing: -0.03em; margin: 0 0 20px; }
+.page main h2 { font-size: var(--t-lg); margin: 48px 0 12px; padding-top: 16px; border-top: 1px solid var(--rule); }
+.page main h3 { font-size: var(--t-md); margin: 24px 0 8px; }
+.page main p, .page main ul, .page main ol { margin: 0 0 14px; }
+.page main ul, .page main ol { padding-left: 1.2em; }
+.page main li + li { margin-top: 6px; }
+.page main a { color: var(--ink); }
+.page main a:hover { color: var(--signal-ink); }
+/* Buttons keep their own colours, not the page's link colours. */
+.page main a.btn { text-decoration: none; }
+.page main a.btn-primary, .page main a.btn-primary:hover { color: var(--on-signal); }
+.page main a.btn:not(.btn-primary):hover { color: var(--ink); }
+.page .lede { margin-top: 0; margin-bottom: 24px; }
+.page .eyebrow { font: 500 var(--t-xs)/1 var(--mono); text-transform: uppercase; letter-spacing: .06em; color: var(--faint); margin-bottom: 16px; }
+.updated { color: var(--muted); font-size: var(--t-sm); margin-top: 0; }
+.page .callout { margin: 24px 0; }
+.page .actions { margin-top: 32px; }
+
+.facts { list-style: none; padding: 0 !important; margin: 24px 0 !important; border-top: 1px solid var(--ink); }
+.facts li { padding: 14px 0; border-bottom: 1px solid var(--rule); margin: 0 !important; }
+.facts strong { display: block; font-weight: 600; }
+.facts + h2 { border-top: 0 !important; padding-top: 0 !important; }
+
+/* An unwritten placeholder. Nothing with this class should reach the live site. */
+.todo { color: #1a1206; background: #f5c26b; border-radius: 3px; padding: 0 .3rem; font-weight: 600; }
+
+.diagram { margin: 28px 0; }
+.diagram img { display: block; width: 100%; height: auto; border: 1px solid var(--rule); border-radius: var(--r-lg); }
+.diagram figcaption { color: var(--muted); font-size: var(--t-sm); margin-top: 10px; }
+
+/* --- Narrow screens --- */
+
+@media (max-width: 1000px) {
+  .demo-frames { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .dframe { min-height: 320px; }
+  .demo-captions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 760px) {
+  .site-header .wrap { gap: 16px; }
+  .hero .btn { width: 100%; justify-content: center; }
+  .demo-top { grid-template-columns: 1fr auto; }
+  .demo-top .label { display: none; }
+  .demo-top .dcells { grid-column: 1 / -1; grid-row: 2; }
+  .dframe { min-height: 280px; }
+  .demo-captions { grid-template-columns: 1fr; gap: 12px; }
+  .demo-captions li:not(.now) { display: none; }
+  .demo.static .demo-captions li { display: block; }
+}
+
+@media (max-width: 480px) {
+  .demo-frames { grid-template-columns: 1fr; }
+  .dframe { min-height: 0; }
+  .dframe-body { min-height: 150px; }
+}
+
+/* --- The about page's diagram (inline SVG) --- */
+
+.about-diagram { display: block; width: 100%; height: auto; overflow: visible; }
+.about-diagram .d-browser > rect, .about-diagram .d-server > rect { fill: var(--bg); stroke: var(--ink); stroke-width: 1; }
+.about-diagram .d-server > rect { fill: var(--surface); stroke: var(--rule-strong); }
+.about-diagram .d-name { font: 600 13px var(--sans); fill: var(--ink); }
+.about-diagram .d-mono { font: 400 10.5px var(--mono); fill: var(--muted); }
+.about-diagram .d-pieces rect { fill: var(--bg); stroke: var(--rule-strong); stroke-width: 1; }
+.about-diagram .d-pieces rect.on { fill: var(--ink); stroke: none; }
+.about-diagram .d-flow { stroke: var(--signal); stroke-width: 2; }
+.about-diagram .d-signal-fill { fill: var(--signal); }
+.about-diagram .d-bus line { stroke: var(--rule-strong); stroke-width: 1; stroke-dasharray: 3 3; }
+.page .diagram { margin: 32px 0; padding: 24px; border: 1px solid var(--rule); border-radius: var(--r-lg); }
+
+/* --- The headline's intro (js/landing.js) --- */
+
+.hero-title .hw { display: inline-block; will-change: transform; }
+.hero-title .hj { position: relative; display: inline-block; width: 0; height: 1em; vertical-align: baseline; }
+.hero-title .spark {
+  position: absolute; left: 0; top: 50%;
+  width: .32em; height: .32em;
+  border-radius: 50%;
+  border: .045em solid var(--signal);
+  background: radial-gradient(circle, var(--signal) 0 22%, transparent 24%);
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* --- The contents column on long pages (js/toc.js) --- */
+
+.page main.with-toc {
+  max-width: 64rem;
+  display: grid;
+  grid-template-columns: 13rem minmax(0, 44rem);
+  column-gap: 56px;
+  justify-content: center;
+}
+.toc nav {
+  position: sticky; top: 92px;
+  display: flex; flex-direction: column;
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
+  padding-top: 6px;
+}
+.toc-title { margin: 0 0 10px !important; font: 500 var(--t-xs)/1 var(--mono); text-transform: uppercase; letter-spacing: .08em; color: var(--faint); }
+.page main .toc a {
+  display: block;
+  padding: 6px 0 6px 12px;
+  border-left: 2px solid var(--rule);
+  font-size: var(--t-sm); line-height: 1.35;
+  color: var(--muted);
+  text-decoration: none;
+}
+.page main .toc a:hover { color: var(--ink); }
+.page main .toc a[aria-current] { color: var(--ink); border-left-color: var(--signal); font-weight: 500; }
+/* Jumping to a heading leaves room for the sticky header. */
+.page main h2[id] { scroll-margin-top: 84px; }
+/* The heading just jumped to flashes, so a click always shows where it went. */
+@keyframes toc-flash { 0% { background: var(--signal-soft); box-shadow: 0 0 0 8px var(--signal-soft); } 100% { background: transparent; box-shadow: 0 0 0 8px transparent; } }
+.page main h2:target { animation: toc-flash 1.4s var(--ease); border-radius: 2px; }
+@media (prefers-reduced-motion: reduce) { .page main h2:target { animation: none; } }
+@media (max-width: 960px) {
+  .page main.with-toc { display: block; max-width: 44rem; }
+  .toc { display: none; }
+}

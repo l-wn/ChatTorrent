@@ -242,7 +242,7 @@ export class Engine {
             if (autoGrow) {
                 this.#growClaim(device, d).catch((err) => console.error('growClaim:', err));
             }
-            return { role: 'worker', held: [lo, hi], note, error: false };
+            return { role: 'worker', held: [lo, hi], note, error: false, code: 'lending' };
         } catch (err) {
             console.warn('serve stopped:', err);
             const r = this.#runner;
@@ -254,7 +254,7 @@ export class Engine {
                 const now = describeRange(r.lo, r.have, r.d.n_layer);
                 net.releaseTail(r.have);
                 return {
-                    role: 'worker', held: [r.lo, r.have], error: false,
+                    role: 'worker', held: [r.lo, r.have], error: false, code: 'grow-stopped', cause: err,
                     note: `Stopped growing at ${now} (${err.message}). This tab keeps serving ` +
                         `what it has; the rest of its claim has been given back to the network.`,
                 };
@@ -263,7 +263,7 @@ export class Engine {
             this.#runner = null;
             net.claim(0).catch(() => {});
             return {
-                role: 'spectator', held: null, error: true,
+                role: 'spectator', held: null, error: true, code: 'lend-failed', cause: err,
                 note: `Spectator: this tab holds no blocks and will never be routed a job ` +
                     `(${err.message}). It can still prompt the mesh like any other tab.`,
             };
@@ -286,6 +286,19 @@ export class Engine {
 
     get manifest() { return this.#manifest; }
     get baseUrl() { return this.#baseUrl; }
+
+    // How many positions this tab would end up holding with a limit of
+    // `bytes`: the claim serve() would make for that budget, after the
+    // server's minimum. 0 before connect() or below the minimum. The setup
+    // screen uses it to preview where a new tab would be placed.
+    capacityFor(bytes) {
+        const net = this.net;
+        if (!this.#manifest || !net?.positions || !(bytes > 0)) return 0;
+        const d = dimsFromManifest(this.#manifest);
+        const { sessions, slots } = runnerSessions(null, net.sessions);
+        const n = this.#capacity(d, net, { vram: bytes, sessions, slots });
+        return n >= Math.max(1, net.minBlocks || 1) ? n : 0;
+    }
 
     // How many positions to claim: an explicit block count, a VRAM budget in
     // bytes, or by default the network's minimum, which background growth then
@@ -385,6 +398,7 @@ export class Engine {
             }
             if (r.lo === 0 && r.hi === N) {
                 this.#emit('status', {
+                    code: 'whole',
                     text: `Holding the whole of ${manifest?.model ?? 'the model'}. Nothing left to grow into.`,
                 });
                 return;
@@ -419,6 +433,7 @@ export class Engine {
                     if (this.#growPausedUnder !== this.#vramLimit) {
                         this.#growPausedUnder = this.#vramLimit;
                         this.#emit('status', {
+                            code: 'limit', limit: this.#vramLimit,
                             text: `Paused growing at ${describeRange(r.lo, r.have, L)}: the next ` +
                                 `position would take this tab to ${gib(needed)}, past its ` +
                                 `${gib(this.#vramLimit)} VRAM limit. Raise the limit, or clear it, ` +
@@ -432,6 +447,7 @@ export class Engine {
                 if (this.#growPausedUnder !== null) {
                     this.#growPausedUnder = null;
                     this.#emit('status', {
+                        code: 'limit-room',
                         text: `The VRAM limit has room again: growing on from ` +
                             `${describeRange(r.lo, r.have, L)}.`,
                     });
@@ -469,6 +485,7 @@ export class Engine {
             } catch (err) {
                 const r2 = this.#runner;
                 this.#emit('status', {
+                    code: 'grow-stopped', cause: err,
                     text: `Stopped growing at ${describeRange(r2.lo, r2.have, L)} (${err.message}). ` +
                         `This tab keeps serving what it has.`,
                 });
@@ -485,22 +502,22 @@ export class Engine {
         const needed = r.vramBytes + mtpBytes(d, { nMax: N_MAX, slots: r.slots })
             + scratchBytes(draft, T_MAX, N_MAX);
         if (needed > this.#vramLimit) {
-            this.#emit('status', { text: `Not loading the MTP draft head: it would take this tab to ` +
+            this.#emit('status', { code: 'mtp', text: `Not loading the MTP draft head: it would take this tab to ` +
                 `${gib(needed)}, past its ${gib(this.#vramLimit)} VRAM limit.` });
             return;
         }
         try {
-            this.#emit('status', { text: 'Loading the MTP draft head…' });
+            this.#emit('status', { code: 'mtp', text: 'Loading the MTP draft head…' });
             const { manifest, baseUrl } = this;
             const m = await loadMtp(device, { baseUrl, manifest, d });
             device.pushErrorScope('out-of-memory');
             r.attachMtp(m);
             const oom = await device.popErrorScope();
             if (oom) throw new Error(`GPU ran out of memory (${oom.message || 'out of memory'})`);
-            this.#emit('status', { text: `Holding the MTP draft head (${gib(m.bytes ?? 0)}): ` +
+            this.#emit('status', { code: 'mtp', text: `Holding the MTP draft head (${gib(m.bytes ?? 0)}): ` +
                 'speculative decoding drafts with it here.' });
         } catch (err) {
-            this.#emit('status', { text: `Could not load the MTP draft head (${err.message}). ` +
+            this.#emit('status', { code: 'mtp', cause: err, text: `Could not load the MTP draft head (${err.message}). ` +
                 'Speculative decoding drafts from the chat only.' });
         }
     }
@@ -518,6 +535,7 @@ export class Engine {
             } catch (err) {
                 if (err.permanent || /ran out of memory/.test(err.message) || this.#runner !== r) throw err;
                 this.#emit('status', {
+                    code: 'retry', cause: err,
                     text: `Downloading ${describeRange(p, p + 1, L)} failed (${err.message}). ` +
                         `Trying again in ${Math.round(wait / 1000)}s; this tab keeps serving ` +
                         `${describeRange(r.lo, r.have, L)}.`,
@@ -581,6 +599,7 @@ export class Engine {
         device.lost.then((info) => {
             if (info.reason === 'destroyed') return;
             this.#emit('status', {
+                code: 'gpu-lost', cause: info,
                 text: `WebGPU device lost: ${info.message}. Reload the page.`,
                 error: true, pill: 'device lost',
             });
@@ -591,6 +610,7 @@ export class Engine {
             if (gpuErrorNoted) return;
             gpuErrorNoted = true;
             this.#emit('status', {
+                code: 'gpu-error', cause: ev.error,
                 text: `WebGPU reported an error this tab wasn't watching for `
                     + `(${ev.error.message}). Replies from here on may be corrupted. Reload `
                     + `the page if they start looking wrong.`,

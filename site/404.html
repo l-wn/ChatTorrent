@@ -5,32 +5,35 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="robots" content="noindex" />
   <title>Not found · ChatTorrent</title>
-  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="/favicon.svg?v=3" type="image/svg+xml" />
+  <link rel="stylesheet" href="/tokens.css" />
   <link rel="stylesheet" href="/site.css" />
 </head>
-<body>
+<body class="page">
   <header class="site-header">
-    <a class="brand" href="/"><img src="/favicon.svg" alt="" />ChatTorrent</a>
-    <nav>
-      <a href="/chat">Chat</a>
-      <a href="/about">About</a>
-    </nav>
+    <div class="wrap">
+      <a class="brand" href="/" aria-label="ChatTorrent home"><span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>ChatTorrent</a>
+      <nav aria-label="Main">
+        <a href="/about">About</a>
+        <a href="https://github.com/l-wn/ChatTorrent" rel="noopener">GitHub</a>
+      </nav>
+    </div>
   </header>
   <main>
     <h1>Page not found</h1>
     <p class="muted">There is nothing at this address.</p>
-    <p><a href="/chat">Go to the chat</a></p>
+    <div class="actions"><a class="btn btn-primary" href="/">Go to the home page</a><a class="btn" href="/chat">Open the chat</a></div>
   </main>
-  <!-- The same credit ribbon as the chat page (web/peer.html). Change one,
-       change them all: this page, the other site/ pages, and the chat. -->
-  <footer class="ribbon">
-    <span>ChatTorrent</span>
-    <span>by lwn</span>
-    <a href="/about">about</a>
-    <a href="https://github.com/l-wn/ChatTorrent" target="_blank" rel="noopener">source</a>
-    <a href="/privacy">privacy</a>
-    <a href="/terms">terms</a>
-    <a href="/terms#conduct">code of conduct</a>
+  <footer class="site-footer">
+    <div class="wrap">
+      <nav aria-label="Footer">
+        <span>Open source, by lwn</span>
+        <a href="https://github.com/l-wn/ChatTorrent" rel="noopener">GitHub</a>
+        <a href="/about">About</a>
+        <a href="/privacy">Privacy</a>
+        <a href="/terms">Terms</a>
+      </nav>
+    </div>
   </footer>
 </body>
 </html>

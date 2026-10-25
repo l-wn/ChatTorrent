@@ -15,7 +15,7 @@ import { join, relative } from 'node:path';
 const ROOT = new URL('../web/', import.meta.url).pathname;
 
 // These use the DOM as soon as they are evaluated.
-const BROWSER_ONLY = new Set(['dev/main.js', 'chat.js', 'peer.js', 'peer-start.js']);
+const BROWSER_ONLY = new Set(['dev/main.js', 'chat.js', 'peer.js', 'peer-start.js', 'create.js']);
 
 function walk(dir) {
     return readdirSync(dir).flatMap((name) => {

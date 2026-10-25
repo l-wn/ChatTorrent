@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="referrer" content="no-referrer" />
+  <title>Start a private cluster · ChatTorrent</title>
+  <meta name="description" content="Start a private ChatTorrent cluster and invite your group to run a 27B model together." />
+  <meta name="theme-color" content="#ffffff" />
+  <link rel="icon" href="/favicon.svg?v=3" type="image/svg+xml" />
+  <link rel="preload" href="/fonts/instrument-sans.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="stylesheet" href="/tokens.css" />
+  <link rel="stylesheet" href="./app.css" />
+  <script type="module" src="./create.js"></script>
+</head>
+<body class="create-page">
+<!--
+  Served at /create. Starts a private cluster in four steps: the model, how
+  much of this graphics card to lend, the room's capacity (people chatting
+  at once) and the name shown on invite links. "Create cluster" makes the
+  invite and opens the chat in it
+  (create.js). The network behind the card is the landing page's
+  (/js/landing.js).
+-->
+  <canvas class="hero-net" id="heroNet" aria-hidden="true"></canvas>
+  <a class="brand create-brand" href="/" aria-label="ChatTorrent home">
+    <span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>
+    <span>ChatTorrent</span>
+  </a>
+  <main class="create-flow">
+    <div class="create-head">
+      <p class="lobby-name">New private cluster</p>
+      <h1 class="create-title">Start a cluster for your group</h1>
+      <p class="create-intro">Only people with its link can join, and only their computers run your chats.</p>
+    </div>
+
+    <!-- Four steps, each its own card: a number, a title, one line on what
+         it means, then the control. -->
+    <ol class="steps">
+      <li class="step">
+        <div class="step-head">
+          <h2 class="step-title">Pick a model</h2>
+          <p class="step-desc">Bigger models need more graphics card memory from your group.</p>
+        </div>
+        <!-- One model for now; more would be more tiles, each with its need. -->
+        <fieldset class="model-list">
+          <legend class="sr">Model</legend>
+          <label class="model-option">
+            <input type="radio" name="model" value="qwen3.8-27b" checked>
+            <span class="model-option-name">Qwen3.8-27B</span>
+            <span class="model-option-meta">Needs about <b id="modelNeed">27 GB</b> across your group</span>
+          </label>
+        </fieldset>
+      </li>
+
+      <li class="step">
+        <div class="step-head">
+          <h2 class="step-title">How much will you lend?</h2>
+          <p class="step-desc">The part of your graphics card that runs the model for everyone's chats.</p>
+        </div>
+        <section class="lend-widget" aria-labelledby="lendLabel">
+          <div class="setup-row">
+            <span class="model-name" id="modelLabel">Qwen3.8-27B</span>
+            <span class="setup-num" id="modelPct">0%</span>
+          </div>
+          <div class="preview-bar" id="previewBar" aria-hidden="true"></div>
+          <div class="setup-row lend-row">
+            <span id="lendLabel">Your graphics card</span>
+            <output class="setup-num" id="lendOut" for="lendHandle">None</output>
+          </div>
+          <div class="lend-bar" id="lendBar">
+            <div class="lend-you" id="lendYou">
+              <span class="lend-handle" id="lendHandle" role="slider" tabindex="0" aria-labelledby="lendLabel"
+                    aria-valuemin="0" aria-valuemax="32" aria-valuenow="0" aria-valuetext="none"></span>
+            </div>
+          </div>
+          <p class="setup-caption" id="previewCaption"></p>
+        </section>
+      </li>
+
+      <li class="step">
+        <div class="step-head">
+          <h2 class="step-title"><label for="capacity">Room capacity</label></h2>
+          <p class="step-desc">How many people can chat at the same time.</p>
+        </div>
+        <select id="capacity" class="step-input" autocomplete="off">
+          <option value="" selected>No limit</option>
+          <option value="2">2 people</option>
+          <option value="4">4 people</option>
+          <option value="8">8 people</option>
+          <option value="16">16 people</option>
+        </select>
+      </li>
+
+      <li class="step">
+        <div class="step-head">
+          <h2 class="step-title"><label for="name">Your name <span class="optional">(optional)</span></label></h2>
+          <p class="step-desc">People you invite see "Ana invited you".</p>
+        </div>
+        <input id="name" class="step-input" type="text" placeholder="e.g. Ana" autocomplete="nickname" maxlength="32">
+      </li>
+    </ol>
+
+    <div class="create-go">
+      <button id="create" class="primary setup-go" type="button">Create cluster</button>
+      <p class="setup-legal">By clicking Create cluster you confirm you are 18 or over and agree to follow the <a href="/terms#conduct" target="_blank" rel="noopener">code of conduct</a>, the <a href="/terms" target="_blank" rel="noopener">terms of service</a> and the <a href="/privacy" target="_blank" rel="noopener">privacy policy</a>.</p>
+    </div>
+  </main>
+  <script src="/js/landing.js" defer></script>
+</body>
+</html>

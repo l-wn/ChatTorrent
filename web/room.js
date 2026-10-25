@@ -42,23 +42,44 @@ export function newSecret() {
 
 // The link to share: this page's URL with the fragment set and the query
 // removed. The query (`?blocks=`, `?gb=`) holds this tab's own settings.
-export function inviteUrl(secret, base = globalThis.location) {
+// `from`, if given, is the inviter's name, shown to whoever opens the link.
+// It is not authenticated and plays no part in the keys.
+export function inviteUrl(secret, base = globalThis.location, from = '') {
     const u = new URL(base.href);
     u.search = '';
-    u.hash = `mesh=${secret}`;
+    const name = cleanName(from);
+    u.hash = `mesh=${secret}${name ? `&from=${encodeURIComponent(name)}` : ''}`;
     return u.href;
+}
+
+// The longest inviter name kept, in characters.
+export const NAME_MAX = 32;
+
+// A display name: control characters removed, spaces collapsed, cut to
+// NAME_MAX characters.
+export function cleanName(s) {
+    return [...String(s ?? '').replace(/[\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim()]
+        .slice(0, NAME_MAX).join('');
+}
+
+// The inviter's name in a `location.hash`, or '' when there is none or the
+// hash is not an invite.
+export function inviteFrom(hash) {
+    const m = /^#?mesh=[A-Za-z0-9_-]{22}&from=([^&]*)$/.exec(hash ?? '');
+    if (!m) return '';
+    try { return cleanName(decodeURIComponent(m[1])); } catch { return ''; }
 }
 
 // The secret in a `location.hash`, or null for the global mesh.
 //
 // An empty hash is the global mesh. Anything else must be exactly
-// `#mesh=<22 base64url characters>`. A damaged or mistyped invite throws; it
-// does not fall back to the public mesh, where someone expecting a private
-// chat would be exposed.
+// `#mesh=<22 base64url characters>`, optionally followed by `&from=<name>`.
+// A damaged or mistyped invite throws; it does not fall back to the public
+// mesh, where someone expecting a private chat would be exposed.
 export function readInvite(hash) {
     const h = (hash ?? '').replace(/^#/, '');
     if (!h) return null;
-    const m = /^mesh=(.*)$/.exec(h);
+    const m = /^mesh=([^&]*)(?:&from=[^&]*)?$/.exec(h);
     if (!m) throw new Error(`the link's "#${h.slice(0, 40)}" is not an invite. Expected #mesh=<code>.`);
     if (!SECRET_RE.test(m[1])) {
         throw new Error('the invite code in this link is damaged. It should be 22 letters, ' +
@@ -134,3 +155,17 @@ export async function openRoom(secret, { overrideToken = null } = {}) {
         },
     });
 }
+
+// --- What a tab that starts a cluster remembers ---
+//
+// sessionStorage, keyed by the invite secret, so a reload keeps them: that
+// this tab started it (the share card says so), and the limits it chose on
+// the create page (sent with every join, see net.js's connect()).
+export const creatorKey = (s) => `chattorrent:creator:${s}`;
+export const chatsKey = (s) => `chattorrent:chats:${s}`;
+export const sessionsKey = (s) => `chattorrent:sessions:${s}`;
+
+// The name this tab puts on its invite links for one cluster
+// (sessionStorage, keyed by the secret). Not kept across clusters or visits,
+// so someone arriving through a link starts with an empty name.
+export const nameKey = (s) => `chattorrent:name:${s}`;
