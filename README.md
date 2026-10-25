@@ -31,7 +31,7 @@ Everyone lends part of their GPU. Everyone gets their own chat.
   holding it can connect. The signaling server can't join or read anything.
 - **Nobody has to stay.** Each piece of the model can be held by more than one
   browser, so when someone leaves, the others carry on.
-- **Nothing to install.** WebGPU runs the model with hand-written kernels.
+- **Nothing to install.** WebGPU runs the model with custom kernels.
   WebRTC links the browsers through a relay, so nobody learns anyone else's IP
   address.
 - **Lending is optional.** Any modern browser can join just to chat.
