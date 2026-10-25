@@ -159,7 +159,7 @@ const waitReady = async ({ timeout }) => {
         if (status === 'ready' && !$('send').disabled) {
             return { outcome: 'ok', joinMs: joined ?? now, readyMs: now, status };
         }
-        if (/mesh is full/.test(status)) return { outcome: 'full', joinMs: joined, status };
+        if (/cluster is full/.test(status)) return { outcome: 'full', joinMs: joined, status };
         if (/did not accept this page/.test(status)) return { outcome: 'refused', joinMs: joined, status };
         if (now > timeout) return { outcome: 'never-ready', joinMs: joined, status };
         await new Promise((r) => setTimeout(r, 50));

@@ -1778,7 +1778,7 @@ console.log('\nsignal-server: chats in memory');
         s1.close(4002);
         let why = null;
         await p.ready.catch((e) => { why = e.message; });
-        eq('a full mesh is reported', why, 'this mesh is full');
+        eq('a full mesh is reported', why, 'this cluster is full');
         const n = FakeWS.all.length;
         await tick(1200);
         eq('and not retried', FakeWS.all.length, n);

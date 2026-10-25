@@ -1513,7 +1513,7 @@ async function soak(mode, iters, rand, gen = generate) {
             if (mode === 'survivable') {
                 broken.push(`${where}: coverage never dropped, yet: ${err.message}\n` +
                     `        mesh ${JSON.stringify(ranges)}`);
-            } else if (/is reachable|unreachable|no answer from the mesh|no longer cached/
+            } else if (/is reachable|unreachable|no answer from the cluster|no longer cached/
                 .test(err.message)) {
                 refused++;
             } else {
@@ -1768,7 +1768,7 @@ console.log('\na chat belongs to its mesh, and a switch waits for the reply');
     let err = null;
     try { asker.router.switchTo(makeConversation({ mesh: 'a1b2c3d4', history: [1, 2, 3] })); }
     catch (e) { err = e; }
-    ok('a chat from another mesh is refused', /another mesh/.test(err?.message ?? ''),
+    ok('a chat from another mesh is refused', /another cluster/.test(err?.message ?? ''),
         `got ${err?.message}`);
     ok('leaving the active chat as it was',
         asker.router.conversation === a && JSON.stringify(a.history) === JSON.stringify(hist));
@@ -2903,7 +2903,7 @@ async function fuzzOne(seed) {
                 // the context gained must be a prefix of what a single peer
                 // produces.
                 const allowed = err.busy
-                    || (thrash && /no longer cached|is reachable|unreachable|no answer from the mesh/.test(err.message));
+                    || (thrash && /no longer cached|is reachable|unreachable|no answer from the cluster/.test(err.message));
                 if (!allowed) { problems.push(`${where(a, t)}: ${err.message}`); continue; }
                 const part = tail.slice(0, prompt.length);
                 if (JSON.stringify(part) !== JSON.stringify(prompt.slice(0, part.length))) {

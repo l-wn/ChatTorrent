@@ -47,7 +47,7 @@ console.log('\na store sees only its own mesh');
     eq('reading another mesh\'s chat by id finds nothing', await global.get(p1.id), null);
     ok('the same as reading one that does not exist', (await global.get('nope')) === null);
     ok('saving into another mesh is refused',
-        /another mesh/.test((await rejects(global.save(chat(PRIV))))?.message ?? ''));
+        /another cluster/.test((await rejects(global.save(chat(PRIV))))?.message ?? ''));
     eq('as is deleting across meshes', await priv.remove(g1.id), false);
     ok('which left it there', (await global.get(g1.id)) !== null);
     eq('each side counts the other\'s chats, and only counts them',

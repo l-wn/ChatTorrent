@@ -233,7 +233,7 @@ export class Engine {
             const note = `Holding ${held} of ${manifest.model}: ${hi - lo} of ` +
                 `${positions(d.n_layer)} positions. This tab runs that stretch of every job ` +
                 `routed to it, and can send prompts of its own.`
-                + (at ? ' Placed by hand (?at=), not by the server. A mesh that looks '
+                + (at ? ' Placed by hand (?at=), not by the server. A cluster that looks '
                       + 'broken may have a hole nobody was asked to fill.' : '');
 
             // `blocks`/`vram`/`at` fix the holding, so they turn growth off.
@@ -265,7 +265,7 @@ export class Engine {
             return {
                 role: 'spectator', held: null, error: true, code: 'lend-failed', cause: err,
                 note: `Spectator: this tab holds no blocks and will never be routed a job ` +
-                    `(${err.message}). It can still prompt the mesh like any other tab.`,
+                    `(${err.message}). It can still prompt the cluster like any other tab.`,
             };
         } finally {
             this.#emit('change');
@@ -632,7 +632,7 @@ export class Engine {
             const bad = rows.filter((r) => !r.ok);
             throw new Error(
                 `${bad.length} of ${rows.length} checks on ${label} failed on this GPU, so this ` +
-                `tab will not join the mesh:\n  ` +
+                `tab will not join the cluster:\n  ` +
                 bad.map((r) => `${r.name}: ${r.detail ?? ''}`).join('\n  '));
         }
     }

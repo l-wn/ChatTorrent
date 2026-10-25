@@ -66,7 +66,7 @@ export function relayOnlySdp(sdp) {
 // Close codes from signal-server.js that a reconnect cannot fix: a join the
 // server did not accept (this page is older than the server), and a full mesh.
 const REFUSED = { 4001: 'the signaling server did not accept this page. Reload it.',
-                  4002: 'this mesh is full' };
+                  4002: 'this cluster is full' };
 
 // --- Framing ---
 
@@ -781,8 +781,8 @@ export class Mesh {
             // the reverse, stops here.
             if (!!m.private !== this.room.private) {
                 this.#stopFor(this.room.private
-                    ? 'the signaling server did not put this tab in its private mesh'
-                    : 'the signaling server put this tab in a private mesh it did not ask for');
+                    ? 'the signaling server did not put this tab in its private cluster'
+                    : 'the signaling server put this tab in a private cluster it did not ask for');
                 return;
             }
             // Joined: clear the welcome timeout and reset the backoff. Reset
@@ -797,7 +797,7 @@ export class Mesh {
             // A runner is sized once, so a different number after a reconnect
             // (a restarted server) does not apply to it.
             if (this.sessions != null && sessions !== this.sessions) {
-                console.warn(`the mesh now keeps ${sessions ?? 'the default number of'} chats in `
+                console.warn(`the cluster now keeps ${sessions ?? 'the default number of'} chats in `
                     + `memory per peer; this tab keeps ${this.sessions} until it is reloaded`);
             }
             Object.assign(this, {
@@ -1050,7 +1050,7 @@ export class Mesh {
             return true;
         }
         this.authFailures++;
-        console.warn(`dropped an ${m.type} from peer ${m.from}: it does not carry this mesh's seal`);
+        console.warn(`dropped an ${m.type} from peer ${m.from}: it does not carry this cluster's seal`);
         this.onChange?.();
         return false;
     }

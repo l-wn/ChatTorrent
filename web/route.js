@@ -1090,7 +1090,7 @@ export function makeRouter({
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
                 pending.delete(s);
-                reject(new Error(`no answer from the mesh after ${jobTimeout / 1000}s` +
+                reject(new Error(`no answer from the cluster after ${jobTimeout / 1000}s` +
                     '. A peer probably left.'));
             }, jobTimeout);
             const t0 = performance.now();
@@ -1220,7 +1220,7 @@ export function makeRouter({
                 const chunk = ids.slice(i, i + T_MAX);
                 const past = past0 + i;
                 const timer = setTimeout(() => f.fail(new Error(
-                    `no answer from the mesh after ${jobTimeout / 1000}s. A peer probably left.`)), jobTimeout);
+                    `no answer from the cluster after ${jobTimeout / 1000}s. A peer probably left.`)), jobTimeout);
                 waiting.set(past, { n: chunk.length, t0: performance.now(), timer });
                 // No sampler settings: nothing is sampled. `ids` reach the
                 // head only for the MTP head (`mtp`).
@@ -1467,7 +1467,7 @@ export function makeRouter({
     function arm(st) {
         clearTimeout(st.timer);
         st.timer = setTimeout(() => failed(st, new Error(
-            `no answer from the mesh after ${jobTimeout / 1000}s. A peer probably left.`)), jobTimeout);
+            `no answer from the cluster after ${jobTimeout / 1000}s. A peer probably left.`)), jobTimeout);
     }
 
     function accept(st, h) {
@@ -1654,7 +1654,7 @@ export function makeRouter({
     // if they have not been evicted.
     function switchTo(c) {
         if (c?.mesh !== mesh) {
-            throw new Error(`that chat belongs to another mesh (${c?.mesh ?? 'none'}), ` +
+            throw new Error(`that chat belongs to another cluster (${c?.mesh ?? 'none'}), ` +
                 `not this one (${mesh})`);
         }
         if (c === conv) return;

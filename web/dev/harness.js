@@ -191,7 +191,7 @@ const GREEDY = { temp: 0, topK: 0, rep: 1, freq: 0, pres: 0, ngram: 0,
 function classify(message) {
     if (/try again in a moment/.test(message)) return 'busy';
     if (/no longer cached here/.test(message)) return 'evicted';
-    if (/no answer from the mesh/.test(message)) return 'timeout';
+    if (/no answer from the cluster/.test(message)) return 'timeout';
     if (/is unreachable|is reachable/.test(message)) return 'unreachable';
     if (/rebuild cancelled/.test(message)) return 'cancelled';
     if (/context/.test(message) && /full/.test(message)) return 'context-full';

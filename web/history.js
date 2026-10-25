@@ -143,7 +143,7 @@ export function openHistory({ mesh, backend = idbBackend(), channel = null,
         // Sets `updated` and `rev` on `rec` itself, so the caller's copy
         // matches what was stored.
         async save(rec) {
-            if (!mine(rec)) throw new Error(`that chat belongs to another mesh (${rec?.mesh})`);
+            if (!mine(rec)) throw new Error(`that chat belongs to another cluster (${rec?.mesh})`);
             if (rec.title === '') {
                 rec.title = titleFrom(rec.messages.find((m) => m.role === 'user')?.text);
             }
