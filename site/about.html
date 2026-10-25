@@ -116,11 +116,12 @@
     <p>People come and go, so the cluster rearranges itself. A new computer starts with a few pieces and takes on more while it's idle, up to the limit its owner chose. You can also join just to chat, without lending anything.</p>
 
     <h2>Private clusters and the public demo</h2>
-    <p>A private cluster is for a group: friends, a lab, a club. Only people with its link can join, and only their computers run its chats. Start one from the <a href="/">home page</a> and share the link.</p>
+    <p>A private cluster is for a group: friends, a lab, a club. Only people with its link can join, and only their computers run its chats. Start one from the <a href="/">home page</a> and share the link. Up to 64 people can join, and whoever starts it chooses how many replies can run at once.</p>
     <p>The public demo is a cluster anyone can join. It's there to try ChatTorrent, so don't send it anything personal.</p>
     <aside class="callout" aria-label="Privacy">
       <p class="callout-label">Privacy</p>
       <p><strong>Your chat is separate, not secret.</strong> The computers in your cluster process it. Invite people you trust.</p>
+      <p>The servers see who is in a cluster, but not what anyone says.</p>
       <p class="small">The <a href="/privacy">privacy notice</a> explains exactly who sees what.</p>
     </aside>
 
@@ -156,9 +157,19 @@
 
     <h2>What to expect</h2>
     <ul>
-      <li><strong>It's slower</strong> than commercial chatbots: a few words a second when the cluster is healthy, and it needs enough GPU memory between its members to run at all.</li>
+      <li><strong>It's slower</strong> than commercial chatbots: about 6 tokens a second on two gaming GPUs, and faster on repetitive text like lists and code. It also needs enough GPU memory between its members to run at all.</li>
       <li><strong>It can be wrong.</strong> Like any AI, it makes mistakes. Check anything important.</li>
     </ul>
+
+    <h2 id="faq">Questions</h2>
+    <h3>Can others in my cluster see my chats?</h3>
+    <p>Not in the app. Your chats show up only in your browser, and they're saved there. But the computers in your cluster run the model on what you send, so someone who changed their copy of ChatTorrent could read it. Your chat is separate, not secret.</p>
+    <h3>What happens if the person who started it leaves?</h3>
+    <p>Nothing special. There's no host, so the cluster keeps running as long as the people still in it hold the whole model between them. When everyone has left, the cluster closes. Opening the link again starts it back up, and your saved chats are still in your browser.</p>
+    <h3>Do I need a GPU?</h3>
+    <p>No. You can join to chat without lending anything. The cluster as a whole needs about 27 GB of GPU memory to run the model.</p>
+    <h3>How is this different from sharing one chat room?</h3>
+    <p>Everyone has their own conversations, with their own history. Several people can get replies at the same time, and nobody sees anyone else's messages in the app.</p>
 
     <h2>A note from me</h2>
     <p>Yes, as you can probably tell, this project used a lot of help from LLMs. It allowed me to build it, and to be honest even attempt it, way faster than I otherwise could have. The idea, architecture and design choices were all mine, and AI focused on implementation and domain-specific knowledge.</p>

@@ -7,6 +7,8 @@ datachannels until one of them samples it. A small Node signaling server
 assigns ranges and relays WebRTC offers; everything else happens in the
 browsers.
 
+In the code and these docs, a cluster is called a mesh.
+
 The model math is in [`model.md`](model.md).
 
 ## Positions

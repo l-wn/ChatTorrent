@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-24 -24 728 348" width="728" height="348" role="img">
+  <style>
+    .d-browser > rect { fill: #ffffff; stroke: #0b0b0c; stroke-width: 1; }
+    .d-server > rect { fill: #f5f6f7; stroke: #c9ccd1; stroke-width: 1; }
+    .d-name { font: 600 13px "Instrument Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; fill: #0b0b0c; }
+    .d-mono { font: 400 10.5px ui-monospace, "SF Mono", Menlo, Consolas, monospace; fill: #5a5f66; }
+    .d-pieces rect { fill: #ffffff; stroke: #c9ccd1; stroke-width: 1; }
+    .d-pieces rect.on { fill: #0b0b0c; stroke: none; }
+    .d-flow { stroke: #7022d6; stroke-width: 2; }
+    .d-signal-fill { fill: #7022d6; }
+    .d-bus line { stroke: #c9ccd1; stroke-width: 1; stroke-dasharray: 3 3; }
+  </style>
+  <rect x="-24" y="-24" width="728" height="348" rx="12" fill="#ffffff" stroke="#e3e5e8" />
+
+        <title id="diagram-t">Four browsers sharing one model</title>
+        <desc id="diagram-d">Ana's laptop and Lab PC 3 each hold pieces 1 to 6. Ben's gaming PC and Mia's desktop each hold pieces 7 to 12. Ben's message runs on Ana's laptop, then his own PC. Mia's runs on Lab PC 3, then her desktop. All four connect to a signalling server and a relay.</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto">
+            <path d="M0 0 L8 4 L0 8 z" class="d-signal-fill" />
+          </marker>
+        </defs>
+
+        <g class="d-browser" transform="translate(0 20)">
+          <rect width="150" height="100" rx="4" />
+          <text x="12" y="24" class="d-name">Ana's laptop</text>
+          <g class="d-pieces" transform="translate(12 46)">
+            <rect x="0" width="8" height="14" class="on" /><rect x="10.5" width="8" height="14" class="on" /><rect x="21" width="8" height="14" class="on" /><rect x="31.5" width="8" height="14" class="on" /><rect x="42" width="8" height="14" class="on" /><rect x="52.5" width="8" height="14" class="on" />
+            <rect x="63" width="8" height="14" /><rect x="73.5" width="8" height="14" /><rect x="84" width="8" height="14" /><rect x="94.5" width="8" height="14" /><rect x="105" width="8" height="14" /><rect x="115.5" width="8" height="14" />
+          </g>
+          <text x="12" y="84" class="d-mono">pieces 1-6</text>
+        </g>
+        <g class="d-browser" transform="translate(176 20)">
+          <rect width="150" height="100" rx="4" />
+          <text x="12" y="24" class="d-name">Ben's gaming PC</text>
+          <g class="d-pieces" transform="translate(12 46)">
+            <rect x="0" width="8" height="14" /><rect x="10.5" width="8" height="14" /><rect x="21" width="8" height="14" /><rect x="31.5" width="8" height="14" /><rect x="42" width="8" height="14" /><rect x="52.5" width="8" height="14" />
+            <rect x="63" width="8" height="14" class="on" /><rect x="73.5" width="8" height="14" class="on" /><rect x="84" width="8" height="14" class="on" /><rect x="94.5" width="8" height="14" class="on" /><rect x="105" width="8" height="14" class="on" /><rect x="115.5" width="8" height="14" class="on" />
+          </g>
+          <text x="12" y="84" class="d-mono">pieces 7-12</text>
+        </g>
+        <g class="d-browser" transform="translate(352 20)">
+          <rect width="150" height="100" rx="4" />
+          <text x="12" y="24" class="d-name">Lab PC 3</text>
+          <g class="d-pieces" transform="translate(12 46)">
+            <rect x="0" width="8" height="14" class="on" /><rect x="10.5" width="8" height="14" class="on" /><rect x="21" width="8" height="14" class="on" /><rect x="31.5" width="8" height="14" class="on" /><rect x="42" width="8" height="14" class="on" /><rect x="52.5" width="8" height="14" class="on" />
+            <rect x="63" width="8" height="14" /><rect x="73.5" width="8" height="14" /><rect x="84" width="8" height="14" /><rect x="94.5" width="8" height="14" /><rect x="105" width="8" height="14" /><rect x="115.5" width="8" height="14" />
+          </g>
+          <text x="12" y="84" class="d-mono">pieces 1-6</text>
+        </g>
+        <g class="d-browser" transform="translate(528 20)">
+          <rect width="150" height="100" rx="4" />
+          <text x="12" y="24" class="d-name">Mia's desktop</text>
+          <g class="d-pieces" transform="translate(12 46)">
+            <rect x="0" width="8" height="14" /><rect x="10.5" width="8" height="14" /><rect x="21" width="8" height="14" /><rect x="31.5" width="8" height="14" /><rect x="42" width="8" height="14" /><rect x="52.5" width="8" height="14" />
+            <rect x="63" width="8" height="14" class="on" /><rect x="73.5" width="8" height="14" class="on" /><rect x="84" width="8" height="14" class="on" /><rect x="94.5" width="8" height="14" class="on" /><rect x="105" width="8" height="14" class="on" /><rect x="115.5" width="8" height="14" class="on" />
+          </g>
+          <text x="12" y="84" class="d-mono">pieces 7-12</text>
+        </g>
+
+        <!-- Each message's path: two hops, one per half of the model. -->
+        <line x1="150" y1="73" x2="174" y2="73" class="d-flow" marker-end="url(#arrow)" />
+        <line x1="502" y1="73" x2="526" y2="73" class="d-flow" marker-end="url(#arrow)" />
+
+        <!-- The two servers, linked to every browser. -->
+        <g class="d-bus">
+          <line x1="75" y1="120" x2="75" y2="170" /><line x1="251" y1="120" x2="251" y2="170" />
+          <line x1="427" y1="120" x2="427" y2="170" /><line x1="603" y1="120" x2="603" y2="170" />
+          <line x1="75" y1="170" x2="603" y2="170" />
+          <line x1="230" y1="170" x2="230" y2="204" /><line x1="450" y1="170" x2="450" y2="204" />
+        </g>
+        <g class="d-server" transform="translate(130 204)">
+          <rect width="200" height="72" rx="4" />
+          <text x="14" y="26" class="d-name">Signalling server</text>
+          <text x="14" y="50" class="d-mono">introduces new browsers</text>
+        </g>
+        <g class="d-server" transform="translate(350 204)">
+          <rect width="200" height="72" rx="4" />
+          <text x="14" y="26" class="d-name">Relay</text>
+          <text x="14" y="50" class="d-mono">passes on encrypted traffic</text>
+        </g>
+      </svg>
