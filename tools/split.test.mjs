@@ -4,7 +4,7 @@
 
 import {
     holds, holders, depths, minDepth, covers, gaps, size, place, assign,
-    blockBytes, blockWeightBytes, endBytes, kvShare, recurrentStateBytes, replayLayerBytes, floorBlocks, budgetBlocks, costDims, MIN_BYTES,
+    blockBytes, blockWeightBytes, kvRowBytes, modelBytes, endBytes, kvShare, recurrentStateBytes, replayLayerBytes, floorBlocks, budgetBlocks, costDims, MIN_BYTES,
     positions, headPos, blockRange, served, filling, coverage, EMBED,
     SESSIONS, SLOTS, MAX_SESSIONS, poolSlots, runnerSessions,
 } from '../web/split.js';
@@ -118,10 +118,12 @@ console.log('\nblockBytes: one cost model, both spellings of the dimensions');
     // Weights alone, then weights plus the KV cache the session pool needs.
     eq('a SmolLM2-135M block is 14 MiB of weights',
         Math.round(blockWeightBytes(d) / 2 ** 20), 14);
-    eq('and 26 MiB once the KV pool is counted',
-        Math.round(blockBytes(d) / 2 ** 20), 26);
-    eq('a 1024-token window costs 17 MiB',
-        Math.round(blockBytes(d, { nMax: 1024 }) / 2 ** 20), 17);
+    eq('and 27 MiB once a 16K-token int8 KV pool is counted',
+        Math.round(blockBytes(d) / 2 ** 20), 27);
+    eq('a 4096-token window costs 17 MiB',
+        Math.round(blockBytes(d, { nMax: 4096 }) / 2 ** 20), 17);
+    eq('a token of K is each KV head\'s int8 row and its f32 scales',
+        kvRowBytes(d), 3 * (64 + 4 * 2));
     eq('a TinyLlama-1.1B block is 84 MiB of f16 weights',
         Math.round(blockWeightBytes(costDims({ ...TINYLLAMA_11B, dtype: 'f16' })) / 2 ** 20), 84);
 
@@ -149,9 +151,9 @@ console.log('\nkvShare: a hybrid checkpoint is not charged KV on every layer');
     eq('and the KV term is quartered',
         blockBytes(hybrid) - blockWeightBytes(hybrid),
         (blockBytes(flat) - blockWeightBytes(flat)) / 4);
-    eq('so 4096 tokens on the hybrid cost in KV what 1024 cost charged flat',
+    eq('so 16384 tokens on the hybrid cost in KV what 4096 cost charged flat',
         blockBytes(hybrid) - blockWeightBytes(hybrid),
-        blockBytes(flat, { nMax: 1024 }) - blockWeightBytes(flat));
+        blockBytes(flat, { nMax: 4096 }) - blockWeightBytes(flat));
 }
 
 // A linear_attention layer has no KV but keeps a recurrent state per session
@@ -230,10 +232,10 @@ console.log('\nstored bytes: a block costs what its file weighs');
     eq('unnamed, the mean of the model', blockWeightBytes(d), (LIN * 48 + FULL * 16) / 64);
     eq('a linear block: 388.5 MiB + 8 recurrent states + 2 replay slots = 420 MiB',
         Math.round(blockBytes(d, { index: 0 }) / MiB), 420);
-    eq('a full block: 377.2 MiB + 64 MiB of KV pool = 441 MiB',
-        Math.round(blockBytes(d, { index: 3 }) / MiB), 441);
-    eq('the KV pool is 2 contexts of K and V', blockBytes(d, { index: 3 }) - FULL,
-        4 * 256 * 4096 * 4 * 2 * 2);
+    eq('a full block: 377.2 MiB + 72 MiB of KV pool = 449 MiB',
+        Math.round(blockBytes(d, { index: 3 }) / MiB), 449);
+    eq('the KV pool is 2 16K contexts of int8 K and V, one scale per 32',
+        blockBytes(d, { index: 3 }) - FULL, 4 * (256 + 4 * 8) * 16384 * 2 * 2);
 
     // With no file listing the formula is used, and must be close.
     for (const [kind, real] of [['linear_attention', LIN], ['full_attention', FULL]]) {
@@ -262,7 +264,11 @@ console.log('\nstored bytes: a block costs what its file weighs');
     // The cost of the whole model, for a peer holding all of it.
     const whole = kinds.reduce((n, _, i) => n + blockBytes(d, { index: i }), 0)
         + endBytes(d, 'embed') + endBytes(d, 'head');
-    eq('the whole of Qwen3.8-27B is 29.1 GiB before scratch', (whole / 2 ** 30).toFixed(1), '29.1');
+    eq('the whole of Qwen3.8-27B at 16K is 29.2 GiB before scratch', (whole / 2 ** 30).toFixed(1), '29.2');
+    eq('modelBytes() sums the same', modelBytes(d), whole);
+    eq('and at 32K the KV pool doubles: 1.1 GiB more',
+        ((modelBytes(d, { nMax: 32768 }) - whole) / 2 ** 30).toFixed(2),
+        (16 * 4 * 288 * 16384 * 2 * 2 / 2 ** 30).toFixed(2));
 }
 
 console.log('\nblockBytes: f16 halves the weights but not the KV cache');
@@ -274,13 +280,13 @@ console.log('\nblockBytes: f16 halves the weights but not the KV cache');
     eq('dtype f16 is 2', f16.bytes, 2);
     eq('an absent dtype is f32', costDims(TINYLLAMA_11B).bytes, 4);
 
-    // f16 halves the weights but not the KV cache, which holds activations
-    // that every kernel reads and writes in f32. So a block's cost falls by
-    // less than half, and the difference is one KV term.
+    // f16 halves the weights but not the KV cache, which is int8 whatever
+    // the weights' dtype. So a block's cost falls by less than half, and the
+    // difference is one KV term.
     const weightsF32 = blockWeightBytes(f32);
     eq('slots:0 and blockWeightBytes agree', blockBytes(f32, { slots: 0 }), weightsF32);
     ok('an f16 block is cheaper than an f32 one', blockBytes(f16) < blockBytes(f32));
-    ok('but not half: the KV cache is still f32',
+    ok('but not half: the KV cache does not shrink',
         blockBytes(f16) > blockBytes(f32) / 2);
     eq('the saving is exactly half the weights',
         blockBytes(f32) - blockBytes(f16), weightsF32 / 2);

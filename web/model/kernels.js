@@ -877,53 +877,93 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
-// --- scatter_kv ---
-// [T_new, n_kv*D] projection → paged [page, n_kv, page_tokens, D] cache, at
-// time offset T_past. Called once for K, once for V.
+// --- store_kv ---
+// [T_new, n_kv*D] projection → the int8 KV cache at time offset T_past.
+// Called once for K (with RoPE) and once for V (rot = 0).
+//
+// Format: the cache is u32 words in rows of one (page, kv head, slot). A row
+// is D/4 words of packed int8 (four values per word, low byte first), then
+// D/QB f32 scales, one per QB values: x ≈ q * scale, with scale = max|x|/127
+// over the block. QB = min(32, D), split.js's kvQB(). Row stride
+// RW = D/4 + D/QB words.
 //
 // Paging: a session's KV is a list of fixed-size pages from a pool shared by
 // the whole peer. `pages` maps a logical token position to its physical page,
 // so memory follows the tokens in use (see model.js's makePagePool()). Every
-// kernel that touches the cache reads that table.
+// kernel that touches the cache reads that table. Row r of page p, head n is
+// at ((p*n_kv + n)*page + r) * RW.
 //
 // A contiguous cache is the one-page case: with `page` = N_max and
-// `pages = [0]`, the address reduces to `n*N_max*D + t*D + d`.
-// bindings: src, cache, u{T_new,T_past,page,n_kv,D}, pages
-// dispatch: ceil(D/64), T_new, n_kv
-KERNEL.scatter_kv = /* wgsl */ `
-struct U { T_new: u32, T_past: u32, page: u32, n_kv: u32, D: u32 }
+// `pages = [0]`, the row reduces to n*N_max + t.
+//
+// RoPE is applied here, before quantizing, with the rope kernel's arithmetic
+// and table (split-half pairing; channels [rot, D) pass through). A row's
+// bytes depend only on that row's input, so a rewind, a speculative overwrite
+// or a chunked prefill writes the same bits as one job would.
+// bindings: src, cache, u{T_new,T_past,page,n_kv,D,rot}, pages, tbl
+// dispatch: ceil(T_new*n_kv*(D/QB) / 64)
+KERNEL.store_kv = /* wgsl */ `
+struct U { T_new: u32, T_past: u32, page: u32, n_kv: u32, D: u32, rot: u32, _p0: u32, _p1: u32 }
 @group(0) @binding(0) var<storage, read>       src   : array<f32>;
-@group(0) @binding(1) var<storage, read_write> cache : array<f32>;
+@group(0) @binding(1) var<storage, read_write> cache : array<u32>;
 @group(0) @binding(2) var<uniform>             u     : U;
 @group(0) @binding(3) var<storage, read>       pages : array<u32>;
+@group(0) @binding(4) var<storage, read>       tbl   : array<f32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let d = gid.x;
-    let t_n = gid.y;
-    let n = gid.z;
+    let QB = min(32u, u.D);
+    let nb = u.D / QB;
+    let id = gid.x;
+    if (id >= u.T_new * u.n_kv * nb) { return; }
+    let b   = id % nb;
+    let n   = (id / nb) % u.n_kv;
+    let t_n = id / (nb * u.n_kv);
+    let t   = u.T_past + t_n;
+    let base = t_n * u.n_kv * u.D + n * u.D;
+    let half = u.rot / 2u;
 
-    if (d >= u.D || t_n >= u.T_new || n >= u.n_kv) { return; }
+    var x: array<f32, 32>;
+    var amax = 0.0;
+    for (var j = 0u; j < QB; j++) {
+        let c = b * QB + j;
+        var v = src[base + c];
+        if (c < u.rot) {
+            let i = c % half;
+            let k = (t * half + i) * 2u;
+            let cs = tbl[k];
+            let sn = tbl[k + 1u];
+            let a = src[base + i];
+            let o = src[base + i + half];
+            if (c < half) { v = a*cs - o*sn; } else { v = o*cs + a*sn; }
+        }
+        x[j] = v;
+        amax = max(amax, abs(v));
+    }
+    let scale = amax / 127.0;
+    let inv = select(0.0, 1.0 / scale, scale > 0.0);
 
-    let t = u.T_past + t_n;
-    let phys = pages[t / u.page];
-    let at = (phys*u.n_kv + n)*u.page*u.D + (t % u.page)*u.D + d;
-    cache[at] = src[t_n * u.n_kv * u.D + n*u.D + d];
+    let RW = u.D / 4u + nb;
+    let at = ((pages[t / u.page] * u.n_kv + n) * u.page + t % u.page) * RW;
+    for (var w = 0u; w < QB / 4u; w++) {
+        let q = round(vec4<f32>(x[4u*w], x[4u*w + 1u], x[4u*w + 2u], x[4u*w + 3u]) * inv);
+        cache[at + b * (QB / 4u) + w] = pack4xI8(vec4<i32>(clamp(q, vec4<f32>(-127.0), vec4<f32>(127.0))));
+    }
+    cache[at + u.D / 4u + b] = bitcast<u32>(scale);
 }
 `;
 
 // --- rope ---
-// In-place rotation of Q or K. Llama split-half pairing: channel i pairs with
-// i+rot_dim/2, not (2i, 2i+1).
+// In-place rotation of an f32 [heads, rows, D] buffer: Q in the forward pass.
+// K is rotated by store_kv as it is quantized, with the same arithmetic and
+// table. Llama split-half pairing: channel i pairs with i+rot_dim/2, not
+// (2i, 2i+1).
 //
 // rot_dim (rotation width) and head_dim (per-head storage stride) are separate
 // so a partial-rotary checkpoint (Qwen3.8-27B: rot_dim = head_dim/4) leaves
 // channels [rot_dim, head_dim) unchanged, matching HF's apply_rotary_pos_emb.
-// `page` depends on the call site: T for Q, the cache's page size for the K
-// cache. row0 is the first buffer row to rotate: 0 for Q, T_past for the cache
-// (only the rows scatter_kv just wrote).
-//
-// Q is not paged: a dense [heads, T, D] buffer is the one-page case with
+// `page` is the buffer's rows per head and row0 the first row to rotate. A
+// paged buffer passes its page table; a dense one is the one-page case with
 // `page` = T and `pages = [0]`, the wrapper's default.
 //
 // The angles come from a table built on the CPU in f64, not from sin/cos in
@@ -970,16 +1010,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 `;
 
 // --- qk_scores_gqa ---
-// scores[n_heads, T_new, T_act] = Q @ K_cache^T * (1/sqrt(D)).
-// GQA: query head h reads KV head h / group.
+// scores[n_heads, T_new, T_act] = Q @ K_cache^T * (1/sqrt(D)), for the T_new
+// query rows starting at r0 of Q's T_q. GQA: query head h reads KV head
+// h / group. K is the int8 cache (see store_kv): each block's int8 dot
+// product is scaled once.
 //
 // One `pages` lookup per thread, since each thread has one `t_a`.
-// bindings: Q, K_cache, scores, u{T_new,T_act,page,D,n_heads,group}, pages
+// bindings: Q, K_cache, scores, u{T_new,T_act,page,D,n_heads,group,r0,T_q}, pages
 // dispatch: ceil(T_new/8), ceil(T_act/8), n_heads
 KERNEL.qk_scores_gqa = /* wgsl */ `
-struct U { T_new: u32, T_act: u32, page: u32, D: u32, n_heads: u32, group: u32 }
+struct U { T_new: u32, T_act: u32, page: u32, D: u32, n_heads: u32, group: u32, r0: u32, T_q: u32 }
 @group(0) @binding(0) var<storage, read>       Q       : array<f32>;
-@group(0) @binding(1) var<storage, read>       K_cache : array<f32>;
+@group(0) @binding(1) var<storage, read>       K_cache : array<u32>;
 @group(0) @binding(2) var<storage, read_write> scores  : array<f32>;
 @group(0) @binding(3) var<uniform>             u       : U;
 @group(0) @binding(4) var<storage, read>       pages   : array<u32>;
@@ -992,15 +1034,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if (t_n >= u.T_new || t_a >= u.T_act || h >= u.n_heads) { return; }
 
+    let QB = min(32u, u.D);
+    let nb = u.D / QB;
+    let RW = u.D / 4u + nb;
     let kv_h = h / u.group;
     let n_kv = u.n_heads / u.group;
-    let Q_base = h*u.T_new*u.D + t_n*u.D;
-    let phys = pages[t_a / u.page];
-    let K_base = (phys*n_kv + kv_h)*u.page*u.D + (t_a % u.page)*u.D;
+    let Q_base = h*u.T_q*u.D + (u.r0 + t_n)*u.D;
+    let at = ((pages[t_a / u.page]*n_kv + kv_h)*u.page + t_a % u.page) * RW;
 
     var sum = 0.0;
-    for (var i = 0u; i < u.D; i++) {
-        sum += Q[Q_base + i] * K_cache[K_base + i];
+    for (var b = 0u; b < nb; b++) {
+        var s = 0.0;
+        for (var w = 0u; w < QB / 4u; w++) {
+            let k4 = vec4<f32>(unpack4xI8(K_cache[at + b*(QB/4u) + w]));
+            let i  = Q_base + b*QB + 4u*w;
+            s += dot(vec4<f32>(Q[i], Q[i + 1u], Q[i + 2u], Q[i + 3u]), k4);
+        }
+        sum += s * bitcast<f32>(K_cache[at + u.D/4u + b]);
     }
 
     let scale = 1.0 / sqrt(f32(u.D));
@@ -1084,17 +1134,18 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>,
 `;
 
 // --- attn_av_gqa ---
-// out[n_heads, T_new, D] = scores @ V_cache. Same GQA mapping as qk_scores.
+// out[n_heads, T_q, D] rows r0 .. r0+T_new-1 = scores @ V_cache. Same GQA
+// mapping as qk_scores. V is the int8 cache (see store_kv).
 //
 // Each thread walks the whole time axis, so the outer loop is over pages and
 // the inner loop over slots: one `pages` lookup per page, not per token. With
 // a contiguous cache (`page` >= T_act) the outer loop runs once.
-// bindings: scores, V_cache, out, u{T_new,T_act,page,D,n_heads,group}, pages
+// bindings: scores, V_cache, out, u{T_new,T_act,page,D,n_heads,group,r0,T_q}, pages
 // dispatch: ceil(T_new/8), ceil(D/8), n_heads
 KERNEL.attn_av_gqa = /* wgsl */ `
-struct U { T_new: u32, T_act: u32, page: u32, D: u32, n_heads: u32, group: u32 }
+struct U { T_new: u32, T_act: u32, page: u32, D: u32, n_heads: u32, group: u32, r0: u32, T_q: u32 }
 @group(0) @binding(0) var<storage, read>       scores  : array<f32>;
-@group(0) @binding(1) var<storage, read>       V_cache : array<f32>;
+@group(0) @binding(1) var<storage, read>       V_cache : array<u32>;
 @group(0) @binding(2) var<storage, read_write> out     : array<f32>;
 @group(0) @binding(3) var<uniform>             u       : U;
 @group(0) @binding(4) var<storage, read>       pages   : array<u32>;
@@ -1107,9 +1158,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if (t_n >= u.T_new || d >= u.D || h >= u.n_heads) { return; }
 
+    let QB = min(32u, u.D);
+    let RW = u.D / 4u + u.D / QB;
     let h_kv = h / u.group;
     let n_kv = u.n_heads / u.group;
     let scores_base = h*u.T_new*u.T_act + t_n*u.T_act;
+    // This thread's byte and scale within a row.
+    let word  = d / 4u;
+    let shift = (d % 4u) * 8u;
+    let sc    = u.D / 4u + d / QB;
 
     var sum = 0.0;
     var i = 0u;
@@ -1120,14 +1177,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Up to the end of this page or the end of the context, whichever is
         // first.
         let n = min(u.page - slot, u.T_act - i);
-        let v_base = (phys*n_kv + h_kv)*u.page*u.D + slot*u.D;
+        let row = ((phys*n_kv + h_kv)*u.page + slot) * RW;
         for (var j = 0u; j < n; j++) {
-            sum += scores[scores_base + i + j] * V_cache[v_base + j*u.D + d];
+            let r = row + j*RW;
+            let q = f32(extractBits(bitcast<i32>(V_cache[r + word]), shift, 8u));
+            sum += scores[scores_base + i + j] * (q * bitcast<f32>(V_cache[r + sc]));
         }
         i += n;
     }
 
-    out[h*u.T_new*u.D + t_n*u.D + d] = sum;
+    out[h*u.T_q*u.D + (u.r0 + t_n)*u.D + d] = sum;
 }
 `;
 
@@ -1164,6 +1223,43 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
   if (i >= u.N) { return; }
   a[i] = a[i] + b[i];
+}
+`;
+
+// --- round_f16 ---
+// a[i] = a[i] rounded to the nearest f16 value, ties to even, kept as f32.
+// Values past ±65504 clamp to it; NaN stays NaN. The same rounding as
+// web/f16.js, bit for bit: it is run on the residual stream after every block
+// (model.js block()), so rows handed to another peer are already halves and
+// a reply is the same however the model is split. Integer ops only, so every
+// GPU rounds alike.
+// bindings: a, u{N}   dispatch: ceil(N/256)
+KERNEL.round_f16 = /* wgsl */ `
+struct U { N: u32 }
+@group(0) @binding(0) var<storage, read_write> a: array<f32>;
+@group(0) @binding(1) var<uniform>             u: U;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= u.N) { return; }
+  let b = bitcast<u32>(a[i]);
+  let sign = b & 0x80000000u;
+  let m = b & 0x7fffffffu;
+  if (m > 0x7f800000u) { return; }                      // NaN
+  if (m > 0x477fe000u) { a[i] = bitcast<f32>(sign | 0x477fe000u); return; }   // past 65504
+  if (m < 0x38800000u) {
+    // Below 2^-14 the halves are multiples of 2^-24. Scaling by a power of
+    // two is exact, and round() is to nearest even.
+    let q = round(bitcast<f32>(m) * 16777216.0) / 16777216.0;
+    a[i] = bitcast<f32>(sign | bitcast<u32>(q));
+    return;
+  }
+  // Keep 10 of the 23 mantissa bits. A carry into the exponent is right.
+  let rest = m & 0x1fffu;
+  var r = m & ~0x1fffu;
+  if (rest > 0x1000u || (rest == 0x1000u && (r & 0x2000u) != 0u)) { r += 0x2000u; }
+  a[i] = bitcast<f32>(sign | r);
 }
 `;
 
@@ -1733,13 +1829,40 @@ export function onePage(device) {
     return buf;
 }
 
-// src[T_new, nKV*D] → the paged cache at time offset T_past
-export function scatterKV(device, pass, src, cache, T_new, T_past, pageTokens, nKV, D,
-                          pages = null) {
-    const p  = getPipeline(device, KERNEL.scatter_kv);
-    const u  = uniform(device, u8(T_new, T_past, pageTokens, nKV, D));
-    const bg = bind(device, p, [src, cache, u, pages ?? onePage(device)]);
-    dispatch(pass, p, bg, Math.ceil(D / 64), T_new, nKV, 'scatter_kv');
+// u32 words in one KV row (one token, one KV head): D/4 of int8, then one
+// f32 scale per min(32, D) values. See store_kv; split.js's kvRowBytes() is
+// n_kv rows of this, in bytes.
+export const kvRowWords = (D) => D / 4 + D / Math.min(32, D);
+
+// src[T_new, nKV*D] → the int8 cache at time offset T_past. `rope` is
+// { theta, scaling, rotDim } for K and null for V.
+export function storeKV(device, pass, src, cache, T_new, T_past, pageTokens, nKV, D,
+                        rope = null, pages = null) {
+    const p   = getPipeline(device, KERNEL.store_kv);
+    const rot = rope ? (rope.rotDim ?? D) : 0;
+    const u   = uniform(device, u8(T_new, T_past, pageTokens, nKV, D, rot));
+    // V binds the (smallest) table too, so the layout is one bind group shape.
+    const tbl = ropeTable(device, rope ? rot : 2, rope?.theta ?? DIMS.rope_theta,
+                          rope ? T_past + T_new : 1, rope?.scaling);
+    const bg  = bind(device, p, [src, cache, u, pages ?? onePage(device), tbl]);
+    const n   = T_new * nKV * (D / Math.min(32, D));
+    dispatch(pass, p, bg, Math.ceil(n / 64), 1, 1, 'store_kv');
+}
+
+// Rows of an int8 cache read back as f32 [rows, D], for checks. `words` is
+// the buffer's contents as a Uint32Array, `row0` the first row.
+export function dequantKV(words, D, rows, row0 = 0) {
+    const RW = kvRowWords(D), QB = Math.min(32, D);
+    const f = new Float32Array(words.buffer, words.byteOffset, words.length);
+    const b = new Int8Array(words.buffer, words.byteOffset, words.byteLength);
+    const out = new Float32Array(rows * D);
+    for (let r = 0; r < rows; r++) {
+        const at = (row0 + r) * RW;
+        for (let d = 0; d < D; d++) {
+            out[r * D + d] = b[at * 4 + d] * f[at + D / 4 + Math.floor(d / QB)];
+        }
+    }
+    return out;
 }
 
 // device → Map<"D:theta[:scaling]", { cap, buf }>. cos/sin for absolute
@@ -1798,9 +1921,7 @@ export function ropeTable(device, D, theta, needPos, scaling) {
     return buf;
 }
 
-// In-place RoPE. Two call sites:
-//   Q:       rope(dev, pass, Qh,      nHeads, T, D, T_past, T,          0)
-//   K cache: rope(dev, pass, K_cache, nKV,    T, D, T_past, pageTokens, T_past, …, pages)
+// In-place RoPE on a dense f32 buffer: rope(dev, pass, Qh, nHeads, T, D, T_past, T, 0).
 // rotDim < D is a partial-rotary checkpoint (Qwen3.8-27B: rotDim = D/4).
 // Channels [rotDim, D) are left unchanged.
 export function rope(device, pass, buf, nHeads, T, D, T_past, timeStride, row0 = 0,
@@ -1813,11 +1934,13 @@ export function rope(device, pass, buf, nHeads, T, D, T_past, timeStride, row0 =
     dispatch(pass, p, bg, Math.ceil((rotDim / 2) / 64), T, nHeads, 'rope');
 }
 
-// scores[nHeads, T_new, T_act] = Q @ K_cache^T / sqrt(D)
+// scores[nHeads, T_new, T_act] = Q @ K_cache^T / sqrt(D), for Q's rows
+// r0 .. r0+T_new-1 of T_q (T_q = T_new, r0 = 0: every row).
 export function qkScoresGQA(device, pass, Q, Kcache, scores,
-                            T_new, T_act, pageTokens, D, nHeads, group, pages = null) {
+                            T_new, T_act, pageTokens, D, nHeads, group, pages = null,
+                            r0 = 0, T_q = T_new) {
     const p  = getPipeline(device, KERNEL.qk_scores_gqa);
-    const u  = uniform(device, u8(T_new, T_act, pageTokens, D, nHeads, group));
+    const u  = uniform(device, u8(T_new, T_act, pageTokens, D, nHeads, group, r0, T_q));
     const bg = bind(device, p, [Q, Kcache, scores, u, pages ?? onePage(device)]);
     dispatch(pass, p, bg, Math.ceil(T_new / 8), Math.ceil(T_act / 8), nHeads, 'qk_scores');
 }
@@ -1830,11 +1953,12 @@ export function causalSoftmax(device, pass, scores, T_new, T_act, T_past, nHeads
     dispatch(pass, p, bg, T_new, nHeads, 1, 'causal_softmax');
 }
 
-// out[nHeads, T_new, D] = scores @ V_cache
+// out[nHeads, T_q, D] rows r0 .. r0+T_new-1 = scores @ V_cache
 export function attnAVGQA(device, pass, scores, Vcache, out,
-                          T_new, T_act, pageTokens, D, nHeads, group, pages = null) {
+                          T_new, T_act, pageTokens, D, nHeads, group, pages = null,
+                          r0 = 0, T_q = T_new) {
     const p  = getPipeline(device, KERNEL.attn_av_gqa);
-    const u  = uniform(device, u8(T_new, T_act, pageTokens, D, nHeads, group));
+    const u  = uniform(device, u8(T_new, T_act, pageTokens, D, nHeads, group, r0, T_q));
     const bg = bind(device, p, [scores, Vcache, out, u, pages ?? onePage(device)]);
     dispatch(pass, p, bg, Math.ceil(T_new / 8), Math.ceil(D / 8), nHeads, 'attn_av');
 }
@@ -1853,6 +1977,14 @@ export function addInplace(device, pass, a, b, N) {
     const u  = uniform(device, u4(N));
     const bg = bind(device, p, [a, b, u]);
     dispatch(pass, p, bg, Math.ceil(N / 256), 1, 1, 'add_inplace');
+}
+
+// a[0, N) rounded in place to f16 values (see round_f16).
+export function roundF16(device, pass, a, N) {
+    const p  = getPipeline(device, KERNEL.round_f16);
+    const u  = uniform(device, u4(N));
+    const bg = bind(device, p, [a, u]);
+    dispatch(pass, p, bg, Math.ceil(N / 256), 1, 1, 'round_f16');
 }
 
 // dst[dstOff, dstOff + N) = src[srcOff, srcOff + N), inside a compute pass.

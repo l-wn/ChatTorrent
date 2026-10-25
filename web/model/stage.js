@@ -15,14 +15,15 @@
 // See docs/architecture.md (KV cache and admission, Routing, Failures).
 
 import { F32, makeStorage, makeReadback, readF32, gatherEmbedNoPos, rmsnorm, matmulNobias,
-         withPass, counters, copyF32, topkRows, topkPairs } from './kernels.js';
+         withPass, counters, copyF32, topkRows, topkPairs, roundF16 } from './kernels.js';
 import { block, makeCache, makeScratch, makeRecurrentState, recurrentStateBytes,
          makePagePool, makeSessionFrame, ensurePages, freePages, makeReplayLayer,
          replayLayerBytes, mtpBlock, mtpChain, makeMtpScratch } from './model.js';
 import { makeGpuProf } from './gpuprof.js';
 import { sampleFromLogitsRow } from './generate.js';
 import { sampleFromCandidates, candidatesFor, TOPK_MAX } from './sampling.js';
-import { positions, blockRange, PAGE_TOKENS, IDLE_MS, WAIT_MS, SPEC_COLS } from '../split.js';
+import { toF16, fromF16 } from '../f16.js';
+import { positions, blockRange, kvRowBytes, PAGE_TOKENS, IDLE_MS, WAIT_MS, SPEC_COLS } from '../split.js';
 
 // The session id a warm-up pass runs under. Peer-minted ids are
 // `${peerId}-${base36}`, so it cannot collide with a chat.
@@ -97,6 +98,15 @@ export class Runner {
         this.pageTokens = Math.min(pageTokens, nMax);
         // Pages per session. The pool has `slots` times that.
         this.maxPages = Math.ceil(nMax / this.pageTokens);
+        // A layer's K pool buffer is bound whole, so it must fit the device's
+        // binding limit.
+        const poolBuffer = kvRowBytes(d) * this.pageTokens * slots * this.maxPages;
+        const bindMax = device.limits?.maxStorageBufferBindingSize;
+        if (bindMax && poolBuffer > bindMax) {
+            throw new Error(`this GPU can bind at most ${(bindMax / 2 ** 20).toFixed(0)} MiB, and a ` +
+                `${nMax}-token context for ${sessions} chats needs a ${(poolBuffer / 2 ** 20).toFixed(0)} ` +
+                `MiB KV buffer per layer. A cluster with a shorter context or fewer chats in memory fits.`);
+        }
         this.pool = makePagePool(device, d, {
             pageTokens: this.pageTokens,
             nPages: slots * this.maxPages,
@@ -472,8 +482,7 @@ export class Runner {
 
     // Bytes of one layer's K (or V) pool buffer.
     #poolBufferBytes() {
-        return this.d.n_kv_heads * this.pool.pageTokens * this.d.head_dim * F32
-            * this.pool.nPages;
+        return kvRowBytes(this.d) * this.pool.pageTokens * this.pool.nPages;
     }
 
     // Reserve and attach the state for the position at `hi`, then raise `hi`.
@@ -660,7 +669,7 @@ export class Runner {
             // returns id 0, which is also a valid token.
             const out = r.at === positions(this.d.n_layer)
                 ? await readF32(this.device, this.scratch.logits, this.d.vocab * F32)
-                : r.hidden;
+                : r.f32;
             if (!out.every(Number.isFinite)) {
                 throw new Error(`a warm-up pass through positions ${from}–${r.at - 1} produced ` +
                     'non-finite output. This GPU cannot run them ' +
@@ -974,7 +983,7 @@ export class Runner {
     // `len` is set to match.
     //
     // Allocated on first use and doubled from LOG_CHUNK up to `nMax`, so a
-    // short chat uses little host RAM.
+    // short chat uses little host RAM. Rows are half bits, as sent.
     #log(s, at, past, rows) {
         if (s === WARMUP) return;              // a warm-up hands its rows to nobody
         const H = this.d.hidden;
@@ -983,14 +992,14 @@ export class Runner {
         let log = boundaries.get(at);
         if (!log) {
             const cap = Math.min(LOG_CHUNK, this.nMax);
-            boundaries.set(at, log = { rows: new Float32Array(cap * H), len: 0 });
+            boundaries.set(at, log = { rows: new Uint16Array(cap * H), len: 0 });
         }
 
         const need = past + rows.length / H;
         if (need * H > log.rows.length) {
             let cap = log.rows.length / H;
             while (cap < need) cap = Math.min(this.nMax, cap * 2);
-            const grown = new Float32Array(cap * H);
+            const grown = new Uint16Array(cap * H);
             grown.set(log.rows);               // rows are at absolute positions
             log.rows = grown;
         }
@@ -1055,6 +1064,8 @@ export class Runner {
         if (!gather && hidden?.length !== T * H) {
             throw new Error(`payload is ${hidden?.length ?? 0} floats, expected ${T * H}`);
         }
+        // Rows from another peer or a boundary log are half bits (f16.js).
+        if (hidden instanceof Uint16Array) hidden = fromF16(hidden);
         // A verify job: its ids are the last sampled token and the drafts.
         const drafts = h.drafts ?? null;
         const verify = drafts !== null && h.s !== WARMUP && !h.replay;
@@ -1130,7 +1141,12 @@ export class Runner {
         }
         withPass(enc, (pass) => {
             prof?.at('embed');
-            if (gather) gatherEmbedNoPos(device, pass, this.ids, this.w.wte, s.x, T, H);
+            if (gather) {
+                gatherEmbedNoPos(device, pass, this.ids, this.w.wte, s.x, T, H);
+                // Rounded as block() rounds its output, so the embedding's
+                // rows are the same f16 values whoever holds the next block.
+                roundF16(device, pass, s.x, T * H);
+            }
 
             // `w.layers` and the cache are both indexed from `blockLo`:
             // position `p` is block `p - 1`, which is layer `p - 1 - blockLo`.
@@ -1279,10 +1295,13 @@ export class Runner {
             this.#timed(h, queuedAt, t0, t3, to - at);
             return { at: to, token, phases, ...(gpu && { gpu }), ...(next && { mtp: next }) };
         }
-        this.#log(h.s, to, h.past, out);
+        // The rows leave as half bits, rounded once here: the next peer, the
+        // boundary log and any replay of it all see the same values.
+        const bits = toF16(out);
+        this.#log(h.s, to, h.past, bits);
         phases.log = ms(t4, performance.now());
         this.#timed(h, queuedAt, t0, t3, to - at);
-        return { at: to, hidden: out, phases, ...(gpu && { gpu }) };
+        return { at: to, hidden: bits, phases, ...(gpu && { gpu }), ...(h.s === WARMUP && { f32: out }) };
     }
 
     // Update the timings route.js balances on, after a job. `t0` is when it

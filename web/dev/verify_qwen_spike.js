@@ -10,13 +10,17 @@
 import {
     uploadF32, makeStorage, readF32, withPass,
     matmulNobias, rmsnorm, siluMul, addInplace, rope,
-    reshapeHeads, scatterKV, qkScoresGQA, causalSoftmax, attnAVGQA, mergeHeads,
+    reshapeHeads, storeKV, kvRowWords, dequantKV, qkScoresGQA, causalSoftmax, attnAVGQA, mergeHeads,
     causalConv1d, l2NormalizeHeads, gatedDeltaNetStep, sigmoidMul,
 } from '../model/kernels.js';
 import { loadNpy, loadJson } from './npy.js';
 import { diff, makeReporter } from './verify.js';
 
 export const ORACLE_URL = '/oracle/qwen3.8-27b-spike';
+
+// The tolerance for a full-attention layer's outputs, which carry the int8 KV
+// cache's rounding (see runLayer3).
+export const KV_TOL = { atol: 2e-3, rtol: 1e-2 };
 
 // Qwen3.8-27B's rms_norm_eps, from the checkpoint's config.json. kernels.js's
 // rmsnorm() defaults to DIMS.rms_eps (1e-5, SmolLM2's value), which is 10x too
@@ -278,7 +282,8 @@ export async function runLayer3(device, cfg, oracleBase = ORACLE_URL) {
     const queryNormed = makeStorage(device, T * nH * D * 4), kNormed = makeStorage(device, T * nKV * D * 4);
     const qh = makeStorage(device, nH * T * D * 4);
     const N_max = T;
-    const Kcache = makeStorage(device, nKV * N_max * D * 4), Vcache = makeStorage(device, nKV * N_max * D * 4);
+    const kvBytes = nKV * N_max * kvRowWords(D) * 4;
+    const Kcache = makeStorage(device, kvBytes), Vcache = makeStorage(device, kvBytes);
     const scores = makeStorage(device, nH * T * N_max * 4);
     const ctx = makeStorage(device, nH * T * D * 4), merged = makeStorage(device, T * nH * D * 4);
     const gated = makeStorage(device, T * nH * D * 4), attnOut = makeStorage(device, T * H * 4);
@@ -299,10 +304,9 @@ export async function runLayer3(device, cfg, oracleBase = ORACLE_URL) {
         rmsnorm(device, pass, query, qNormW, queryNormed, T * nH, D, RMS_EPS);
         rmsnorm(device, pass, kRaw, kNormW, kNormed, T * nKV, D, RMS_EPS);
         reshapeHeads(device, pass, queryNormed, qh, T, nH, D);
-        scatterKV(device, pass, kNormed, Kcache, T, 0, N_max, nKV, D);
-        scatterKV(device, pass, vRaw, Vcache, T, 0, N_max, nKV, D);
+        storeKV(device, pass, kNormed, Kcache, T, 0, N_max, nKV, D, { theta, scaling: null, rotDim });
+        storeKV(device, pass, vRaw, Vcache, T, 0, N_max, nKV, D);
         rope(device, pass, qh, nH, T, D, 0, T, 0, theta, null, rotDim);
-        rope(device, pass, Kcache, nKV, T, D, 0, N_max, 0, theta, null, rotDim);
         qkScoresGQA(device, pass, qh, Kcache, scores, T, T, N_max, D, nH, groupGQA);
         causalSoftmax(device, pass, scores, T, T, 0, nH);
         attnAVGQA(device, pass, scores, Vcache, ctx, T, T, N_max, D, nH, groupGQA);
@@ -329,25 +333,32 @@ export async function runLayer3(device, cfg, oracleBase = ORACLE_URL) {
         { atol: 1e-4, rtol: 1e-5 });
     r.close('layer03 q_rope (head-major)', await read(qh, nH * T * D),
         toHeadMajor(o.layer03_q_rope.data, T, nH, D), { atol: 1e-3, rtol: 1e-3 });
-    r.close('layer03 k_rope (head-major)', await read(Kcache, nKV * N_max * D),
-        toHeadMajor(o.layer03_k_rope.data, T, nKV, D), { atol: 1e-3, rtol: 1e-3 });
-    r.close('layer03 attn_out', await read(attnOut, T * H), o.layer03_attn_out.data,
-        { atol: 1e-3, rtol: 1e-3 });
-    r.close('layer03 ln2', await read(ln2, T * H), o.layer03_ln2.data, { atol: 1e-3, rtol: 1e-3 });
-    r.close('layer03 mlp gate', await read(gateFfn, T * ffn), o.layer03_gate.data, { atol: 1e-3, rtol: 1e-3 });
-    r.close('layer03 mlp up', await read(upFfn, T * ffn), o.layer03_up.data, { atol: 1e-3, rtol: 1e-3 });
+    // The cache is int8 (N_max = T, so rows are already head-major): each
+    // value is within half a step, max|x|/254, of its block's rope output.
+    const kWant = toHeadMajor(o.layer03_k_rope.data, T, nKV, D);
+    const kStep = kWant.reduce((m, x) => Math.max(m, Math.abs(x)), 0) / 254;
+    r.close('layer03 k_rope (head-major, int8)',
+        dequantKV(new Uint32Array((await read(Kcache, nKV * N_max * kvRowWords(D))).buffer), D, nKV * N_max),
+        kWant, { atol: 1e-3 + kStep, rtol: 1e-3 });
+    // Everything after the cache carries the int8 KV error. Measured on this
+    // fixture: attn_out 1.4e-3 (|x| <= 0.21), ln2 1.5e-2 (|x| <= 3.5), mlp gate
+    // 5.8e-3, block out 1.4e-3, against ~2e-7 with an f32 cache. Each
+    // tolerance is about 1.5x that. A layout bug gives errors of order |x|.
+    r.close('layer03 attn_out', await read(attnOut, T * H), o.layer03_attn_out.data, KV_TOL);
+    r.close('layer03 ln2', await read(ln2, T * H), o.layer03_ln2.data, KV_TOL);
+    r.close('layer03 mlp gate', await read(gateFfn, T * ffn), o.layer03_gate.data, KV_TOL);
+    r.close('layer03 mlp up', await read(upFfn, T * ffn), o.layer03_up.data, KV_TOL);
     const down3 = await read(downFfn, T * H), blockOut3 = await read(x, T * H);
     // Computed as x - down, as for layer 0's after_attn_resid.
-    r.close('layer03 after_attn_resid', sub(blockOut3, down3), o.layer03_after_attn_resid.data,
-        { atol: 1e-3, rtol: 1e-3 });
-    r.close('layer03 mlp out', down3, o.layer03_mlp_out.data, { atol: 1e-3, rtol: 1e-3 });
-    r.close('block_03 out', blockOut3, o.block_03_out.data, { atol: 1e-3, rtol: 1e-3 });
+    r.close('layer03 after_attn_resid', sub(blockOut3, down3), o.layer03_after_attn_resid.data, KV_TOL);
+    r.close('layer03 mlp out', down3, o.layer03_mlp_out.data, KV_TOL);
+    r.close('block_03 out', blockOut3, o.block_03_out.data, KV_TOL);
 
     return { rows: r.rows, ok: r.rows.every((x) => x.ok) };
 }
 
 // The oracle's *_rope.npy is [T,heads,D] (T-major). The GPU pipeline keeps Q/K
-// head-major ([heads,T,D]) after reshapeHeads/scatterKV, as in production. The
+// head-major ([heads,T,D]) after reshapeHeads/storeKV, as in production. The
 // oracle array is re-laid out here so one diff() call covers it.
 function toHeadMajor(flat, T, heads, D) {
     const out = new Float32Array(T * heads * D);

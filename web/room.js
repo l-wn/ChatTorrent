@@ -164,6 +164,7 @@ export async function openRoom(secret, { overrideToken = null } = {}) {
 export const creatorKey = (s) => `chattorrent:creator:${s}`;
 export const chatsKey = (s) => `chattorrent:chats:${s}`;
 export const sessionsKey = (s) => `chattorrent:sessions:${s}`;
+export const ctxKey = (s) => `chattorrent:ctx:${s}`;
 
 // The name this tab puts on its invite links for one cluster
 // (sessionStorage, keyed by the secret). Not kept across clusters or visits,

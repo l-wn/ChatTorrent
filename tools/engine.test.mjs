@@ -18,7 +18,10 @@ import { Runner } from '../web/model/stage.js';
 import { makeGpu, D, L, N, weightsFor, zeroTopk } from './stub-gpu.mjs';
 import { Mesh } from '../web/net.js';
 import { makeRouter, T_MAX } from '../web/route.js';
-import { N_MAX, SLOTS } from '../web/split.js';
+import { CONTEXTS, SLOTS } from '../web/split.js';
+
+// The shortest context, so filling it stays quick.
+const N_MAX = CONTEXTS[0];
 
 const TOKENIZER = 'weights/llama-3.1-8b-instruct/tokenizer/tokenizer.json';
 if (!existsSync(TOKENIZER)) {

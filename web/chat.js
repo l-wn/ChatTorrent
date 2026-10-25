@@ -8,6 +8,7 @@
 // Raw mode skips the wrapper and continues the typed text.
 
 import { checkDims, makeCache, makeScratch } from './model/model.js';
+import { DEFAULT_CTX } from './split.js';
 import { loadManifest, loadWeights, dimsFromManifest, activeWeights } from './model/loader.js';
 import { forwardIds } from './model/generate.js';
 import { penaltyState, sampleFromLogitsRow } from './model/sampling.js';
@@ -18,9 +19,9 @@ import { makeMessage } from './message.js';
 
 // --- Session shape ---
 
-// Context window for a session. Must match web/split.js's N_MAX so this page
-// and the mesh give the same answer on a long chat.
-const N_MAX = 4096;
+// Context window for a session: the mesh's default, so this page and the
+// mesh give the same answer on a long chat.
+const N_MAX = DEFAULT_CTX;
 
 // Longest run of tokens fed in one forward pass. A prompt is chunked to fit.
 // Bounds the scratch buffers.

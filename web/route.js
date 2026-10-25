@@ -13,7 +13,7 @@
 
 import { penaltyState } from './model/sampling.js';
 import { lookup, makeDepth, pickDepth, noteDepth, MIN_DRAFTS } from './draft.js';
-import { SPEC_COLS, N_MAX } from './split.js';
+import { SPEC_COLS, DEFAULT_CTX } from './split.js';
 
 // Longest run of tokens in one job. Chosen for latency: net.js fragments a
 // message too big for one datachannel send.
@@ -143,6 +143,7 @@ export function makeRouter({
     onProgress = () => {},
     isCancelled = () => false,
     gpu = () => null,              // this tab's adapter name, for a profiled hop
+    ctxMax = () => DEFAULT_CTX,    // the mesh's context window, in tokens
     jobTimeout = JOB_TIMEOUT,
     ackTimeout = ACK_TIMEOUT,
     ackRate = ACK_RATE,
@@ -1011,7 +1012,7 @@ export function makeRouter({
         const opts = jobOpts(settings, ctx ?? [], eos);
         let drafts = [], chosen = 0, rowOpts = null;
         if (depth && ctx) {
-            const nMax = runner()?.nMax ?? N_MAX;
+            const nMax = runner()?.nMax ?? ctxMax();
             chosen = pickDepth(depth);
             const K = Math.min(chosen, left - 1, SPEC_COLS - 1, nMax - at - 1);
             if (K >= MIN_DRAFTS) {

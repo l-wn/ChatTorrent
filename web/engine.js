@@ -18,8 +18,8 @@ import { runAllTests } from './dev/kernels.test.js';
 import { smokeForward } from './dev/smoke.js';
 import { Mesh } from './net.js';
 import { makeRouter, makeConversation, T_MAX } from './route.js';
-import { blockBytes, endBytes, mtpBytes, floorBlocks, positions, describeRange, N_MAX, SLOTS,
-         SESSIONS, runnerSessions } from './split.js';
+import { blockBytes, endBytes, mtpBytes, floorBlocks, positions, describeRange, DEFAULT_CTX, SLOTS,
+         SESSIONS, runnerSessions, runnerCtx } from './split.js';
 
 // How long a Runner must be idle before #growClaim() takes another step, so
 // downloads and warm-ups do not compete with live chats.
@@ -39,9 +39,9 @@ const keepChunk = (samples, a) => samples.push({ kind: 'prefill', n: a.n, rt: a.
     ...(a.link && { link: a.link }), trace: a.trace ?? [] });
 
 export class ContextFullError extends Error {
-    constructor(needed, room) {
+    constructor(needed, room, ctx) {
         super(`this prompt needs ${needed} tokens and only ${room} are left in the ` +
-            `${N_MAX}-token context`);
+            `${ctx}-token context`);
         this.needed = needed;
         this.room = room;
     }
@@ -52,6 +52,9 @@ export class Engine {
     #router = null;
     #runner = null;
     #manifest = null;
+    // The context window serve() sized this tab's Runner for. Null for a tab
+    // that only chats; ctxMax then reads the mesh's.
+    #ctx = null;
     #baseUrl = null;
     #dims = null;
     #role = 'joining';       // 'joining' -> 'worker' | 'spectator'
@@ -122,13 +125,14 @@ export class Engine {
     //
     // `relayOnly` (default true) sends every link through a TURN relay, so no
     // peer sees this tab's address (see web/net.js). `chats` is the limit on
-    // replies at once, and `sessions` the chats each peer keeps in memory, to
-    // ask for if this join creates a private mesh.
-    async connect({ room, relayOnly = true, chats = null, sessions = null } = {}) {
+    // replies at once, `sessions` the chats each peer keeps in memory and
+    // `ctx` the context window, to ask for if this join creates a private mesh.
+    async connect({ room, relayOnly = true, chats = null, sessions = null, ctx = null } = {}) {
         const net = new Mesh({
             room,
             chats,
             sessions,
+            ctx,
             relayOnly,
             onMessage: (h, payload, raw, from) => this.#router.route(h, payload, raw, from),
             onChange: () => this.#emit('change'),
@@ -150,6 +154,7 @@ export class Engine {
             onProgress: (sent, total) => this.#emit('rebuild-progress', { sent, total }),
             isCancelled: () => this.#stopRequested,
             gpu: () => this.#gpuLabel,
+            ctxMax: () => this.ctxMax,
         });
         await net.ready;
 
@@ -186,13 +191,15 @@ export class Engine {
     // `blocks`/`vram`/`at` are plain values. The caller reads them from a form
     // field or URL parameter.
     async serve({ blocks = null, vram = null, at = null, slowMs = 0, floor = null,
-                  sessions = undefined, pageTokens = undefined, waitMs = undefined } = {}) {
+                  sessions = undefined, ctx = undefined, pageTokens = undefined,
+                  waitMs = undefined } = {}) {
         const { net, manifest, baseUrl } = this;
-        // Chats kept in memory: the caller's number (the dev harness), else the
-        // mesh's from the welcome. Read once: a later welcome cannot resize a
-        // Runner that is already allocated.
+        // Chats kept in memory and the context window: the caller's numbers
+        // (the dev harness), else the mesh's from the welcome. Read once: a
+        // later welcome cannot resize a Runner that is already allocated.
         let slots;
         ({ sessions, slots } = runnerSessions(sessions, net?.sessions));
+        this.#ctx = runnerCtx(ctx, net?.ctx, manifest?.n_pos);
         try {
             const d = dimsFromManifest(manifest);
             const problems = checkDims(d);
@@ -214,7 +221,7 @@ export class Engine {
 
             this.#emit('progress', { text: 'asking for a range of blocks…' });
             const cap = at ? at[1] - at[0]
-                : this.#capacity(d, net, { blocks, vram, floor, sessions, slots });
+                : this.#capacity(d, net, { blocks, vram, floor, sessions, slots, ctx: this.ctxMax });
             const range = await net.claim(cap, at);
             if (!range) {
                 throw new Error(`this tab offered ${cap} blocks and the network's minimum is ` +
@@ -228,7 +235,7 @@ export class Engine {
             const held = describeRange(lo, hi, d.n_layer);
             this.#emit('progress', { text: `downloading ${held} (you can chat meanwhile)` });
 
-            await this.#fill(device, d, lo, hi, slowMs, sessions, slots, pageTokens, waitMs);
+            await this.#fill(device, d, lo, hi, slowMs, sessions, slots, this.ctxMax, pageTokens, waitMs);
 
             const note = `Holding ${held} of ${manifest.model}: ${hi - lo} of ` +
                 `${positions(d.n_layer)} positions. This tab runs that stretch of every job ` +
@@ -296,14 +303,15 @@ export class Engine {
         if (!this.#manifest || !net?.positions || !(bytes > 0)) return 0;
         const d = dimsFromManifest(this.#manifest);
         const { sessions, slots } = runnerSessions(null, net.sessions);
-        const n = this.#capacity(d, net, { vram: bytes, sessions, slots });
+        const n = this.#capacity(d, net, { vram: bytes, sessions, slots, ctx: this.ctxMax });
         return n >= Math.max(1, net.minBlocks || 1) ? n : 0;
     }
 
     // How many positions to claim: an explicit block count, a VRAM budget in
     // bytes, or by default the network's minimum, which background growth then
     // extends.
-    #capacity(d, net, { blocks, vram, floor = null, sessions = SESSIONS, slots = SLOTS }) {
+    #capacity(d, net, { blocks, vram, floor = null, sessions = SESSIONS, slots = SLOTS,
+                        ctx = DEFAULT_CTX }) {
         const N = net.positions || positions(d.n_layer);
         const clamp = (n) => Math.max(0, Math.min(Math.floor(n) || 0, N));
         if (blocks != null) return clamp(blocks);
@@ -311,9 +319,9 @@ export class Engine {
             // The range is not known yet, so blocks are priced at their mean
             // cost and one end is assumed (a claim short of the whole model
             // holds at most one). The scratch is needed whatever is held.
-            const fixed = scratchBytes(d, T_MAX, N_MAX)
+            const fixed = scratchBytes(d, T_MAX, ctx)
                 + Math.max(endBytes(d, 'embed'), endBytes(d, 'head'));
-            return clamp((vram - fixed) / blockBytes(d, { sessions, slots }));
+            return clamp((vram - fixed) / blockBytes(d, { nMax: ctx, sessions, slots }));
         }
         return clamp(floor ?? floorBlocks(d, N));
     }
@@ -321,7 +329,7 @@ export class Engine {
     // Download a claim one position at a time, serving each as soon as it is
     // loaded. Ascending from `lo`, because a holding is the contiguous prefix
     // `[lo, have)`.
-    async #fill(device, d, lo, hi, slowMs, sessions = SESSIONS, slots = SLOTS,
+    async #fill(device, d, lo, hi, slowMs, sessions = SESSIONS, slots = SLOTS, ctx = DEFAULT_CTX,
                 pageTokens = undefined, waitMs = undefined) {
         const { net } = this;
         const L = d.n_layer, N = positions(L);
@@ -329,7 +337,7 @@ export class Engine {
         device.pushErrorScope('out-of-memory');
         device.pushErrorScope('validation');
         const runner = new Runner(device, d, { layers: [] },
-            { lo, hi, have: lo, nMax: N_MAX, tMax: T_MAX, slots, sessions,
+            { lo, hi, have: lo, nMax: ctx, tMax: T_MAX, slots, sessions,
               ...(pageTokens ? { pageTokens } : {}),
               ...(waitMs !== undefined ? { waitMs } : {}) });
         const validation = await device.popErrorScope();
@@ -499,8 +507,8 @@ export class Engine {
     // chat's own text only.
     async #loadMtp(device, d, r) {
         const draft = { ...d, linear: undefined, vocab: d.mtp.draftVocab };
-        const needed = r.vramBytes + mtpBytes(d, { nMax: N_MAX, slots: r.slots })
-            + scratchBytes(draft, T_MAX, N_MAX);
+        const needed = r.vramBytes + mtpBytes(d, { nMax: r.nMax, slots: r.slots })
+            + scratchBytes(draft, T_MAX, r.nMax);
         if (needed > this.#vramLimit) {
             this.#emit('status', { code: 'mtp', text: `Not loading the MTP draft head: it would take this tab to ` +
                 `${gib(needed)}, past its ${gib(this.#vramLimit)} VRAM limit.` });
@@ -567,7 +575,7 @@ export class Engine {
         const tied = d.tied_lm_head !== false;
         if (p === 0) return tied && r.w.lm_head ? 0 : endBytes(d, 'embed');
         if (p === positions(d.n_layer) - 1) return tied && r.w.wte ? 0 : endBytes(d, 'head');
-        return blockBytes(d, { nMax: N_MAX, slots: r.slots, sessions: r.sessions, index: p - 1 });
+        return blockBytes(d, { nMax: r.nMax, slots: r.slots, sessions: r.sessions, index: p - 1 });
     }
 
     async #openDevice() {
@@ -692,8 +700,9 @@ export class Engine {
         this.#lastProfile = { level: prof, samples };
         const promptIds = await encode(text);
         this.#lastPromptTokens = promptIds.length;
-        const room = N_MAX - this.#router.ctxLen - promptIds.length;
-        if (room <= 0) throw new ContextFullError(promptIds.length, N_MAX - this.#router.ctxLen);
+        const ctx = this.ctxMax;
+        const room = ctx - this.#router.ctxLen - promptIds.length;
+        if (room <= 0) throw new ContextFullError(promptIds.length, ctx - this.#router.ctxLen, ctx);
         const budget = Math.min(maxTokens, room);
         // Which limit the budget comes from. They need different fixes from
         // the user: a higher cap, or a new chat.
@@ -831,6 +840,8 @@ export class Engine {
     get canPrompt() { return this.#canPrompt; }
     get dims() { return this.#dims; }
     get ctxLen() { return this.#router?.ctxLen ?? 0; }
+    // The context window of this mesh's chats, in tokens.
+    get ctxMax() { return this.#ctx ?? this.#runner?.nMax ?? runnerCtx(null, this.#net?.ctx, this.#manifest?.n_pos); }
     get conversation() { return this.#router?.conversation ?? null; }
     get meshTag() { return this.#router?.mesh ?? null; }
     // A copy of the active chat's token ids: what the peers were fed, and what

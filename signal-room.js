@@ -6,7 +6,7 @@
 // own peers, placement uses only its own claims, and an SDP is relayed only to
 // a peer in the same Room.
 
-import { assign, covers, minDepth, gaps, served, SESSIONS } from './web/split.js';
+import { assign, covers, minDepth, gaps, served, SESSIONS, DEFAULT_CTX } from './web/split.js';
 
 const send = (ws, msg) => ws.readyState === 1 && ws.send(JSON.stringify(msg));
 
@@ -36,10 +36,10 @@ export class Room {
     // `maxChats` caps the replies generating at once in this room (Infinity:
     // no cap). `chatLeaseMs` frees a seat whose `chat-end` never came.
     // `sessions` is how many chats each peer here keeps in memory, sent in
-    // the welcome.
+    // the welcome, as is `ctx`, the context window in tokens.
     constructor({ label = '', positions, head, minBlocks, maxPeers = Infinity,
                   maxChats = Infinity, chatLeaseMs = 600000, sessions = SESSIONS,
-                  log = console.log }) {
+                  ctx = DEFAULT_CTX, log = console.log }) {
         this.label = label;
         this.positions = positions;
         this.head = head;
@@ -48,6 +48,7 @@ export class Room {
         this.maxChats = maxChats;
         this.chatLeaseMs = chatLeaseMs;
         this.sessions = sessions;
+        this.ctx = ctx;
         // Peers with a reply generating: id -> the lease timer.
         this.chats = new Map();
         this.log = (line) => log(`${this.label}${line}`);

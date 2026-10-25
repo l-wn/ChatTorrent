@@ -16,11 +16,12 @@
 
 import {
     F32, DIMS, uploadF32, uploadF16, uploadQ8, makeStorage, readF32,
-    matmulNobias, GEMV_ROWS_MAX, topkRows, topkPairs, argmaxRows, gatherEmbedNoPos, rmsnorm, reshapeHeads, scatterKV, rope,
+    matmulNobias, GEMV_ROWS_MAX, topkRows, topkPairs, argmaxRows, gatherEmbedNoPos, rmsnorm, reshapeHeads, storeKV, kvRowWords, dequantKV, uploadU32, rope,
     qkScoresGQA, causalSoftmax, attnAVGQA, mergeHeads, addInplace, siluMul, withPass,
-    sigmoidMul, causalConv1d, l2NormalizeHeads, gatedDeltaNetStep, updateConvHistory,
+    sigmoidMul, roundF16, causalConv1d, l2NormalizeHeads, gatedDeltaNetStep, updateConvHistory,
 } from '../model/kernels.js';
 import { sampleFromLogitsRow, sampleFromCandidates, candidatesFor } from '../model/sampling.js';
+import { toF16, fromF16 } from '../f16.js';
 
 // --- Harness ---
 
@@ -131,15 +132,6 @@ function mergeHeadsCPU(heads, T, nHeads, D) {
             for (let d = 0; d < D; d++)
                 out[t * nHeads * D + h * D + d] = heads[h * T * D + t * D + d];
     return out;
-}
-
-function scatterKVCPU(src, cache0, T_new, T_past, N_max, nKV, D) {
-    const cache = Float32Array.from(cache0);
-    for (let n = 0; n < nKV; n++)
-        for (let t = 0; t < T_new; t++)
-            for (let d = 0; d < D; d++)
-                cache[n * N_max * D + (T_past + t) * D + d] = src[t * nKV * D + n * D + d];
-    return cache;
 }
 
 // Llama 3.1's "llama3" RoPE scaling, written from HF's public spec
@@ -712,30 +704,155 @@ async function testReshapeMergeHeads(device, r) {
     r.close('reshape→merge round trip', merged, src, 0);
 }
 
-async function testScatterKV(device, r) {
-    const T_new = 3, T_past = 2, N_max = 11, nKV = 3, D = 6;   // N_max > T_past+T_new
+// An int8 cache for attention tests: `rows` is [N_max, nKV*D] f32, quantized
+// by store_kv into a contiguous [nKV, N_max] cache. Returns the buffer and
+// its contents read back as f32 [nKV, N_max, D], which the CPU references
+// take as K or V, so they check the attention arithmetic on the exact values
+// the kernels read.
+async function int8Cache(device, rows, N_max, nKV, D) {
+    const words = nKV * N_max * kvRowWords(D);
+    const cb = makeStorage(device, words * 4);
+    const sb = uploadF32(device, rows);
+    submit(device, 'store_kv', (pass) => storeKV(device, pass, sb, cb, N_max, 0, N_max, nKV, D));
+    const got = new Uint32Array((await readF32(device, cb, words * 4)).buffer);
+    return { buf: cb, f32: dequantKV(got, D, nKV * N_max) };
+}
+
+// Reads a contiguous int8 cache's words.
+const readWords = async (device, buf, n) => new Uint32Array((await readF32(device, buf, n * 4)).buffer);
+
+async function testStoreKV(device, r) {
+    const T_new = 3, T_past = 2, N_max = 11, nKV = 3;
     const rng = makeRng(5);
-    const src = randF32(T_new * nKV * D, rng);
-    const SENTINEL = 999;
-    const cache0 = new Float32Array(nKV * N_max * D).fill(SENTINEL);
+    const SENTINEL = 0xdeadbeef;
 
-    const sb = uploadF32(device, src), cb = uploadF32(device, cache0);
-    submit(device, 'scatter_kv', (pass) =>
-        scatterKV(device, pass, sb, cb, T_new, T_past, N_max, nKV, D));
+    for (const D of [16, 64]) {
+        const QB = Math.min(32, D), RW = kvRowWords(D);
+        const src = randF32(T_new * nKV * D, rng);
+        // One block per row holds zeros only: its scale must be 0 and its
+        // values exactly 0, not NaN.
+        for (let i = 0; i < QB; i++) src[i] = 0;
+        const sb = uploadF32(device, src);
+        const words = nKV * N_max * RW;
 
-    const got = await readF32(device, cb, nKV * N_max * D * F32);
-    r.close('scatter_kv', got, scatterKVCPU(src, cache0, T_new, T_past, N_max, nKV, D));
+        for (const rot of [0, D / 2]) {
+            const cb = makeStorage(device, words * 4);
+            device.queue.writeBuffer(cb, 0, new Uint32Array(words).fill(SENTINEL));
+            submit(device, 'store_kv', (pass) => storeKV(device, pass, sb, cb, T_new, T_past, N_max, nKV, D,
+                rot ? { theta: DIMS.rope_theta, rotDim: rot } : null));
+            const got = await readWords(device, cb, words);
+            const kind = rot ? `K, rot ${rot}` : 'V';
 
-    // Everything outside [T_past, T_past+T_new) must be unchanged. A wrong
-    // head stride would write into a neighbouring head's rows.
-    let clobbered = 0;
-    for (let n = 0; n < nKV; n++)
-        for (let t = 0; t < N_max; t++)
-            if (t < T_past || t >= T_past + T_new)
-                for (let d = 0; d < D; d++)
-                    if (got[n * N_max * D + t * D + d] !== SENTINEL) clobbered++;
-    r.assert('scatter_kv  leaves the rest of the cache alone', clobbered === 0,
-        `${clobbered} clobbered slots`);
+            // The expected values: the rows, rotated for K, head-major.
+            const dense = new Float32Array(nKV * T_new * D);
+            for (let t = 0; t < T_new; t++)
+                for (let n = 0; n < nKV; n++)
+                    dense.set(src.subarray((t * nKV + n) * D, (t * nKV + n + 1) * D), (n * T_new + t) * D);
+            const want = rot ? ropeCPU(dense, nKV, T_new, D, T_past, T_new, 0, { rotDim: rot }) : dense;
+
+            // Every value within half a step of its block's scale, and each
+            // scale max|x|/127 of its block.
+            let worstStep = 0, worstScale = 0, nan = 0;
+            const f = new Float32Array(got.buffer);
+            for (let n = 0; n < nKV; n++)
+                for (let t = 0; t < T_new; t++) {
+                    const row = n * N_max + T_past + t;
+                    const deq = dequantKV(got, D, 1, row);
+                    for (let b = 0; b < D / QB; b++) {
+                        let amax = 0;
+                        for (let i = 0; i < QB; i++) amax = Math.max(amax, Math.abs(want[(n * T_new + t) * D + b * QB + i]));
+                        const scale = f[row * RW + D / 4 + b];
+                        worstScale = Math.max(worstScale, Math.abs(scale - amax / 127) / Math.max(amax / 127, 1e-30));
+                        for (let i = 0; i < QB; i++) {
+                            const d = b * QB + i, x = deq[d];
+                            if (Number.isNaN(x)) nan++;
+                            const err = Math.abs(x - want[(n * T_new + t) * D + d]);
+                            worstStep = Math.max(worstStep, amax ? err / (amax / 127) : err);
+                        }
+                    }
+                }
+            r.assert(`store_kv  ${kind}, D ${D}: each value within half a step`, worstStep <= 0.5 + 1e-3 && !nan,
+                `worst ${worstStep.toFixed(4)} steps, ${nan} NaN`);
+            r.assert(`store_kv  ${kind}, D ${D}: scale is max|x|/127`, worstScale < 1e-5,
+                `worst relative ${worstScale.toExponential(2)}`);
+
+            // Rows outside [T_past, T_past+T_new) must be unchanged. A wrong
+            // head stride would write into a neighbouring head's rows.
+            let clobbered = 0;
+            for (let n = 0; n < nKV; n++)
+                for (let t = 0; t < N_max; t++)
+                    if (t < T_past || t >= T_past + T_new)
+                        for (let w = 0; w < RW; w++)
+                            if (got[(n * N_max + t) * RW + w] !== SENTINEL) clobbered++;
+            r.assert(`store_kv  ${kind}, D ${D}: leaves the rest of the cache alone`, clobbered === 0,
+                `${clobbered} clobbered words`);
+        }
+    }
+
+    // A row's bytes depend only on that row: one T_new = 5 job and five
+    // T_new = 1 jobs write the same words, and a paged cache holds the same
+    // rows as a contiguous one. Rewinds, speculation and chunked prefill rely
+    // on both.
+    {
+        const D = 64, T = 5, page = 4, N = 8, RW = kvRowWords(D);
+        const src = randF32(T * nKV * D, rng);
+        const sb = uploadF32(device, src);
+        const rope = { theta: DIMS.rope_theta, rotDim: D / 4 };
+        const whole = makeStorage(device, nKV * N * RW * 4), steps = makeStorage(device, nKV * N * RW * 4);
+        submit(device, 'store_kv whole', (pass) => storeKV(device, pass, sb, whole, T, 1, N, nKV, D, rope));
+        for (let t = 0; t < T; t++) {
+            const one = uploadF32(device, src.subarray(t * nKV * D, (t + 1) * nKV * D));
+            submit(device, 'store_kv step', (pass) => storeKV(device, pass, one, steps, 1, 1 + t, N, nKV, D, rope));
+        }
+        const a = await readWords(device, whole, nKV * N * RW), b = await readWords(device, steps, nKV * N * RW);
+        let diff = 0;
+        for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) diff++;
+        r.assert('store_kv  one T=5 job writes the bits of five T=1 jobs', diff === 0, `${diff} words differ`);
+
+        // Logical page p lives at physical page table[p]; 2 pages of 4 rows.
+        const table = [1, 0];
+        const paged = makeStorage(device, 2 * nKV * page * RW * 4);
+        submit(device, 'store_kv paged', (pass) =>
+            storeKV(device, pass, sb, paged, T, 1, page, nKV, D, rope, uploadU32(device, new Uint32Array(table))));
+        const p = await readWords(device, paged, 2 * nKV * page * RW);
+        let pdiff = 0;
+        for (let n = 0; n < nKV; n++)
+            for (let t = 1; t < 1 + T; t++) {
+                const at = ((table[Math.floor(t / page)] * nKV + n) * page + t % page) * RW;
+                for (let w = 0; w < RW; w++) if (p[at + w] !== a[(n * N + t) * RW + w]) pdiff++;
+            }
+        r.assert('store_kv  paged rows match contiguous bit for bit', pdiff === 0, `${pdiff} words differ`);
+    }
+}
+
+// round_f16 must give web/f16.js's values bit for bit: the Runner converts its
+// exit rows with f16.js, and that is lossless only for values the GPU already
+// rounded the same way.
+async function testRoundF16(device, r) {
+    const rng = makeRng(23);
+    const xs = [0, -0, NaN, Infinity, -Infinity, 65504, 65519, 65520, 1e9, -1e9,
+                2 ** -24, 2 ** -25, 3 * 2 ** -25, 2 ** -14, 2 ** -15, 1, -1, 1 + 2 ** -11, 1 + 3 * 2 ** -11];
+    // Every tie between neighbouring halves, both signs, and wide-range noise.
+    const halves = fromF16(Uint16Array.from({ length: 0x7c00 }, (_, i) => i));
+    for (let i = 0; i + 1 < halves.length; i++) {
+        const mid = Math.fround((halves[i] + halves[i + 1]) / 2);
+        xs.push(mid, -mid);
+    }
+    for (let i = 0; i < 50000; i++) xs.push((rng() - 0.5) * 2 ** (rng() * 40 - 25));
+    const x = Float32Array.from(xs);
+    const b = uploadF32(device, x);
+    submit(device, 'round_f16', (pass) => roundF16(device, pass, b, x.length));
+    const got = await readF32(device, b, x.length * F32);
+    const want = fromF16(toF16(x));
+    let bad = 0, first = -1;
+    for (let i = 0; i < x.length; i++) {
+        // ±inf clamp in f16.js; NaN is NaN either way.
+        if (Number.isNaN(want[i]) ? !Number.isNaN(got[i]) : !Object.is(got[i], want[i])) {
+            bad++; if (first < 0) first = i;
+        }
+    }
+    r.assert('round_f16  matches f16.js bit for bit (ties, subnormals, clamps)', bad === 0,
+        bad ? `${bad} of ${x.length} differ, first x=${x[first]}: got ${got[first]}, want ${want[first]}` : `${x.length} values`);
 }
 
 async function testRope(device, r) {
@@ -860,16 +977,16 @@ async function testRope(device, r) {
 async function testAttention(device, r) {
     // Every dim distinct. N_max > T_act, so the cache stride is tested.
     const T_new = 3, T_past = 2, T_act = T_past + T_new, N_max = 11;
-    const D = 6, nHeads = 9, group = DIMS.group, nKV = nHeads / group;
+    const D = 8, nHeads = 9, group = DIMS.group, nKV = nHeads / group;
     const rng = makeRng(7);
 
     const Q = randF32(nHeads * T_new * D, rng);
     // Only the first T_act rows of each head are valid. The rest is random, so
     // a read past T_act shows up as a mismatch.
-    const K = randF32(nKV * N_max * D, rng);
-    const V = randF32(nKV * N_max * D, rng);
+    const { buf: kb, f32: K } = await int8Cache(device, randF32(N_max * nKV * D, rng), N_max, nKV, D);
+    const { buf: vb, f32: V } = await int8Cache(device, randF32(N_max * nKV * D, rng), N_max, nKV, D);
 
-    const qb = uploadF32(device, Q), kb = uploadF32(device, K), vb = uploadF32(device, V);
+    const qb = uploadF32(device, Q);
     const sb = makeStorage(device, nHeads * T_new * T_act * F32);
     const ob = makeStorage(device, nHeads * T_new * D * F32);
 
@@ -921,6 +1038,25 @@ async function testAttention(device, r) {
             T_new, T_act, T_past, nHeads),
         V, T_new, T_act, N_max, D, nHeads, group);
     r.close('attention chain (qk→softmax→av)', ctx, chain, 2e-5);
+
+    // fullBlock runs attention in chunks of query rows (model.js attnRows):
+    // rows r0.. of Q and of the output, with the causal limit moved by r0.
+    // Every output element must have the same bits as in one pass.
+    const chunked = makeStorage(device, nHeads * T_new * D * F32);
+    const sc = makeStorage(device, nHeads * 2 * T_act * F32);
+    submit(device, 'attn chunked', (pass) => {
+        for (let r0 = 0; r0 < T_new; r0 += 2) {
+            const R = Math.min(2, T_new - r0);
+            qkScoresGQA(device, pass, qb, kb, sc, R, T_act, N_max, D, nHeads, group, null, r0, T_new);
+            causalSoftmax(device, pass, sc, R, T_act, T_past + r0, nHeads);
+            attnAVGQA(device, pass, sc, vb, chunked, R, T_act, N_max, D, nHeads, group, null, r0, T_new);
+        }
+    });
+    const got = await readF32(device, chunked, nHeads * T_new * D * F32);
+    let same = 0;
+    for (let i = 0; i < got.length; i++) if (Object.is(got[i], ctx[i])) same++;
+    r.assert('attention in row chunks matches one pass bit for bit', same === got.length,
+        `${got.length - same} of ${got.length} differ`);
 }
 
 // A speculative verify runs n query rows at once. Row i must match a one-row
@@ -931,8 +1067,8 @@ async function testAttentionRowsBitwise(device, r) {
     const D = 32, nHeads = 8, group = 4, nKV = nHeads / group;
     const rng = makeRng(17);
     const Q = randF32(nHeads * n * D, rng);
-    const K = randF32(nKV * N_max * D, rng), V = randF32(nKV * N_max * D, rng);
-    const kb = uploadF32(device, K), vb = uploadF32(device, V);
+    const { buf: kb } = await int8Cache(device, randF32(N_max * nKV * D, rng), N_max, nKV, D);
+    const { buf: vb } = await int8Cache(device, randF32(N_max * nKV * D, rng), N_max, nKV, D);
 
     async function run(Qrows, T_new, past) {
         const T_act = past + T_new;
@@ -1271,7 +1407,8 @@ export async function runAllTests(device) {
     await testSiluMul(device, r);
     await testAddInplace(device, r);
     await testReshapeMergeHeads(device, r);
-    await testScatterKV(device, r);
+    await testStoreKV(device, r);
+    await testRoundF16(device, r);
     await testRope(device, r);
     await testAttention(device, r);
     await testAttentionRowsBitwise(device, r);

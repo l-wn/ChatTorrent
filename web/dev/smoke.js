@@ -16,11 +16,11 @@ import { F32, uploadF32, readF32, cacheStats, withPass } from '../model/kernels.
 import { checkDims, makeCache, makeScratch, forward, randomWeights } from '../model/model.js';
 
 const TINY = {
-    hidden:     24,
+    hidden:     32,
     n_layer:     3,
     n_heads:     4,
     n_kv_heads:  2,
-    head_dim:    6,
+    head_dim:    8,   // a multiple of 4, for the int8 KV cache
     ffn:        40,
     vocab:      32,
     n_pos:      16,

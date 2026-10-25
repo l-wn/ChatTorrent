@@ -40,7 +40,6 @@
 import { Engine, ContextFullError } from '../engine.js';
 import { chatFormat, stopRe } from '../prompt.js';
 import { runTurn } from '../turn.js';
-import { N_MAX } from '../split.js';
 import { installBroadcastWire } from './bcwire.js';
 import { openRoom } from '../room.js';
 
@@ -358,7 +357,7 @@ export const api = {
                 ...r.counts,
             } : null,
             events: events.map((e) => ({ type: e.type, at: Math.round(e.at) })),
-            nMax: N_MAX,
+            nMax: engine.ctxMax,
         };
     },
 

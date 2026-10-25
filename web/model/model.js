@@ -8,12 +8,12 @@
 
 import {
     F32, makeStorage, makeReadback, uploadF32, uploadU32,
-    matmulNobias, gatherEmbedNoPos, rmsnorm, reshapeHeads, scatterKV, rope,
+    matmulNobias, gatherEmbedNoPos, rmsnorm, reshapeHeads, storeKV, rope,
     qkScoresGQA, causalSoftmax, attnAVGQA, mergeHeads, addInplace, siluMul,
     sigmoidMul, causalConv1d, updateConvHistory, l2NormalizeHeads, gatedDeltaNetStep,
-    copyF32, argmaxRows,
+    copyF32, argmaxRows, roundF16,
 } from './kernels.js';
-import { recurrentStateBytes, replayLayerBytes, SPEC_COLS } from '../split.js';
+import { recurrentStateBytes, replayLayerBytes, kvRowBytes, kvQB, SPEC_COLS } from '../split.js';
 
 // --- Shapes ---
 
@@ -33,6 +33,9 @@ export function checkDims(d) {
         problems.push(`group (${d.group}) != n_heads/n_kv_heads (${d.n_heads / d.n_kv_heads})`);
     if (d.head_dim % 2 !== 0)
         problems.push(`head_dim (${d.head_dim}) must be even for RoPE's split-half pairing`);
+    // The int8 KV cache packs four values to a word, in blocks of kvQB().
+    if (d.head_dim % 4 !== 0 || d.head_dim % kvQB(d) !== 0)
+        problems.push(`head_dim (${d.head_dim}) must be a multiple of 4 and of ${kvQB(d)} for the KV cache`);
     return problems;
 }
 
@@ -78,7 +81,8 @@ export function makeReplayLayer(device, d, cols = SPEC_COLS) {
     };
 }
 
-// KV cache: one [n_kv, N_max, head_dim] buffer per layer for K and one for V.
+// KV cache: one [n_kv, N_max] buffer of int8 rows per layer for K and one for
+// V (the row format is kernels.js's store_kv).
 // On a hybrid checkpoint, a linear_attention layer has a recurrent-state entry
 // instead (K[i]=V[i]=null there, and recurrent[i]=null at every full_attention
 // layer). `n_layer` defaults to the whole model. A peer holding part of the
@@ -89,7 +93,7 @@ export function makeReplayLayer(device, d, cols = SPEC_COLS) {
 // any block's weights are loaded, so layer kinds come from `d.layer_types` by
 // global index, not from the weights' `.kind`.
 export function makeCache(device, d, N_max, n_layer = d.n_layer, layerLo = 0) {
-    const bytes = d.n_kv_heads * N_max * d.head_dim * F32;
+    const bytes = kvRowBytes(d) * N_max;
     const K = [], V = [], recurrent = [];
     let total = 0;
     for (let i = 0; i < n_layer; i++) {
@@ -103,7 +107,9 @@ export function makeCache(device, d, N_max, n_layer = d.n_layer, layerLo = 0) {
             K.push(makeStorage(device, bytes));
             V.push(makeStorage(device, bytes));
             recurrent.push(null);
-            total += bytes * 2;
+            // makeStorage allocates at least 16 bytes, which a one-token
+            // cache of small heads can be under.
+            total += Math.max(bytes, 16) * 2;
         }
     }
     return { N_max, K, V, recurrent, bytes: total };
@@ -111,7 +117,7 @@ export function makeCache(device, d, N_max, n_layer = d.n_layer, layerLo = 0) {
 
 // --- Paged KV ---
 //
-// makeCache() reserves a contiguous `[n_kv, N_max, D]` run per layer per
+// makeCache() reserves a contiguous `[n_kv, N_max]` run of rows per layer per
 // session. The pool allocates by tokens in use: one buffer per layer, divided
 // into fixed-size pages, plus a per-session table mapping logical position to
 // physical page. Smaller pages waste less at the tail of each session and cost
@@ -125,7 +131,7 @@ export function makeCache(device, d, N_max, n_layer = d.n_layer, layerLo = 0) {
 // layerLo + n_layer). `free` is a stack of free physical page indices.
 export function makePagePool(device, d, { pageTokens, nPages, n_layer = d.n_layer,
                                           layerLo = 0 } = {}) {
-    const perPage = d.n_kv_heads * pageTokens * d.head_dim * F32;
+    const perPage = kvRowBytes(d) * pageTokens;
     const K = [], V = [];
     let bytes = 0;
     for (let i = 0; i < n_layer; i++) {
@@ -211,10 +217,18 @@ const newStorage = makeStorage, newReadback = makeReadback;
 export const scratchBytes = (d, T_max, N_max) =>
     makeScratch({ createBuffer: () => ({}) }, d, T_max, N_max).bytes;
 
+// The most bytes of attention scores one dispatch writes. fullBlock runs
+// attention over the job's rows in chunks of attnRows(), so the scores buffer
+// does not grow with T_max times the context window.
+const SCORES_BYTES = 32 * 2 ** 20;
+export const attnRows = (d, T_max, N_max) =>
+    Math.max(1, Math.min(T_max, Math.floor(SCORES_BYTES / (d.n_heads * N_max * F32))));
+
 // Intermediate buffers, sized for the widest step (T_max rows). Data is packed
 // at the current T, not T_max, so every kernel takes the live T_new/T_act.
 // T_max only sets the allocation size.
 export function makeScratch(device, d, T_max, N_max) {
+    const rows = attnRows(d, T_max, N_max);
     const H = d.hidden, D = d.head_dim, nH = d.n_heads;
     const kvDim = d.n_kv_heads * D;
     // n_heads*head_dim. Equal to H except on hybrid full-attention layers, so
@@ -232,7 +246,7 @@ export function makeScratch(device, d, T_max, N_max) {
         k:       makeStorage(device, T_max * kvDim * F32),      // [T, n_kv*D]
         v:       makeStorage(device, T_max * kvDim * F32),      // [T, n_kv*D]
         qh:      makeStorage(device, nH * T_max * D * F32),     // [n_heads, T, D]
-        scores:  makeStorage(device, nH * T_max * N_max * F32), // [n_heads, T, T_act]
+        scores:  makeStorage(device, nH * rows * N_max * F32),  // [n_heads, rows, T_act]
         ctx:     makeStorage(device, nH * T_max * D * F32),     // [n_heads, T, D]
         merged:  makeStorage(device, T_max * qDim * F32),       // [T, qDim]
         // Scratch for attn_gate/q_norm/k_norm, used only by blocks that have
@@ -282,6 +296,7 @@ export function makeScratch(device, d, T_max, N_max) {
         });
     }
 
+    s.attnRows = rows;
     s.bytes = bytes;
     return s;
 }
@@ -336,20 +351,25 @@ export function fullBlock(device, pass, d, w, layer, cache, s, T_new, T_past) {
     if (L.q_norm) { rmsnorm(device, pass, s.q, L.q_norm, s.qNormed, T_new * nH,  D, d.rms_eps); qBuf = s.qNormed; }
     if (L.k_norm) { rmsnorm(device, pass, s.k, L.k_norm, s.kNormed, T_new * nKV, D, d.rms_eps); kBuf = s.kNormed; }
 
-    // Q is reshaped head-major. K/V are written into the cache at T_past.
+    // Q is reshaped head-major. K/V are quantized into the cache at T_past,
+    // K rotated first. V is not rotated.
     reshapeHeads(device, pass, qBuf, s.qh, T_new, nH, D);
-    scatterKV(device, pass, kBuf, K, T_new, T_past, P, nKV, D, pages);
-    scatterKV(device, pass, s.v, V, T_new, T_past, P, nKV, D, pages);
+    storeKV(device, pass, kBuf, K, T_new, T_past, P, nKV, D,
+            { theta: d.rope_theta, scaling: d.rope_scaling, rotDim: d.rot_dim ?? D }, pages);
+    storeKV(device, pass, s.v, V, T_new, T_past, P, nKV, D, null, pages);
 
-    // RoPE after projection, before the scores. Q is dense: one page of T_new
-    // rows starting at 0. The cache is paged, and only the rows scatter_kv
-    // just wrote are rotated. V is not rotated.
-    rope(device, pass, s.qh, nH,  T_new, D, T_past, T_new, 0,      d.rope_theta, d.rope_scaling, d.rot_dim);
-    rope(device, pass, K,    nKV, T_new, D, T_past, P,     T_past, d.rope_theta, d.rope_scaling, d.rot_dim, pages);
+    // RoPE on Q after projection, before the scores. Q is dense: one page of
+    // T_new rows starting at 0.
+    rope(device, pass, s.qh, nH, T_new, D, T_past, T_new, 0, d.rope_theta, d.rope_scaling, d.rot_dim);
 
-    qkScoresGQA(device, pass, s.qh, K, s.scores, T_new, T_act, P, D, nH, d.group, pages);
-    causalSoftmax(device, pass, s.scores, T_new, T_act, T_past, nH);
-    attnAVGQA(device, pass, s.scores, V, s.ctx, T_new, T_act, P, D, nH, d.group, pages);
+    // Attention in chunks of s.attnRows query rows, so the scores buffer is
+    // bounded. Each output element is computed the same way in any chunking.
+    for (let r0 = 0; r0 < T_new; r0 += s.attnRows) {
+        const R = Math.min(s.attnRows, T_new - r0);
+        qkScoresGQA(device, pass, s.qh, K, s.scores, R, T_act, P, D, nH, d.group, pages, r0, T_new);
+        causalSoftmax(device, pass, s.scores, R, T_act, T_past + r0, nH);
+        attnAVGQA(device, pass, s.scores, V, s.ctx, R, T_act, P, D, nH, d.group, pages, r0, T_new);
+    }
 
     mergeHeads(device, pass, s.ctx, s.merged, T_new, nH, D);
     let attnIn = s.merged;
@@ -519,10 +539,16 @@ export function makeMtpScratch(device, d, draftVocab, T_max, N_max) {
 // `spec` is the session's speculative state, read by linear_attention blocks
 // only: a full-attention block's KV is overwritten by position, so a rejected
 // row needs no undo.
+//
+// The residual stream leaves every block rounded to f16 values (round_f16 in
+// kernels.js). Peers hand rows on as f16 (net.js), and are only ever cut
+// between blocks, so with the rounding in the same places on every peer a
+// reply is the same however the model is split.
 export function block(device, pass, d, w, layer, cache, s, T_new, T_past, spec = null) {
     const kind = w.layers[layer].kind ?? 'full_attention';
-    if (kind === 'linear_attention') return linearBlock(device, pass, d, w, layer, cache, s, T_new, spec);
-    return fullBlock(device, pass, d, w, layer, cache, s, T_new, T_past);
+    if (kind === 'linear_attention') linearBlock(device, pass, d, w, layer, cache, s, T_new, spec);
+    else fullBlock(device, pass, d, w, layer, cache, s, T_new, T_past);
+    roundF16(device, pass, s.x, T_new * d.hidden);
 }
 
 // Records the whole stack on `pass`, an open compute pass. `ids` is an f32
@@ -533,6 +559,7 @@ export function block(device, pass, d, w, layer, cache, s, T_new, T_past, spec =
 // T_new = 1 is a decode step. The caller advances T_past by T_new afterwards.
 export function forward(device, pass, d, w, cache, s, ids, T_new, T_past) {
     gatherEmbedNoPos(device, pass, ids, w.wte, s.x, T_new, d.hidden);
+    roundF16(device, pass, s.x, T_new * d.hidden);          // as block() leaves it
 
     for (let layer = 0; layer < d.n_layer; layer++) {
         block(device, pass, d, w, layer, cache, s, T_new, T_past);

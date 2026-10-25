@@ -13,6 +13,7 @@ import { webcrypto, createHmac } from 'node:crypto';
 globalThis.crypto ??= webcrypto;
 const { openRoom, newSecret } = await import('../web/room.js');
 const { PROTOCOL } = await import('../web/split.js');
+const { toF16, fromF16 } = await import('../web/f16.js');
 
 let pass = 0, fail = 0;
 const ok = (name, cond, detail = '') => {
@@ -77,16 +78,22 @@ const { Mesh, hasTurn, pack, unpack, fragment, reassemble, wireLimit,
     const a = new Uint8Array(whole), b = new Uint8Array(got.at(-1));
     ok('and byte-identical in content', a.every((v, i) => v === b[i]));
 
-    // The floats the next peer reads must equal the ones sent, not only the
-    // bytes.
+    // The payload goes as half bits (f16.js): the next peer reads the sent
+    // rows rounded to f16 once, bit for bit, in half the bytes.
     const src = hidden(T_MAX);
     const stRt = {};
     const rt = unpack(fragment(pack(job, src), WIRE_DEFAULT, 2)
         .map((f) => reassemble(stRt, f)).at(-1));
     eq('the header survives the round trip', rt.header, job);
     eq('the payload survives it too, in full', rt.payload.length, src.length);
-    ok('with every float intact',
-        src.every((v, i) => Object.is(v, rt.payload[i])));
+    const sent = fromF16(toF16(src)), got16 = fromF16(rt.payload);
+    ok('with every value its f16 rounding',
+        sent.every((v, i) => Object.is(v, got16[i])));
+    ok('and each within half an f16 step of the f32 sent',
+        src.every((v, i) => Math.abs(got16[i] - v) <= Math.abs(v) * 2 ** -11 + 2 ** -25));
+    eq('in two bytes a value', pack(job, src).byteLength - pack(job).byteLength, src.length * 2);
+    eq('and rows already in half bits pass through unchanged',
+        [...unpack(pack(job, rt.payload)).payload], [...rt.payload]);
 
     // A tiny limit: many fragments, with a short last one.
     const tiny = fragment(whole, FRAG_HEAD + 4096, 3);
@@ -613,7 +620,7 @@ console.log('\nMesh.ready: retries a failed or hung first connect, never gives u
 
         eq('one whole message came out of the fragments', seen.length, 1);
         eq('with its header', seen[0][0], job);
-        eq('and its payload', [...seen[0][1]], [1.5, 2.5]);
+        eq('and its payload', [...fromF16(seen[0][1])], [1.5, 2.5]);
         eq('and the id of the peer that sent it, which is on no wire', seen[0][3], 2);
         m.stop();
 

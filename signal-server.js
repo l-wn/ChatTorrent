@@ -14,7 +14,8 @@
 import { readFileSync } from 'node:fs';
 import { createHash, createHmac } from 'node:crypto';
 import { WebSocketServer } from 'ws';
-import { costDims, floorBlocks, blockBytes, positions, headPos, SESSIONS, PROTOCOL } from './web/split.js';
+import { costDims, floorBlocks, blockBytes, positions, headPos, SESSIONS, PROTOCOL,
+         CONTEXTS, runnerCtx } from './web/split.js';
 import { Room } from './signal-room.js';
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -201,6 +202,15 @@ const count = (v, d) => Number.isInteger(Number(v)) && Number(v) >= 1 ? Number(v
 const MESH_SESSIONS = count(process.env.MESH_SESSIONS, SESSIONS);
 const MAX_PRIVATE_SESSIONS = count(process.env.MAX_PRIVATE_SESSIONS, 32);
 
+// The context window of every chat, in tokens: MESH_CTX in the global mesh
+// and in a private mesh whose creator chose none, otherwise the creator's
+// choice capped by MAX_PRIVATE_CTX. Always a length in split.js's CONTEXTS
+// that the model's n_pos covers. Peers size their KV pool for it, so a longer
+// window costs VRAM and leaves fewer blocks per peer.
+const ctxFor = (n) => runnerCtx(n, null, manifest?.n_pos);
+const MAX_PRIVATE_CTX = ctxFor(count(process.env.MAX_PRIVATE_CTX, CONTEXTS.at(-1)));
+const MESH_CTX = Math.min(ctxFor(count(process.env.MESH_CTX, undefined)), MAX_PRIVATE_CTX);
+
 // How long a new socket has to send its `join`.
 const JOIN_TIMEOUT_MS = Number(process.env.JOIN_TIMEOUT_MS) || 10000;
 
@@ -213,13 +223,13 @@ export const CLOSE_FULL = 4002;
 // A join token is HKDF output: 32 bytes, base64url.
 const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 
-const makeRoom = (label, maxChats, sessions) => new Room({
+const makeRoom = (label, maxChats, sessions, ctx) => new Room({
     label, positions: POSITIONS, head: HEAD, minBlocks: MIN_BLOCKS, maxPeers: MAX_PEERS_PER_ROOM,
-    maxChats, chatLeaseMs: CHAT_LEASE_MS, sessions,
+    maxChats, chatLeaseMs: CHAT_LEASE_MS, sessions, ctx,
 });
 
 const GLOBAL = 'global';
-const rooms = new Map([[GLOBAL, makeRoom('', MAX_CHATS, MESH_SESSIONS)]]);
+const rooms = new Map([[GLOBAL, makeRoom('', MAX_CHATS, MESH_SESSIONS, MESH_CTX)]]);
 
 // One id counter for all rooms: monotonic and never reused. A browser keys
 // links by peer id, so an id must never refer to a later peer, even after a
@@ -259,7 +269,8 @@ const wss = new WebSocketServer({
         done(true);
     },
 });
-const per = dims ? ` (${(blockBytes(dims) / 2 ** 20).toFixed(0)} MiB each on average, with KV)` : '';
+const per = dims ? ` (${(blockBytes(dims, { nMax: MESH_CTX }) / 2 ** 20).toFixed(0)} MiB each on average, `
+    + `with KV at ${MESH_CTX} tokens)` : '';
 // Logged at boot to show which checkpoint the mesh serves.
 console.log(`signaling on ws://${HOST}:${PORT}: ${manifest?.model ?? 'unknown model'}, `
     + `${BLOCKS} blocks${per} over ${POSITIONS} positions (embedding, blocks, head), `
@@ -270,6 +281,7 @@ console.log(`  chats at once: ${Number.isFinite(MAX_CHATS) ? MAX_CHATS : 'no lim
     + `${Number.isFinite(MAX_PRIVATE_CHATS) ? `at most ${MAX_PRIVATE_CHATS}` : 'no cap'} in a private one`);
 console.log(`  chats in memory per peer: ${MESH_SESSIONS} in the global mesh, `
     + `at most ${MAX_PRIVATE_SESSIONS} in a private one`);
+console.log(`  context: ${MESH_CTX} tokens in the global mesh, at most ${MAX_PRIVATE_CTX} in a private one`);
 if (OWN_TURN) console.log(`  TURN: ${TURN_URLS.join(', ')} (a credential per peer)`);
 else if (TURN_SECRET || TURN_URLS.length) console.warn('TURN_SECRET and TURN_URLS go together. '
     + 'With only one set, peers are not given this TURN server.');
@@ -280,9 +292,9 @@ if (!dims) console.warn('no manifest, falling back to a flat 10-block floor. '
     + 'Set MIN_BLOCKS if that is wrong for this model.');
 
 // The room a `join` names, created if new, or a close code if it is refused.
-// `chats` and `sessions` are the creator's choices, read only when this join
-// creates the room.
-function roomFor(token, chats, sessions) {
+// `chats`, `sessions` and `ctx` are the creator's choices, read only when
+// this join creates the room.
+function roomFor(token, chats, sessions, ctx) {
     if (token == null) return { key: GLOBAL, room: rooms.get(GLOBAL) };
     if (typeof token !== 'string' || !TOKEN_RE.test(token)) return { refuse: CLOSE_BAD_JOIN };
     const key = createHash('sha256').update(token).digest('hex');
@@ -292,10 +304,12 @@ function roomFor(token, chats, sessions) {
         const asked = Number.isInteger(chats) && chats >= 1 ? chats : Infinity;
         const kept = Number.isInteger(sessions) && sessions >= 1
             ? Math.min(sessions, MAX_PRIVATE_SESSIONS) : Math.min(MESH_SESSIONS, MAX_PRIVATE_SESSIONS);
-        room = makeRoom(`room ${key.slice(0, 6)} `, Math.min(asked, MAX_PRIVATE_CHATS), kept);
+        const windowCtx = Number.isInteger(ctx) && ctx >= 1
+            ? Math.min(ctxFor(ctx), MAX_PRIVATE_CTX) : MESH_CTX;
+        room = makeRoom(`room ${key.slice(0, 6)} `, Math.min(asked, MAX_PRIVATE_CHATS), kept, windowCtx);
         rooms.set(key, room);
         room.log(`opened, ${room.chatLimit === 1 ? '1 chat' : `${room.chatLimit ?? 'no limit on'} chats`} at once, `
-            + `${kept} in memory per peer`);
+            + `${kept} in memory per peer, ${windowCtx}-token context`);
     }
     return { key, room };
 }
@@ -321,7 +335,7 @@ wss.on('connection', (ws, req) => {
         if (m.type !== 'join') return ws.close(CLOSE_BAD_JOIN, 'join first');
         clearTimeout(timer);
         if (m.v !== PROTOCOL) return ws.close(CLOSE_BAD_JOIN, `protocol ${m.v}, not ${PROTOCOL}`);
-        const { key, room, refuse, why } = roomFor(m.room, m.chats, m.sessions);
+        const { key, room, refuse, why } = roomFor(m.room, m.chats, m.sessions, m.ctx);
         if (refuse) return ws.close(refuse, why ?? 'bad join');
         if (room.full) {
             if (!room.size) rooms.delete(key);
@@ -346,6 +360,8 @@ wss.on('connection', (ws, req) => {
             maxChats: room.chatLimit,
             // Chats each peer keeps in memory here.
             sessions: room.sessions,
+            // The context window of every chat here, in tokens.
+            ctx: room.ctx,
             ice, peers: room.roster(),
         });
         room.broadcast();

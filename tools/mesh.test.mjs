@@ -15,6 +15,7 @@
 import { Runner } from '../web/model/stage.js';
 import { makeGpu, D, DH, L, N, SINGLE, weightsFor, pieceFor, hybridWeightsFor } from './stub-gpu.mjs';
 import { SLOTS, coverage, served } from '../web/split.js';
+import { fromF16 } from '../web/f16.js';
 
 const F32 = 4;
 
@@ -43,15 +44,25 @@ const eq = (name, got, want) => ok(name, JSON.stringify(got) === JSON.stringify(
 const H = D.hidden;
 const SEED = 0x9e3779b9;
 
-// A 32-bit mixing function. Values that go through the f32 payload are masked
-// to 24 bits, because a float32 represents integers exactly only up to 2^24. A
-// digest that was rounded in transit would look like corruption.
+// A 32-bit mixing function. Digests are masked to 24 bits and carried in the
+// payload as three 8-bit channels (putDigest), because the wire is f16, which
+// holds integers exactly only up to 2048. A digest that was rounded in transit
+// would look like corruption.
 function mix(a, b) {
     let x = ((a ^ b) + 0x9e3779b9) >>> 0;
     x = Math.imul(x ^ (x >>> 16), 0x85ebca6b) >>> 0;
     x = Math.imul(x ^ (x >>> 13), 0xc2b2ae35) >>> 0;
     return (x ^ (x >>> 16)) >>> 0;
 }
+
+const putDigest = (rows, at, d) => {
+    rows[at] = d & 0xff; rows[at + 1] = (d >>> 8) & 0xff; rows[at + 2] = d >>> 16;
+};
+// `hidden` is the job's payload: half bits from the wire or a boundary log.
+const getDigest = (hidden, at) => {
+    const v = hidden instanceof Uint16Array ? fromF16(hidden.subarray(at, at + 3)) : hidden.subarray(at, at + 3);
+    return (v[0] | (v[1] << 8) | (v[2] << 16)) >>> 0;
+};
 
 const tagIds = new Map();
 function tagId(t) {
@@ -220,7 +231,7 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null
                 ? null : new Float32Array(bytes / F32);
             for (let j = 0; j < h.n; j++) {
                 const p = h.past + j;
-                let d = (h.pos === 0 ? h.ids[j] : hidden[j * H]) >>> 0;
+                let d = (h.pos === 0 ? h.ids[j] : getDigest(hidden, j * H)) >>> 0;
                 if (p < seen.len && seen.at[p] !== d && !seen.tent[p]) {
                     if (mayRewind) seen.len = p;
                     else world.violation(`peer ${id}: session ${h.s} re-fed position ${p} ` +
@@ -256,7 +267,7 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null
                     }
                     d &= 0xffffff;
                 }
-                if (rows) rows[j * H] = d;
+                if (rows) putDigest(rows, j * H, d);
                 digs.push(d);
                 last = d;
             }

@@ -12,7 +12,7 @@
 
 // The version of the messages peers exchange. The signaling server refuses a
 // page with another, so one mesh never mixes two.
-export const PROTOCOL = 2;
+export const PROTOCOL = 3;
 
 // --- The position line ---
 
@@ -43,13 +43,28 @@ export function describeRange(lo, hi, L) {
 // Defined here because the minimum range is computed from them, and the server
 // and the peers must agree on it.
 
-// Context window for a session. blockBytes() charges KV for it against every
-// peer's claim, so a bigger window means fewer blocks per tab. On a hybrid
-// checkpoint only the full-attention layers keep KV (see kvShare()).
-export const N_MAX = 4096;
+// Context windows a cluster may run, in tokens. The creator picks one and the
+// welcome brings it (signal-server.js's MESH_CTX for the global mesh).
+// blockBytes() charges KV for it against every peer's claim, so a bigger
+// window means fewer blocks per tab. On a hybrid checkpoint only the
+// full-attention layers keep KV (see kvShare()). Each is a multiple of
+// PAGE_TOKENS. Add a length by appending it.
+export const CONTEXTS = [4096, 8192, 16384, 32768];
+export const DEFAULT_CTX = 16384;
+export const MAX_CTX = CONTEXTS.at(-1);
+
+// The context window a runner is sized for: the caller's (the dev harness's
+// ?ctx=), else the mesh's from the welcome, else DEFAULT_CTX. Rounded down to
+// a length in CONTEXTS and to the model's `nPos`, so it is always one the
+// rope table and every peer agree on.
+export function runnerCtx(asked, mesh, nPos = Infinity) {
+    const want = Math.floor(asked ?? mesh ?? DEFAULT_CTX);
+    const cap = Math.min(Number.isFinite(want) ? want : DEFAULT_CTX, nPos > 0 ? nPos : Infinity);
+    return CONTEXTS.filter((n) => n <= cap).at(-1) ?? Math.min(CONTEXTS[0], nPos);
+}
 
 // Full-context KV caches a runner's page pool is sized for at the default
-// SESSIONS: SLOTS * N_MAX tokens, shared by every session on the runner, not
+// SESSIONS: SLOTS * ctx tokens, shared by every session on the runner, not
 // reserved per chat. A runner with another session count uses poolSlots().
 export const SLOTS = 2;
 
@@ -107,10 +122,18 @@ export const WAIT_MS = 30000;
 // scale per 64 values. Its 1-D norms stay f32, which is negligible.
 export const DTYPE_BYTES = { f32: 4, f16: 2, q8: 1.0625 };
 
+// KV is stored as int8 with one f32 scale per kvQB(d) values of a head's row
+// (kernels.js's store_kv). A block is at most 32 values and must divide
+// head_dim, so a model with a small head_dim gets one scale per row.
+export const kvQB = (d) => Math.min(32, d.head_dim);
+
+// Bytes of one token's K (or V) for one full-attention layer: every KV head's
+// int8 row followed by its scales.
+export const kvRowBytes = (d) => d.n_kv_heads * (d.head_dim + 4 * d.head_dim / kvQB(d));
+
 // Dimensions under both spellings: the manifest's (`n_head`, `n_kv_head`) and
 // loader.js's (`n_heads`, `n_kv_heads`). `bytes` is the size of one stored
-// weight. f16 or q8 shrinks a block's weights but not its KV, which is always
-// f32 because the kernels read and write f32.
+// weight. It does not apply to KV, which is priced by kvRowBytes().
 export const costDims = (m) => ({
     hidden:     m.hidden,
     n_layer:    m.n_layer,
@@ -267,20 +290,27 @@ export function replayLayerBytes(d, cols = SPEC_COLS) {
 // A linear_attention block also reserves `spec` speculative replay slots
 // (stage.js, one per session speculating through it at once), `slots` by
 // default, as the Runner does.
-export function blockBytes(d, { nMax = N_MAX, slots = SLOTS, sessions = SESSIONS, spec = slots,
+export function blockBytes(d, { nMax = DEFAULT_CTX, slots = SLOTS, sessions = SESSIONS, spec = slots,
                                 kind, index } = {}) {
-    const kv = d.n_kv_heads * d.head_dim;
     if (index != null) kind = d.layer_types?.[index] ?? 'full_attention';
     const share = kind ? (kind === 'linear_attention' ? 0 : 1) : kvShare(d);
-    return blockWeightBytes(d, { index, kind }) + kv * nMax * 4 * 2 * slots * share
+    return blockWeightBytes(d, { index, kind }) + kvRowBytes(d) * nMax * 2 * slots * share
         + (recurrentStateBytes(d) * sessions + replayLayerBytes(d) * spec) * (1 - share);
 }
 
 // What holding the MTP draft head costs, apart from its scratch: its file,
 // and its layer's K and V laid out as one more KV pool layer.
-export function mtpBytes(d, { nMax = N_MAX, slots = SLOTS } = {}) {
+export function mtpBytes(d, { nMax = DEFAULT_CTX, slots = SLOTS } = {}) {
     if (!d.mtp) return 0;
-    return (d.stored?.mtp ?? 0) + d.n_kv_heads * d.head_dim * nMax * 4 * 2 * slots;
+    return (d.stored?.mtp ?? 0) + kvRowBytes(d) * nMax * 2 * slots;
+}
+
+// What a whole model costs at a context window, summed over every position
+// (both end tables once each). For the create page's preview.
+export function modelBytes(d, opts = {}) {
+    let n = endBytes(d, 'embed') + endBytes(d, 'head');
+    for (let i = 0; i < d.n_layer; i++) n += blockBytes(d, { ...opts, index: i });
+    return n + mtpBytes(d, opts);
 }
 
 // What holding an end position costs. The embedding is `wte` (client.bin,

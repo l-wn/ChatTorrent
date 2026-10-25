@@ -16,7 +16,8 @@
 // count, so per-block tolerances are loose. The final checks (argmax and
 // greedy decode) are exact.
 
-import { F32, readF32, uploadF32, rmsnorm, matmulNobias, gatherEmbedNoPos, withPass, isQ8, q8Of } from '../model/kernels.js';
+import { F32, readF32, uploadF32, rmsnorm, matmulNobias, gatherEmbedNoPos, withPass, isQ8, q8Of,
+         kvRowWords, dequantKV } from '../model/kernels.js';
 import { block, makeCache, makeScratch } from '../model/model.js';
 import { loadNpy } from './npy.js';
 import { generate } from '../model/generate.js';
@@ -135,6 +136,14 @@ const TOL_Q8 = {
     logits: { atol: 5e-3, rtol: 4.5e-1 },
 };
 
+// The int8 K cache rounds each value to within half a step of its block's
+// scale, max|x|/127, so the cache's tolerance adds the largest such step.
+const kvTol = (want, tol) => {
+    let max = 0;
+    for (const x of want) max = Math.max(max, Math.abs(x));
+    return { ...tol, atol: tol.atol + max / 254 };
+};
+
 // Runs every stage and returns { rows, ok }. `w` must be the real loaded weights.
 export async function verifyAgainstOracle(device, d, w, oracle,
                                           { maxDecodeSteps = 20, dtype = 'f32' } = {}) {
@@ -156,6 +165,14 @@ export async function verifyAgainstOracle(device, d, w, oracle,
         device.queue.submit([enc.finish()]);
     };
     const read = (buf, floats) => readF32(device, buf, floats * F32);
+    // The int8 K cache's rows 0..T of each KV head, as f32 [n_kv, T, D], for
+    // the diff with the oracle's dense array. Rows of head h start at h*N_max.
+    const kCacheRows = async () => {
+        const words = new Uint32Array((await read(cache.K[0], d.n_kv_heads * N_max * kvRowWords(D))).buffer);
+        const out = new Float32Array(d.n_kv_heads * T * D);
+        for (let h = 0; h < d.n_kv_heads; h++) out.set(dequantKV(words, D, T, h * N_max), h * T * D);
+        return out;
+    };
 
     // --- 1. embedding ---
     run('embed', (pass) => gatherEmbedNoPos(device, pass, idsBuf, w.wte, s.x, T, H));
@@ -181,14 +198,8 @@ export async function verifyAgainstOracle(device, d, w, oracle,
 
         r.close('block00 rope(Q)', await read(s.qh, d.n_heads * T * D),
             oracle.block00_q_rope.data, TOL.rope);
-        // The K cache is [n_kv, N_max, D] with only rows 0..T written, so it
-        // is compacted to [n_kv, T, D] before the diff with the oracle's dense
-        // array.
-        const kCache = await read(cache.K[0], d.n_kv_heads * N_max * D);
-        const kDense = new Float32Array(d.n_kv_heads * T * D);
-        for (let h = 0; h < d.n_kv_heads; h++)
-            kDense.set(kCache.subarray(h * N_max * D, h * N_max * D + T * D), h * T * D);
-        r.close('block00 rope(K cache)', kDense, oracle.block00_k_rope.data, TOL.rope);
+        r.close('block00 rope(K cache)', await kCacheRows(), oracle.block00_k_rope.data,
+            kvTol(oracle.block00_k_rope.data, TOL.rope));
 
         r.close('block00 attn out (o_proj)', await read(s.attn, T * H),
             oracle.block00_attn_out.data, TOL.block0);
@@ -298,6 +309,14 @@ export async function verifyAgainstOracleStreaming(device, { baseUrl, manifest, 
         device.queue.submit([enc.finish()]);
     };
     const read = (buf, floats) => readF32(device, buf, floats * F32);
+    // The int8 K cache's rows 0..T of each KV head, as f32 [n_kv, T, D], for
+    // the diff with the oracle's dense array. Rows of head h start at h*N_max.
+    const kCacheRows = async () => {
+        const words = new Uint32Array((await read(cache.K[0], d.n_kv_heads * N_max * kvRowWords(D))).buffer);
+        const out = new Float32Array(d.n_kv_heads * T * D);
+        for (let h = 0; h < d.n_kv_heads; h++) out.set(dequantKV(words, D, T, h * N_max), h * T * D);
+        return out;
+    };
 
     // Runs every block once, loading each window's weights and destroying
     // them afterwards. The caller chooses T_new/T_past; this is used for the
@@ -359,11 +378,8 @@ export async function verifyAgainstOracleStreaming(device, { baseUrl, manifest, 
 
         r.close('block00 rope(Q)', await read(s.qh, d.n_heads * T * D),
             oracle.block00_q_rope.data, TOL.rope);
-        const kCache = await read(cache.K[0], d.n_kv_heads * N_max * D);
-        const kDense = new Float32Array(d.n_kv_heads * T * D);
-        for (let h = 0; h < d.n_kv_heads; h++)
-            kDense.set(kCache.subarray(h * N_max * D, h * N_max * D + T * D), h * T * D);
-        r.close('block00 rope(K cache)', kDense, oracle.block00_k_rope.data, TOL.rope);
+        r.close('block00 rope(K cache)', await kCacheRows(), oracle.block00_k_rope.data,
+            kvTol(oracle.block00_k_rope.data, TOL.rope));
 
         r.close('block00 attn out (o_proj)', await read(s.attn, T * H),
             oracle.block00_attn_out.data, TOL.block0);

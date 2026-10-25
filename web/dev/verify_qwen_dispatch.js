@@ -15,7 +15,7 @@ import { uploadF32, readF32, withPass } from '../model/kernels.js';
 import { dimsFromManifest, checkManifest } from '../model/loader.js';
 import { checkDims, makeCache, makeScratch, block } from '../model/model.js';
 import { loadJson } from './npy.js';
-import { loadAll, splitRows, splitInterleavedGate, plusOne, RMS_EPS } from './verify_qwen_spike.js';
+import { loadAll, splitRows, splitInterleavedGate, plusOne, RMS_EPS, KV_TOL } from './verify_qwen_spike.js';
 import { makeReporter } from './verify.js';
 
 export const ORACLE_URL = '/oracle/qwen3.8-27b-spike';
@@ -136,7 +136,8 @@ async function buildFullLayerWeights(device, d, oracleBase) {
 // the layer's global index, which makeCache needs to look up its kind in
 // d.layer_types. block() gets local index 0 into a one-element w.layers array,
 // as it does from a Runner holding only this position (see stage.js's #run()).
-async function runLayerDispatch(device, d, T, layerLo, buildWeights, xName, outName, r, name, oracleBase) {
+async function runLayerDispatch(device, d, T, layerLo, buildWeights, xName, outName, r, name, oracleBase,
+                                tol = { atol: 1e-3, rtol: 1e-3 }) {
     const o = await loadAll([xName, outName], oracleBase);
     const layerW = await buildWeights(device, d, oracleBase);
     const w = { layers: [layerW] };
@@ -150,8 +151,7 @@ async function runLayerDispatch(device, d, T, layerLo, buildWeights, xName, outN
     device.queue.submit([enc.finish()]);
 
     r.close(`${name} out (via real block() dispatch)`,
-        await readF32(device, s.x, T * d.hidden * 4), o[outName].data,
-        { atol: 1e-3, rtol: 1e-3 });
+        await readF32(device, s.x, T * d.hidden * 4), o[outName].data, tol);
 }
 
 export async function runLayer0Dispatch(device, cfg, oracleBase = ORACLE_URL) {
@@ -166,7 +166,7 @@ export async function runLayer3Dispatch(device, cfg, oracleBase = ORACLE_URL) {
     const r = makeReporter();
     const d = dimsChecked(cfg);
     await runLayerDispatch(device, d, cfg.T, 3, buildFullLayerWeights,
-        'block_02_out', 'block_03_out', r, 'layer03', oracleBase);
+        'block_02_out', 'block_03_out', r, 'layer03', oracleBase, KV_TOL);
     return { rows: r.rows, ok: r.rows.every((x) => x.ok) };
 }
 

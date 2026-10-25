@@ -33,7 +33,7 @@ const num = (name, fallback) => Number(flag(name, fallback));
 // The defaults give a whole model in ~1.3 MB, with a shape that uses every
 // path in model.js: GQA (n_head > n_kv_head), an even head_dim for RoPE's
 // split-half pairing, an untied head so the LM head's weight is
-// distinguishable from the embedding's, and n_pos covering split.js's N_MAX so
+// distinguishable from the embedding's, and n_pos covering split.js's shortest context (CONTEXTS[0]) so
 // a context can fill up.
 const OUT      = resolve(flag('out', 'weights/tiny-test'));
 const SEED     = num('seed', 1);

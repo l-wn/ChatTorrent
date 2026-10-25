@@ -14,6 +14,7 @@
 // See docs/architecture.md (Joining, Private meshes, Links, Wire format).
 
 import { holders, holding, covers, minDepth, served, coverage, PROTOCOL } from './split.js';
+import { toF16 } from './f16.js';
 import { GLOBAL } from './room.js';
 
 // Fallback ICE list. The signaling server sends the real list, TURN included,
@@ -70,30 +71,34 @@ const REFUSED = { 4001: 'the signaling server did not accept this page. Reload i
 
 // --- Framing ---
 
-// A message is a JSON header plus an optional f32 payload (the hidden state):
+// A message is a JSON header plus an optional f16 payload (the hidden state):
 //
 //   [0..4)            u32  header byte length
 //   [4..4+n)          UTF-8 JSON header
-//   [.. pad to 4)     zeros, so the payload view is 4-aligned
-//   [..]              f32 payload
+//   [.. pad to 4)     zeros, so the payload view is aligned
+//   [..]              f16 payload
 //
 // The header is JSON so fields can be added. It is about 200 bytes next to a
-// 2 KB payload.
+// 10 KB payload (one Qwen3.8-27B row). The payload is half bits (f16.js): a
+// Runner rounds its rows once as they leave it, so they arrive as a
+// Uint16Array and pass through unchanged. A Float32Array is rounded here.
 export function pack(header, payload = null) {
     const json = new TextEncoder().encode(JSON.stringify(header));
     const start = 4 + json.length + ((4 - (json.length % 4)) % 4);
-    const buf = new ArrayBuffer(start + (payload?.byteLength ?? 0));
+    const bits = payload && (payload instanceof Uint16Array ? payload : toF16(payload));
+    const buf = new ArrayBuffer(start + (bits?.byteLength ?? 0));
     new DataView(buf).setUint32(0, json.length, true);
     new Uint8Array(buf, 4, json.length).set(json);
-    if (payload) new Float32Array(buf, start).set(payload);
+    if (bits) new Uint16Array(buf, start).set(bits);
     return buf;
 }
 
+// The payload comes back as half bits, a Uint16Array.
 export function unpack(buf) {
     const n = new DataView(buf).getUint32(0, true);
     const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, n)));
     const start = 4 + n + ((4 - (n % 4)) % 4);
-    const payload = buf.byteLength > start ? new Float32Array(buf, start) : null;
+    const payload = buf.byteLength > start ? new Uint16Array(buf, start) : null;
     return { header, payload };
 }
 
@@ -272,14 +277,14 @@ export class Mesh {
     // `room` is the mesh to join (web/room.js), the global one by default.
     // `chats` is the limit on replies at once this tab asks for when its join
     // creates a private mesh (the server ignores it otherwise).
-    // `sessions` is how many chats each peer keeps in memory, asked for the same
-    // way.
+    // `sessions` is how many chats each peer keeps in memory, and `ctx` the
+    // context window in tokens, asked for the same way.
     // `relayOnly` routes every link through TURN, so no peer learns this tab's
     // address. `rate`, `linkWait`, `readyTimeout`, `linkRetry` and `linkOpen`
     // override RATE, LINK_WAIT_MS, READY_TIMEOUT_MS, LINK_RETRY_MS and
     // LINK_OPEN_MS, for tests.
     constructor({ onMessage, onChange, rate = RATE, room = GLOBAL, chats = null, sessions = null,
-                  relayOnly = true,
+                  ctx = null, relayOnly = true,
                   linkWait = LINK_WAIT_MS, readyTimeout = READY_TIMEOUT_MS,
                   linkRetry = LINK_RETRY_MS, linkOpen = LINK_OPEN_MS } = {}) {
         this.id = null;
@@ -303,6 +308,10 @@ export class Mesh {
         // Chats each peer keeps in memory in this mesh, from the welcome. Null
         // if the server sends none.
         this.sessions = null;
+        this.askCtx = ctx;
+        // The context window of this mesh's chats, from the welcome. Null if
+        // the server sends none (split.js's runnerCtx() then picks the default).
+        this.ctx = null;
         this.relayOnly = relayOnly;
         this.linkWait = linkWait;
         this.readyTimeout = readyTimeout;
@@ -372,7 +381,8 @@ export class Mesh {
             // `join` is the first message on every socket: it names the mesh.
             this.#ws({ type: 'join', v: PROTOCOL, room: this.room.joinToken,
                        ...(this.chats && { chats: this.chats }),
-                       ...(this.askSessions && { sessions: this.askSessions }) });
+                       ...(this.askSessions && { sessions: this.askSessions }),
+                       ...(this.askCtx && { ctx: this.askCtx }) });
         });
         ws.addEventListener('message', (e) => {
             if (gone || ws !== this.ws) return;
@@ -800,6 +810,11 @@ export class Mesh {
                 console.warn(`the cluster now keeps ${sessions ?? 'the default number of'} chats in `
                     + `memory per peer; this tab keeps ${this.sessions} until it is reloaded`);
             }
+            const ctx = Number.isInteger(m.ctx) && m.ctx >= 1 ? m.ctx : null;
+            if (this.ctx != null && ctx !== this.ctx) {
+                console.warn(`the cluster now has a ${ctx ?? 'default'}-token context; this tab `
+                    + `keeps ${this.ctx} tokens until it is reloaded`);
+            }
             Object.assign(this, {
                 id: m.id, blocks: m.blocks, positions: m.positions ?? 0,
                 minBlocks: m.minBlocks, ice: m.ice ?? ICE,
@@ -808,6 +823,7 @@ export class Mesh {
                 weightsUrl: m.weightsUrl ?? null,
                 maxChats: m.maxChats ?? null,
                 sessions: this.sessions ?? sessions,
+                ctx: this.ctx ?? ctx,
             });
             this.#welcomed();
 

@@ -255,8 +255,10 @@ Signaling server environment:
 | `MAX_CHATS` | unset (no limit) | replies that may generate at once in the global mesh |
 | `MAX_PRIVATE_CHATS` | unset (no limit) | cap on a private mesh's own limit, and its limit when the creator set none |
 | `CHAT_LEASE_MS` | 600000 | a seat whose `chat-end` never arrives is freed after this long |
-| `MESH_SESSIONS` | 8 | chats each peer keeps in memory in the global mesh, and in a private mesh whose creator set none. Peers size their KV pool to match, about 280 MiB per chat across Qwen3.8-27B |
+| `MESH_SESSIONS` | 8 | chats each peer keeps in memory in the global mesh, and in a private mesh whose creator set none. Peers size their KV pool to match, about 335 MiB per chat across Qwen3.8-27B at 16K |
 | `MAX_PRIVATE_SESSIONS` | 32 | cap on a private mesh creator's "Chats in memory" |
+| `MESH_CTX` | 16384 | context window in tokens in the global mesh, and in a private mesh whose creator set none. Rounded down to a length in `split.js`'s `CONTEXTS` and to the model's `n_pos` |
+| `MAX_PRIVATE_CTX` | 32768 | cap on a private mesh creator's "Chat length" |
 
 Caddy environment: `WEIGHTS_ORIGIN` (default
 `https://weights.chattorrent.net`), and for `Caddyfile.dev`, `CHAT_PASS_HASH`

@@ -11,7 +11,7 @@
 import { Runner } from '../web/model/stage.js';
 import { makeGpu, D, L, N, weightsFor, pieceFor } from './stub-gpu.mjs';
 import { Mesh } from '../web/net.js';
-import { N_MAX, SLOTS, positions } from '../web/split.js';
+import { DEFAULT_CTX as N_MAX, SLOTS, positions } from '../web/split.js';
 
 globalThis.location = { protocol: 'http:', host: 'localhost:8000' };
 globalThis.WebSocket = class { addEventListener() {} send() {} close() {} readyState = 1; };

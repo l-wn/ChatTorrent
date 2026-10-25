@@ -6,12 +6,12 @@
 
 import { dimsFromManifest } from './model/loader.js';
 import { Engine, ContextFullError } from './engine.js';
-import { positions, coverage, holders, holding, describeRange, storedBytes, N_MAX } from './split.js';
+import { positions, coverage, holders, holding, describeRange, storedBytes } from './split.js';
 import { chatFormat, stopRe } from './prompt.js';
 import { runTurn } from './turn.js';
 import { makeMessage } from './message.js';
 import { summarize, formatLine, formatText } from './profile.js';
-import { readInvite, openRoom, inviteUrl, cleanName, NAME_MAX, nameKey, creatorKey, chatsKey, sessionsKey } from './room.js';
+import { readInvite, openRoom, inviteUrl, cleanName, NAME_MAX, nameKey, creatorKey, chatsKey, sessionsKey, ctxKey } from './room.js';
 import { saveChoice } from './welcome.js';
 import { PROBLEMS, classify, report } from './errors.js';
 import { openHistory, idbBackend, memoryBackend, newRecord, groupByDay } from './history.js';
@@ -241,7 +241,7 @@ function refresh() {
     // This tab's own GPU memory, not the cluster's.
     ui.vram.textContent = engine.runner ? `${(engine.vramBytes / 2 ** 30).toFixed(2)} GiB` : '—';
     ui.ran.textContent = `${engine.ran.toLocaleString()} tokens`;
-    ui.ctx.textContent = `${engine.ctxLen.toLocaleString()} / ${N_MAX.toLocaleString()} tokens`;
+    ui.ctx.textContent = `${engine.ctxLen.toLocaleString()} / ${engine.ctxMax.toLocaleString()} tokens`;
 
     renderMap(net, cov);
     renderLanes(net);
@@ -690,7 +690,8 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
     try {
         ({ manifest } = await engine.connect({ room, relayOnly: !directParam(),
                                                chats: creatorChats(secret),
-                                               sessions: creatorSessions(secret) }));
+                                               sessions: creatorSessions(secret),
+                                               ctx: creatorCtx(secret) }));
     } catch (err) {
         console.warn('connect failed:', err);
         ui.title.textContent = 'ChatTorrent';
@@ -866,6 +867,7 @@ function showChatLimit() {
     if (max) ui.mesh.title += ` Up to ${max} replies can run at once.`;
     const kept = engine?.net?.sessions;
     if (kept) ui.mesh.title += ` Each GPU keeps ${plural(kept, 'chat')} in memory.`;
+    if (engine?.net) ui.mesh.title += ` Each chat holds up to ${engine.ctxMax.toLocaleString()} tokens.`;
 }
 
 // The limit on replies at once chosen when this tab created its private mesh,
@@ -883,6 +885,8 @@ function creatorNumber(s, key) {
 const creatorChats = (s) => creatorNumber(s, chatsKey);
 // The chats each peer keeps in memory, chosen and kept the same way.
 const creatorSessions = (s) => creatorNumber(s, sessionsKey);
+// The context window, in tokens, chosen and kept the same way.
+const creatorCtx = (s) => creatorNumber(s, ctxKey);
 
 // The invite link, with this person's name if they gave one.
 const myName = () => { try { return cleanName(sessionStorage.getItem(nameKey(secret))); } catch { return ''; } };
@@ -1480,7 +1484,7 @@ async function respond(text, opts, out, reply) {
                 show('body', (reasoning === null ? shown : answer).replace(/^\s+/, ''));
                 // A reply can run for minutes, so show progress.
                 setStatus(`generating… ${n} tok · ${
-                    Math.max(0, N_MAX - engine.ctxLen)} left`, 'busy');
+                    Math.max(0, engine.ctxMax - engine.ctxLen)} left`, 'busy');
                 scrollDown();
             },
         });

@@ -240,10 +240,10 @@ arrives at. On Qwen3.8-27B at q8:
 | position | weights | state | total |
 |---|---|---|---|
 | a `linear_attention` block | 388.5 MiB | 8 recurrent states, 24.9 MiB; 2 replay slots, 6.9 MiB | 420 MiB |
-| a `full_attention` block | 377.2 MiB | KV pool, 2 x 4096 tokens of K and V, 64 MiB | 441 MiB |
+| a `full_attention` block | 377.2 MiB | KV pool, 2 x 16384 tokens of int8 K and V, 72 MiB | 449 MiB |
 | the embedding | `wte`, 1.26 GiB | none | 1.26 GiB |
 | the head | `lm_head`, 1.26 GiB | none | 1.26 GiB |
-| any peer | none | scratch, ~130 MiB | once |
+| any peer | none | scratch, ~140 MiB at any context | once |
 
 Each end uploads only the table it reads (`loadEmbed`, `loadHead`); a peer
 holding both has two tables, and on a tied checkpoint one. The formulas in
@@ -349,20 +349,29 @@ then by how far they reach. With no load reported, that is reach alone.
 
 ## Wire format
 
-Messages are a JSON header plus an optional f32 payload (`net.js`):
+Messages are a JSON header plus an optional f16 payload (`net.js`):
 
 ```
 [0..4)          u32 header length
 [4..4+n)        UTF-8 JSON header
 [.. pad to 4)
-[..]            f32 payload (the residual stream, [n, hidden])
+[..]            f16 payload (the residual stream, [n, hidden])
 ```
+
+The payload is IEEE half precision (`web/f16.js`: round to nearest even,
+values past ±65504 clamped to it). A Runner rounds the rows it hands on once,
+where they leave it, and keeps those bits in its boundary log, so the next
+peer, a replay and a repair all see the same values. On Qwen3.8-27B a row is
+10 KiB, against 20 KiB in f32, at about 5e-4 relative error per hop (int8
+was measured at about 1%, from outlier channels near 200 against an rms near
+2). A reply therefore depends on where the cuts fall: it is identical for
+the same path, and close to, not bit-identical with, a one-peer run.
 
 Headers (`route.js`):
 
 ```
 job   { k, s, key, from, pos, past, n, ids?, opts?, replay?, fill?, trace?, prof?,
-        loop?, entry?, auto?, drafts?, rowOpts?, rb? }  + f32 [n, hidden] payload
+        loop?, entry?, auto?, drafts?, rowOpts?, rb? }  + f16 [n, hidden] payload
 ack   { k, s, to, at, past }
 tok   { k, s, key, to, past, token, tokens?, eos, trace, ttl, fed?, head?, link? }
 filled { k, s, key, to, past, n, trace, ttl }      a prefill chunk reached the end
@@ -429,7 +438,7 @@ history, and the prompt wrapping:
    decoded token (see the closed loop below). Every chunk runs as one GPU
    pass. The prompt's chunks are pipelined (see Prefill).
 3. The reply ends on end-of-text, on the token budget, on a full context
-   (`N_MAX`, 4096), on Stop, or when `turn.js` sees the stop sequence, in which
+   (the cluster's context window, `ctx`), on Stop, or when `turn.js` sees the stop sequence, in which
    case the tokens past the cut are rewound out of the context. A
    full-attention layer's KV is addressed by position, so rewinding it is only
    a shorter `past` on the next job. A linear-attention (Gated DeltaNet)
@@ -581,13 +590,23 @@ in the same submit. The restored state has the bits k plain steps leave.
   them back like any other.
 
 
+**The context window** is a cluster setting, like `sessions`. The creator
+picks one of `split.js`'s `CONTEXTS` (4K, 8K, 16K or 32K tokens; `DEFAULT_CTX`
+is 16K) on the create page. The join carries it, the server keeps it on the
+room (capped by `MAX_PRIVATE_CTX` and the model's `n_pos`; `MESH_CTX` for the
+global mesh) and the welcome hands it to every tab, which sizes its Runner and
+checks prompts against it. A Runner is sized once, so a tab keeps its window
+until it reloads. KV is int8 (see docs/model.md, Paged KV cache), so 16K costs
+about the VRAM that 4K did in f32. A Runner refuses to start if one layer's
+pool buffer is larger than the GPU can bind.
+
 Each Runner has a **page pool**: one buffer per full-attention layer for K and
 for V, cut into 64-token pages, sized for `poolSlots(sessions)` full contexts:
 one per `SESSIONS_PER_SLOT` (4) sessions, so 2 at the default 8. Each of the
 mesh's `sessions` **frames** holds one session's page table and, on a hybrid
 checkpoint, its recurrent state. A chat is charged for the pages it uses, so
 the frames share the pool rather than each reserving a full context. On
-Qwen3.8-27B each session beyond 8 costs about 280 MiB across the whole model.
+Qwen3.8-27B at 16K each session beyond 8 costs about 335 MiB across the whole model.
 
 A session's frame or pages may only be taken from a session that has been idle
 for `IDLE_MS` (2 s), counted from the end of its last job here. A session with a
@@ -669,7 +688,8 @@ A peer can leave at any time. Recovery works in steps, cheapest first:
 1. **Acks.** The receiver of a job acks it before touching the GPU. No ack
    within 1.5 s counts as a failed send.
 2. **Local repair.** Each peer keeps a **boundary log**: the residual stream it
-   handed over at each boundary, per session (`Runner.logs`). When a hand-off
+   handed over at each boundary, per session (`Runner.logs`), as the f16 bits
+   it sent. When a hand-off
    fails, the peer that made it picks another holder, replays the log into it
    (as `replay` jobs, which rewrite KV all the way down the line) and re-sends
    the job. The enqueuer only gets a `fix` notice. A log that was started again

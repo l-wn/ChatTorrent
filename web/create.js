@@ -4,8 +4,8 @@
 // from the middle. "Create cluster" saves the choices, makes the invite and
 // opens the chat in it, past the pre-join screen.
 
-import { newSecret, cleanName, nameKey, creatorKey, chatsKey } from './room.js';
-import { storedBytes } from './split.js';
+import { newSecret, cleanName, nameKey, creatorKey, chatsKey, ctxKey } from './room.js';
+import { storedBytes, costDims, modelBytes, CONTEXTS, DEFAULT_CTX } from './split.js';
 import { saveChoice, joinedKey } from './welcome.js';
 import { lendSlider, previewRange, cellsFor } from './lend.js';
 
@@ -16,6 +16,28 @@ const FIXED_GB = 1.2;
 
 const $ = (id) => document.getElementById(id);
 let model = { L: 66, gb: 27 };      // replaced by the checkpoint's numbers
+let dims = null;                    // the checkpoint's, for pricing each context
+
+// The chat lengths a cluster can have, with what the whole model then takes.
+const k = (n) => `${n / 1024}K`;
+function fillCtx() {
+    const sel = $('ctx'), at = Number(sel.value) || DEFAULT_CTX;
+    sel.replaceChildren(...CONTEXTS.filter((n) => !dims?.n_pos || n <= dims.n_pos).map((n) => {
+        const gb = dims && modelBytes(dims, { nMax: n }) / 2 ** 30;
+        const o = new Option(`${k(n)} tokens${gb ? `, about ${Math.round(gb)} GB in all` : ''}`, String(n));
+        o.selected = n === at;
+        return o;
+    }));
+}
+fillCtx();
+$('ctx').addEventListener('change', () => { setModelSize(); render(slider.value); });
+
+// The model's size at the chosen context: weights plus every block's KV.
+function setModelSize() {
+    if (!dims) return;
+    model.gb = modelBytes(dims, { nMax: Number($('ctx').value) || DEFAULT_CTX }) / 2 ** 30;
+    $('modelNeed').textContent = `${Math.round(model.gb)} GB`;
+}
 
 function render(gb) {
     const { L } = model;
@@ -44,11 +66,11 @@ render(slider.value);
     try {
         const { url } = await (await fetch('/checkpoint.json')).json();
         const m = await (await fetch(`${url.replace(/\/$/, '')}/manifest.json`)).json();
-        const b = storedBytes(m);
-        if (!b) return;
-        const bytes = b.wte + b.blocks.reduce((a, x) => a + x, 0) + b.norm + b.lm_head;
-        model = { L: m.n_layer + 2, gb: bytes / 2 ** 30 };
-        $('modelNeed').textContent = `${Math.round(model.gb)} GB`;
+        if (!storedBytes(m)) return;
+        dims = { ...costDims(m), n_pos: m.n_pos };
+        model = { L: m.n_layer + 2, gb: model.gb };
+        fillCtx();
+        setModelSize();
         render(slider.value);
     } catch (err) {
         console.info('create: using the default model size', err);
@@ -64,6 +86,7 @@ $('create').addEventListener('click', () => {
     // Room capacity: the cluster's limit on replies at once (blank: none).
     const cap = Number($('capacity').value);
     if (Number.isInteger(cap) && cap >= 1) store(() => sessionStorage.setItem(chatsKey(secret), String(cap)));
+    store(() => sessionStorage.setItem(ctxKey(secret), $('ctx').value));
     store(() => sessionStorage.setItem(nameKey(secret), cleanName($('name').value)));
     saveChoice(gb ? { contribute: true, limit: `${gb}gb` } : { contribute: false, limit: '' });
     location.href = `/chat#mesh=${secret}`;

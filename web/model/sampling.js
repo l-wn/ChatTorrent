@@ -36,7 +36,7 @@ export function penaltyState(ctx, { window = 256, top = 32, ngram = 0, skip = []
 
     // The suffix is the last n-1 ids. Every earlier occurrence of it is
     // followed by a token that is banned. A linear scan over a context of at
-    // most N_MAX tokens, once per token.
+    // most the context window's tokens, once per token.
     if (ngram > 1 && ctx.length >= ngram) {
         const k = ngram - 1;
         const suffix = ctx.slice(ctx.length - k);

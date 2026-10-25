@@ -16,8 +16,9 @@ is used only by the tests and the smoke check.
   transposed on export. Every projection is `Y[M,N] = X[M,K] @ W[N,K]^T`
   (`matmulNobias`), and so is the LM head, which reads `wte` directly when tied.
 - **No biases** anywhere.
-- **Activations, the KV cache and every accumulator are f32.** Only stored
-  weights are f16 or q8, and the shaders widen them on read.
+- **Activations and every accumulator are f32.** Stored weights are f16 or
+  q8, and the KV cache is int8 with f32 scales (see Paged KV cache). The
+  shaders widen both on read.
 - `T_new` is the number of tokens in this job, `T_past` how many the session
   already has cached, and `T_act = T_past + T_new`.
 
@@ -31,8 +32,8 @@ q      = h @ q_proj^T                      # [T, n_heads*D]
 k, v   = h @ k_proj^T, h @ v_proj^T        # [T, n_kv*D] each
 (q, k  = rmsnorm per head (q_norm, k_norm))               # Qwen only
 Qh     = reshape_heads(q)                  # [n_heads, T, D]
-scatter_kv(k → K cache, v → V cache) at T_past            # paged, head-major
-rope(Qh), rope(K cache rows just written)                 # V is never rotated
+store_kv(rope(k) → K cache, v → V cache) at T_past       # int8, paged, head-major
+rope(Qh)                                                  # V is never rotated
 scores = Qh @ K^T / sqrt(D)                # [n_heads, T, T_act], GQA
 causal_softmax(scores)                     # mask j > T_past + i
 ctx    = scores @ V                        # [n_heads, T, D], GQA
@@ -88,7 +89,9 @@ out[i + half]   = x[i + half] * cos + x[i] * sin
 
 Query head `h` reads KV head `h / group`, with `group = n_heads / n_kv_heads`.
 Scores and outputs keep `n_heads` heads; the KV cache is only `n_kv_heads`
-deep.
+deep. The three attention kernels run over chunks of the job's rows
+(`attnRows()` in model.js), so the scores buffer stays near 32 MiB at long
+contexts. Every output element has the same bits in any chunking.
 
 ### Paged KV cache
 
@@ -97,10 +100,22 @@ from a pool that holds one buffer per full-attention layer per K/V. A
 per-session page table maps a logical token position to a physical page:
 
 ```
-cache[(pages[t / page] * n_kv + head) * page * D + (t % page) * D + d]
+row = (pages[t / page] * n_kv + head) * page + (t % page)
 ```
 
-`scatter_kv`, `rope`, `qk_scores_gqa` and `attn_av_gqa` all read the table. A
+A row is one token of one KV head, `RW = D/4 + D/QB` u32 words: `D` int8
+values packed four to a word, then one f32 scale per `QB = min(32, D)` values
+(`scale = max|x| / 127` over the block, values rounded to nearest and clamped
+to ±127, as llama.cpp's q8_0). On Qwen3.8-27B a token of K and V on one
+full-attention layer is 2.25 KiB, against 8 KiB in f32. `split.js`'s
+`kvRowBytes()` prices it, and the server and the peers use the same number.
+
+`store_kv` applies RoPE to K before quantizing, so a stored row is never
+rotated again. Scales never span tokens, so a row's bits depend only on that
+row's input: a rewind, a speculative overwrite, a chunked prefill and a
+different split all write the same bytes.
+
+`store_kv`, `qk_scores_gqa` and `attn_av_gqa` all read the table. A
 contiguous cache (`makeCache()`, used by the single-tab page and the dev tools)
 is the one-page case: `page = N_max`, `pages = [0]`.
 
@@ -214,8 +229,8 @@ dispatch shape:
 | `gather_embed_nopos` | `out[t] = wte[ids[t]]` |
 | `rmsnorm` | one workgroup per row |
 | `reshape_heads`, `merge_heads` | row-major ↔ head-major |
-| `scatter_kv` | projection → paged cache |
-| `rope` | in-place rotation from the CPU table |
+| `store_kv` | projection → int8 paged cache, K rotated first |
+| `rope` | in-place rotation of Q from the CPU table |
 | `qk_scores_gqa`, `causal_softmax`, `attn_av_gqa` | attention |
 | `silu_mul`, `sigmoid_mul`, `add_inplace` | elementwise |
 | `causal_conv1d`, `update_conv_history` | Gated DeltaNet convolution |
