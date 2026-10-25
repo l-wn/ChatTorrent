@@ -670,7 +670,7 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
         secret = readInvite(location.hash);
         room = await openRoom(secret);
     } catch (err) {
-        ui.title.textContent = 'ChatTorrent';
+        ui.title.textContent = 'ClusterChat';
         ui.boot.remove();
         showMesh(null);
         problem('BAD_LINK', err);
@@ -694,7 +694,7 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
                                                ctx: creatorCtx(secret) }));
     } catch (err) {
         console.warn('connect failed:', err);
-        ui.title.textContent = 'ChatTorrent';
+        ui.title.textContent = 'ClusterChat';
         ui.boot.remove();
         problem('NO_CONNECTION', err);
         refresh();
@@ -1275,7 +1275,7 @@ function render() {
     ui.messages.replaceChildren(...(ui.boot?.isConnected ? [ui.boot] : []));
     for (const m of current.rec?.messages ?? []) {
         if (m.role === 'user') { addMessage('you', m.text, 'user'); continue; }
-        const out = addMessage('ChatTorrent', m.text, 'model');
+        const out = addMessage('ClusterChat', m.text, 'model');
         if (m.reasoning != null) out.reasoning = m.reasoning;
         out.meta = m.meta ?? '';
     }
@@ -1444,7 +1444,7 @@ async function submitPrompt() {
     setStatus('generating…', 'busy');
     ui.messages.querySelector('.share')?.remove();
     ui.messages.querySelector('.suggest')?.remove();
-    const out = addMessage('ChatTorrent', '', 'model streaming');
+    const out = addMessage('ClusterChat', '', 'model streaming');
     out.meta = 'Writing…';
 
     let fed = true;

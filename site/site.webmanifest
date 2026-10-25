@@ -1,6 +1,6 @@
 {
-  "name": "ChatTorrent",
-  "short_name": "ChatTorrent",
+  "name": "ClusterChat",
+  "short_name": "ClusterChat",
   "start_url": "/chat",
   "display": "standalone",
   "background_color": "#ffffff",

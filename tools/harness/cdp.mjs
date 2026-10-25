@@ -47,7 +47,7 @@ const FLAGS = [
 ];
 
 export async function launch({ port = 0, verbose = false } = {}) {
-    const profile = mkdtempSync(join(tmpdir(), 'chattorrent-harness-'));
+    const profile = mkdtempSync(join(tmpdir(), 'clusterchat-harness-'));
     const chrome = spawn('google-chrome', [
         ...FLAGS,
         `--remote-debugging-port=${port}`,

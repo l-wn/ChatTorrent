@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>About · ChatTorrent</title>
-  <meta name="description" content="ChatTorrent runs a large open AI model on the graphics cards of the people using it, in their browsers. Everyone gets their own chat, and nobody has to stay online." />
+  <title>About · ClusterChat</title>
+  <meta name="description" content="ClusterChat runs a large open AI model on the graphics cards of the people using it, in their browsers. Everyone gets their own chat, and nobody has to stay online." />
   <link rel="icon" href="favicon.svg?v=3" type="image/svg+xml" />
   <link rel="stylesheet" href="tokens.css" />
   <link rel="stylesheet" href="site.css" />
@@ -12,16 +12,16 @@
 </head>
 <body class="page">
 <!--
-  Served at /about. What ChatTorrent is, how it works and why it exists, for
+  Served at /about. What ClusterChat is, how it works and why it exists, for
   someone who has never heard of it. Linked from the site header, the app's
   welcome dialog and every footer.
 -->
   <header class="site-header">
     <div class="wrap">
-      <a class="brand" href="/" aria-label="ChatTorrent home"><span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>ChatTorrent</a>
+      <a class="brand" href="/" aria-label="ClusterChat home"><span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>ClusterChat</a>
       <nav aria-label="Main">
         <a href="/about" aria-current="page">About</a>
-        <a href="https://github.com/l-wn/ChatTorrent" rel="noopener">GitHub</a>
+        <a href="https://github.com/l-wn/ClusterChat" rel="noopener">GitHub</a>
       </nav>
     </div>
   </header>
@@ -29,7 +29,7 @@
   <main>
     <p class="eyebrow">About</p>
     <h1>An AI chat your group runs together.</h1>
-    <p class="lede">ChatTorrent runs a large open AI model, Qwen3.8 27B, on the graphics cards of the people using it. There's no data centre behind it. Everyone in a cluster lends part of their GPU, and together their browsers run one model that each of them can chat with.</p>
+    <p class="lede">ClusterChat runs a large open AI model, Qwen3.8 27B, on the graphics cards of the people using it. There's no data centre behind it. Everyone in a cluster lends part of their GPU, and together their browsers run one model that each of them can chat with.</p>
 
     <ul class="facts">
       <li><strong>Everyone gets their own chat.</strong> Conversations are separate, and several can run at the same time.</li>
@@ -117,7 +117,7 @@
 
     <h2>Private clusters and the public demo</h2>
     <p>A private cluster is for a group: friends, a lab, a club. Only people with its link can join, and only their computers run its chats. Start one from the <a href="/">home page</a> and share the link. Up to 64 people can join, and whoever starts it chooses how many replies can run at once.</p>
-    <p>The public demo is a cluster anyone can join. It's there to try ChatTorrent, so don't send it anything personal.</p>
+    <p>The public demo is a cluster anyone can join. It's there to try ClusterChat, so don't send it anything personal.</p>
     <aside class="callout" aria-label="Privacy">
       <p class="callout-label">Privacy</p>
       <p><strong>Your chat is separate, not secret.</strong> The computers in your cluster process it. Invite people you trust.</p>
@@ -127,15 +127,15 @@
 
     <h2>The technology</h2>
     <ul>
-      <li><strong>WebGPU</strong> lets a web page use your graphics card. ChatTorrent's model code is written from scratch for it: no AI libraries, no plugins, nothing to install.</li>
+      <li><strong>WebGPU</strong> lets a web page use your graphics card. ClusterChat's model code is written from scratch for it: no AI libraries, no plugins, nothing to install.</li>
       <li><strong>WebRTC</strong> lets browsers talk to each other. It carries the model's working data from one browser to the next, encrypted, through a relay, so nobody learns anyone else's IP address.</li>
       <li><strong>Two small servers</strong> help out. One introduces browsers to each other, and the other relays their encrypted traffic. Neither runs the AI or can read your messages.</li>
     </ul>
-    <p>All of it is open source. The code is on <a href="https://github.com/l-wn/ChatTorrent" rel="noopener">GitHub</a>.</p>
+    <p>All of it is open source. The code is on <a href="https://github.com/l-wn/ClusterChat" rel="noopener">GitHub</a>.</p>
 
     <h2>Why it exists</h2>
-    <p>ChatTorrent is an experiment that explores a question: can large AI models be run by ordinary people, on consumer hardware, freely and privately?</p>
-    <p>In a world where AI is dominated by large, private data centres, or really expensive GPUs, ChatTorrent aims to bring control back and make private AI more affordable.</p>
+    <p>ClusterChat is an experiment that explores a question: can large AI models be run by ordinary people, on consumer hardware, freely and privately?</p>
+    <p>In a world where AI is dominated by large, private data centres, or really expensive GPUs, ClusterChat aims to bring control back and make private AI more affordable.</p>
     <ul>
       <li><strong>A more democratic AI.</strong> No company gatekeeps AI, deciding who can use what and how. The model is run by the people using it, the code is open source, and anybody can host their own private instance.</li>
       <li><strong>A more accessible AI.</strong> It's free, with no account or subscription. A library, a friend group or a community can pool a few graphics cards and run their own model.</li>
@@ -163,7 +163,7 @@
 
     <h2 id="faq">Questions</h2>
     <h3>Can others in my cluster see my chats?</h3>
-    <p>Not in the app. Your chats show up only in your browser, and they're saved there. But the computers in your cluster run the model on what you send, so someone who changed their copy of ChatTorrent could read it. Your chat is separate, not secret.</p>
+    <p>Not in the app. Your chats show up only in your browser, and they're saved there. But the computers in your cluster run the model on what you send, so someone who changed their copy of ClusterChat could read it. Your chat is separate, not secret.</p>
     <h3>What happens if the person who started it leaves?</h3>
     <p>Nothing special. There's no host, so the cluster keeps running as long as the people still in it hold the whole model between them. When everyone has left, the cluster closes. Opening the link again starts it back up, and your saved chats are still in your browser.</p>
     <h3>Do I need a GPU?</h3>
@@ -185,7 +185,7 @@
     <div class="wrap">
       <nav aria-label="Footer">
         <span>Open source, by lwn</span>
-        <a href="https://github.com/l-wn/ChatTorrent" rel="noopener">GitHub</a>
+        <a href="https://github.com/l-wn/ClusterChat" rel="noopener">GitHub</a>
         <a href="/about">About</a>
         <a href="/privacy">Privacy</a>
         <a href="/terms">Terms</a>

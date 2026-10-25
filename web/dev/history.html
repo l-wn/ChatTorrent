@@ -25,7 +25,7 @@ const ok = (name, cond, detail = '') => {
     console.log(line);
 };
 
-const NAME = `chattorrent-test-${crypto.randomUUID()}`;
+const NAME = `clusterchat-test-${crypto.randomUUID()}`;
 const PRIV = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
 const chat = (mesh, text, ids = [1, 2, 3]) => ({
     ...newRecord({ mesh, model: 'm', weights: 'w' }),

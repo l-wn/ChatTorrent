@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run a ChatTorrent GPU peer on a rented, headless GPU machine. This file is
+# Run a ClusterChat GPU peer on a rented, headless GPU machine. This file is
 # self-contained: copy it over with scp, then
 #
 #   ./setup-gpu-peer.sh install      once: Chrome, the Vulkan loader, an NVIDIA ICD
@@ -250,7 +250,7 @@ number), e.g. -L 9223:localhost:$PORT for the second, -L 9224:… for the third.
 
 then in your local Chrome open chrome://inspect, click "Configure…", add
 localhost:$PORT (and each other local port), and press "inspect" under the
-ChatTorrent tab listed for that port. Tick both
+ClusterChat tab listed for that port. Tick both
 boxes, pick an amount, press Contribute. Check it got the real GPU with:
 
   ./setup-gpu-peer.sh status

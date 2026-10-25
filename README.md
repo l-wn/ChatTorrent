@@ -203,7 +203,7 @@ npm run test:gpu    # real peers in headless Chrome, needs a GPU
 ## License
 
 GNU Affero General Public License v3.0. See [`LICENSE`](LICENSE). Under
-[`NOTICE`](NOTICE), any deployment must keep a visible credit to ChatTorrent
+[`NOTICE`](NOTICE), any deployment must keep a visible credit to ClusterChat
 in its interface.
 
 The demo's privacy notice, terms and code of conduct (`site/privacy.html`,

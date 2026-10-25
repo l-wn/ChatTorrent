@@ -1,5 +1,5 @@
-ChatTorrent
-Copyright (C) 2026 ChatTorrent contributors
+ClusterChat
+Copyright (C) 2026 ClusterChat contributors
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU Affero General Public License, version 3, as published by
@@ -17,7 +17,7 @@ Every interactive user interface of this program, and of any work based on it,
 must display the following attribution in its Appropriate Legal Notices, where
 a user can see it without leaving the interface:
 
-    Based on ChatTorrent, https://github.com/l-wn/ChatTorrent
+    Based on ClusterChat, https://github.com/l-wn/ClusterChat
 
 The credit ribbon at the bottom of the pages in web/ and site/ is where this
 program displays it. A modified version may restyle or move the attribution

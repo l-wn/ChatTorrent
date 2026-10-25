@@ -12,6 +12,8 @@
 // the checkpoint the ids belong to. `opts` is { chat, thinking }, how the turn
 // was wrapped. `rev` increases on every save.
 
+// The database and export names keep the project's old name, so saved chats
+// and earlier exports still open.
 const DB = 'chattorrent';
 const STORE = 'chats';
 export const VERSION = 1;
@@ -231,7 +233,7 @@ export function exportChats(recs, now = Date.now()) {
 // is ignored, since importing moves chats into this mesh. Each record gets a
 // new id, so importing twice makes duplicates.
 export function importChats(json, mesh, now = Date.now()) {
-    if (json?.format !== FORMAT) throw new Error('not a ChatTorrent chat export');
+    if (json?.format !== FORMAT) throw new Error('not a ClusterChat chat export');
     if (json.v !== VERSION) throw new Error(`chat export version ${json.v} is not supported`);
     if (!Array.isArray(json.chats)) throw new Error('the export has no chats');
     return json.chats.map((c) => {

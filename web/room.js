@@ -12,6 +12,8 @@
 // is a room with no key: `seal` returns its input and `verify` accepts
 // everything. The trust model is in docs/architecture.md (Private meshes).
 
+// Keeps the project's old name: the salt is part of every join token, so
+// changing it would break every invite link already shared.
 const SALT = 'chattorrent/mesh/v1';
 export const SECRET_BYTES = 16;
 const SECRET_RE = /^[A-Za-z0-9_-]{22}$/;
@@ -160,7 +162,8 @@ export async function openRoom(secret, { overrideToken = null } = {}) {
 //
 // sessionStorage, keyed by the invite secret, so a reload keeps them: that
 // this tab started it (the share card says so), and the limits it chose on
-// the create page (sent with every join, see net.js's connect()).
+// the create page (sent with every join, see net.js's connect()). Storage
+// keys keep the project's old name, so a reload finds what was saved.
 export const creatorKey = (s) => `chattorrent:creator:${s}`;
 export const chatsKey = (s) => `chattorrent:chats:${s}`;
 export const sessionsKey = (s) => `chattorrent:sessions:${s}`;

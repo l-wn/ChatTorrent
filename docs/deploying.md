@@ -1,6 +1,6 @@
 # Deploying
 
-A ChatTorrent deploy is three things:
+A ClusterChat deploy is three things:
 
 1. **The pages**: static files (`web/`, plus `site/` in production).
 2. **The signaling server**: `signal-server.js`, a Node WebSocket server the
