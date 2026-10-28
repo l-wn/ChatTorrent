@@ -236,8 +236,20 @@ export class Room {
             return;
         }
 
-        // ready: a pass has run through the peer's first positions. Never
-        // unset: a peer that cannot serve closes its socket, which is a leave.
+        // release: the peer holds nothing any more (its GPU was lost). It
+        // stays in the room as a client and may claim again, so a peer
+        // reloading a smaller range keeps its socket and its chats.
+        if (m.type === 'release') {
+            if (me.lo == null) return;
+            const was = this.where(me);
+            Object.assign(me, { lo: null, hi: null, have: null, cap: 0, ready: false });
+            this.log(`  peer ${id} released ${was}: ${this.health()}`);
+            this.broadcast();
+            return;
+        }
+
+        // ready: a pass has run through the peer's first positions. Unset
+        // only by `release`.
         if (m.type === 'ready') {
             if (!me.ready && me.lo != null) {
                 me.ready = true;

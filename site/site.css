@@ -123,6 +123,10 @@ p { margin: 0; }
 @media (min-width: 820px) { .lede-line { display: block; white-space: nowrap; } }
 .actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 12px; margin-top: 40px; }
 .hero .btn { height: 52px; padding: 0 24px; font-size: 16px; }
+/* Hero: the private cluster is the main action, the demo sits under it. */
+.hero .actions { flex-direction: column; align-items: center; margin-top: 28px; }
+.hero .btn-primary { height: 56px; padding: 0 28px; font-size: 17px; }
+.hero .btn:not(.btn-primary) { height: 42px; padding: 0 18px; font-size: var(--t-sm); }
 .gpucheck { margin: 20px auto 0; max-width: 34rem; min-height: 3em; font: 400 var(--t-xs)/1.5 var(--mono); color: var(--warn); }
 
 /* The demo's band: full width, a step darker than the page. */

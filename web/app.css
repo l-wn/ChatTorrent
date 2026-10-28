@@ -608,7 +608,15 @@ body.chats-docked { padding-left: var(--side); }
   .drawer.left { border-right: 0; }
   .chat-item button.icon { opacity: 1; }
   .setup-inner { padding: 32px 18px; }
-  .lane-grid { grid-template-columns: 6.5rem minmax(0, 1fr) 4.5rem; column-gap: 8px; }
+  /* Too narrow for side columns: the name and number share a line, and the
+     bar takes the full width under them, so its cells fit. */
+  .lane-grid { grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; }
+  .lane-grid > :first-child { justify-self: start; text-align: left; }
+  .lane-grid > :nth-child(2):not(:last-child) { grid-column: 1 / -1; grid-row: 2; }
+  .lane-grid > :last-child:not(:first-child) { grid-column: 2; grid-row: 1; justify-self: end; text-align: right; }
+  .flag-row.lane-grid { display: block; }
+  .flag-row > span:empty { display: none; }
+  .lane-track { height: auto; padding: 4px 0; }
   .strip-gb { display: none; }
 }
 .person { fill: currentColor; stroke: none; }

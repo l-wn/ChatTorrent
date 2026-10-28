@@ -257,8 +257,8 @@
         <label class="field" title="The peer at the end of the model guesses the next few tokens from earlier text in the chat and checks them all in one pass, so repeated text (code, quotes, lists) comes out several tokens per pass. The reply is the same as without it. Needs the closed loop.">
           <span><span class="name">Speculative decoding</span><span class="desc">Check guessed tokens several at a time</span></span>
           <select id="spec" autocomplete="off">
-            <option value="off" selected>off</option>
-            <option value="on">on</option>
+            <option value="off">off</option>
+            <option value="on" selected>on</option>
           </select>
         </label>
         <label class="field" title="pass = one GPU timestamp pair per hop; kernel = one per dispatch, which slows the token down but shows which kernels the time is in.">

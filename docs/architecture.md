@@ -67,6 +67,7 @@ peer   -> have     { have }                 downloaded and warmed up to here
 peer   -> ready    {}
 peer   -> shrink   {}                       give back the unfilled tail
 peer   -> grow     { lo, hi }               widened by one servable position
+peer   -> release  {}                       give back everything (GPU lost); may claim again
 peer   -> signal   { to, kind, sdp, mac? }  relayed to `to`, in the same mesh only
 server -> roster   { peers }                broadcast on every change
 server -> ping  /  peer -> pong             every 30 s; two misses drop the peer
@@ -212,8 +213,9 @@ URL parameters on `peer.html` pin it instead, which turns growth off:
 ```
 
 **Fill** (`Engine.#fill`). The Runner reserves KV for the whole claim, then
-downloads positions in ascending order. Each is appended, warmed up (one pass
-that also checks the output is finite), and announced with `have`. `ready`
+downloads positions in ascending order. Each is appended, checked (one pass
+through the whole holding so far, as a real job runs it, that also checks the
+output is finite), and announced with `have`. `ready`
 goes out after the first one, so a peer serves the start of its range while the
 rest downloads. If a download or allocation fails part way, the peer keeps what
 it has and gives back the tail (`shrink`); if it holds nothing, it becomes a
@@ -222,11 +224,22 @@ client (`capacity 0`).
 **Growth** (`Engine.#growClaim`). Once the claim is full, the peer keeps adding
 one position at a time, toward whichever neighbouring position is less covered
 (alternating on a tie), whenever its runner has been idle for 2 s. Each new
-position is reserved, downloaded, warmed and only then announced with `grow`.
-Growth stops at a GPU allocation failure or when the peer holds the whole model.
+position is reserved, downloaded, checked with a pass through the whole holding
+and only then announced with `grow`. Growth stops at a GPU allocation failure or
+when the peer holds the whole model.
 At the VRAM limit set in the page it *pauses* instead: the loop parks, and
 `setVramLimit` wakes it, so raising or clearing the limit carries growth on from
 the holding already in VRAM.
+
+**A lost GPU** (`Engine.#onLost`). Some GPUs never fail an allocation: D3D12
+on a shared-memory GPU pages idle buffers out, and only fails when one pass
+needs more resident than fits, which loses the device. That is why every new
+position is checked with a whole-holding pass before it is announced. On a
+loss the peer sends `release` at once, so routing stops reaching it, then opens
+a new device and reloads a smaller holding: the last one a check passed if the
+newest position had not passed yet, else one position fewer than held. Growth
+then stops at that size. After three losses, or below the minimum claim, the
+peer stops lending until the page is reloaded.
 
 **What a position costs.** The VRAM limit is held to bytes, so the two sides of
 the comparison have to be real. What a peer *holds* is `Runner.vramBytes`: the

@@ -167,6 +167,16 @@ function handleEngineEvent(type, detail) {
                     problem('GPU_LOST', detail.cause);
                     setStatus('GPU stopped', 'err');
                     break;
+                // The GPU ran out of memory running everything it held. The
+                // engine reloads a smaller part on its own.
+                case 'gpu-recovering':
+                    console.warn(detail.text);
+                    note('Your GPU ran out of memory. Reloading a smaller part of the model…');
+                    break;
+                case 'gpu-recovered':
+                    console.info(detail.text);
+                    note('Your GPU is lending again, with less of the model.');
+                    break;
                 case 'gpu-error':
                     console.error(detail.text);
                     problem('GPU_ERROR', detail.cause);
@@ -177,16 +187,23 @@ function handleEngineEvent(type, detail) {
             break;
         // A rebuild of the context from this chat's token ids. The message
         // depends on the reason (route.js's rebuild()).
-        case 'repair':
-            rebuilding = REBUILDS[detail.reason] ?? REBUILDS.repair;
+        case 'repair': {
+            // A repair is usually a computer that cleared this chat from its
+            // memory (room for other chats, or the cluster rearranged), not
+            // one that left. The error text says which.
+            const left = detail.reason === 'repair' && LEFT_RE.test(detail.message ?? '');
+            rebuilding = left ? REBUILDS.left : REBUILDS[detail.reason] ?? REBUILDS.repair;
             if (detail.reason === 'resume') {
                 beforeReply(note('Picking this chat back up…'));
             } else if (detail.reason !== 'rewind') {
                 console.info('rebuild:', detail.message);
-                beforeReply(note('Someone running this chat left. Picking it back up on the computers still here…'));
+                beforeReply(note(left
+                    ? 'Someone running this chat left. Picking it back up on the computers still here…'
+                    : 'A computer running this chat cleared it from its memory. Re-reading the conversation to continue…'));
             }
             setStatus(`${rebuilding}…`, 'busy');
             break;
+        }
         case 'rebuild-progress':
             setStatus(`${rebuilding}… (${detail.sent}/${detail.total})`, 'busy');
             break;
@@ -197,18 +214,22 @@ function handleEngineEvent(type, detail) {
         // the job is in flight. Shown to explain the pause.
         case 'fix':
             console.info(`fix: peer ${detail.from} replayed ${detail.rows} tokens`);
-            note('Someone running this chat left. Another computer took over its part.');
+            note('Part of this chat was restored from a neighbouring computer.');
             break;
     }
 }
 
 // Status pill text while a rebuild runs, by reason.
 const REBUILDS = {
-    repair: 'someone left, rebuilding context',
+    left: 'someone left, rebuilding context',
+    repair: 're-reading context',
     resume: 'resuming chat',
     rewind: 're-reading context',
 };
 let rebuilding = REBUILDS.repair;
+// Errors that mean a computer left or stopped answering (route.js fail() and
+// the job timeout), as opposed to one that dropped this chat's cache.
+const LEFT_RE = /is unreachable|no peer that can run|no answer from the cluster/;
 
 // A prompt can be sent when there is a tokenizer and net.connected is true:
 // the ready peers' ranges cover the model, a job of mine can enter, my own
@@ -682,9 +703,12 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
     openStore(room);
 
     ui.bootnote.textContent = 'connecting to the signaling server…';
-    // ?mtp=1: holding the head, also hold the MTP draft head.
+    // Holding the head, also hold the MTP draft head; ?mtp=0 turns it off.
+    // ?warm=0: no keep-warm kernel between jobs (stage.js KEEP_WARM_MS).
+    const params = new URLSearchParams(location.search);
     engine = new Engine({ onEvent: handleEngineEvent,
-                          mtp: new URLSearchParams(location.search).get('mtp') === '1' });
+                          mtp: params.get('mtp') !== '0',
+                          warm: params.get('warm') !== '0' });
 
     let manifest;
     try {
@@ -1508,15 +1532,13 @@ async function respond(text, opts, out, reply) {
     }
     const summary = summarize(engine.lastProfile);
     const hopsLine = formatLine(summary);
-    // Under the reply: how many GPUs ran it and how fast, in words. The token
+    // Under the reply: how many GPUs ran it and how fast, in tokens. The token
     // timings are the hover text; tools/load.mjs reads them from there.
     const gpus = new Set((summary.decode?.hops ?? []).map((h) => h.id)).size;
     for (const h of summary.decode?.hops ?? []) if (h.ms?.med != null) hopMs.set(h.id, h.ms.med);
-    const words = turn.answer.trim() ? turn.answer.trim().split(/\s+/).length : 0;
-    const secs = turn.ids.length * turn.perTok / 1000;
-    const wps = secs > 0 && words ? words / secs : 0;
+    const tps = turn.ids.length && turn.perTok > 0 ? 1000 / turn.perTok : 0;
     show('meta', [gpus ? `via ${plural(gpus, 'GPU')}` : null,
-                  wps ? `${wps < 10 ? wps.toFixed(1) : wps.toFixed(0)} words/s` : null]
+                  tps ? `${tps < 10 ? tps.toFixed(1) : tps.toFixed(0)} tok/s` : null]
         .filter(Boolean).join(' · '));
     out.detail = `${turn.ids.length} tokens · ${turn.perTok.toFixed(0)} ms/tok · ` +
         `prefill ${turn.prefillMs.toFixed(0)} ms for ${turn.promptTokens} · ${turn.stopped}` +

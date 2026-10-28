@@ -12,7 +12,7 @@
 import { adapterLabel } from './model/kernels.js';
 import { checkDims, scratchBytes } from './model/model.js';
 import { loadManifest, loadBlock, loadEmbed, loadHead, loadMtp, dimsFromManifest } from './model/loader.js';
-import { Runner } from './model/stage.js';
+import { Runner, KEEP_WARM_MS } from './model/stage.js';
 import { encode, decode, source as tokenizerSource } from './model/tokenizer.js';
 import { runAllTests } from './dev/kernels.test.js';
 import { smokeForward } from './dev/smoke.js';
@@ -29,6 +29,16 @@ const GROWTH_QUIET_MS = 2000;
 // to the second value, while the tab keeps serving what it has. Only a GPU out
 // of memory or a permanent failure (a 4xx) ends growth.
 const GROW_RETRY_MS = [15_000, 300_000];
+
+// GPU losses a tab recovers from by reloading a smaller holding. After this
+// many it stops lending until the page is reloaded.
+const MAX_LOSSES = 3;
+
+// A pass on a lost device can fail before or after `device.lost` resolves.
+// Wait a moment for it, so #onLost() handles a failure that a loss caused.
+const lossSettled = (device) => device?.lost
+    ? Promise.race([device.lost, new Promise((resolve) => setTimeout(resolve, 1000))])
+    : null;
 
 // Bytes formatted as the VRAM pill shows them (web/peer.js's refresh), so a
 // status note and the pill print the same number the same way.
@@ -66,6 +76,7 @@ export class Engine {
     #growPausedUnder = null; // the limit the pause note was emitted for; null while growing
     #mtpTried = null;        // the runner the MTP head was last tried on
     #mtpWanted = false;      // load the MTP head at the head (constructor option)
+    #keepWarm = true;        // run the keep-warm kernel while serving (constructor option)
     #sp = 0;                 // blocks/sec measured by warmup() in #fill()
     #lastStopReason = null;  // 'length' | 'context' | 'eos' | 'stopped', set by generate()
     #lastPromptTokens = 0;
@@ -76,12 +87,19 @@ export class Engine {
     #onEvent;
     #growRetryMs = GROW_RETRY_MS;
     #loadOverride = null;    // test-only replacement for #load
+    #openOverride = null;    // test-only replacement for opening a new device in #reload
+    #device = null;          // the device the runner lives on. A loss of any other is ignored
+    #serveArgs = null;       // how serve() sized the runner, for a reload after a loss
+    #good = null;            // [lo, hi): the holding the last whole pass ran on
+    #ceiling = Infinity;     // the most positions this GPU ran in one pass before a loss
+    #losses = 0;             // GPU losses so far
 
     // `mtp`: a runner holding the head also loads the MTP draft head, when
-    // the checkpoint has one (peer.html's ?mtp=1).
-    constructor({ onEvent = () => {}, mtp = false } = {}) {
+    // the checkpoint has one (on unless the page has ?mtp=0).
+    constructor({ onEvent = () => {}, mtp = false, warm = true } = {}) {
         this.#onEvent = onEvent;
         this.#mtpWanted = mtp;
+        this.#keepWarm = warm;
     }
 
     // Test-only: build an Engine around an existing net/router/runner,
@@ -92,12 +110,17 @@ export class Engine {
     // claim is downloaded, on `device`/`dims`. `vramLimit` is applied first, so
     // the limit decides the first step. `load` replaces the download of one
     // position and `growRetryMs` the retry delays, so a test can make a
-    // growth download fail and then succeed.
+    // growth download fail and then succeed. `openDevice` returns the device
+    // a reload after a GPU loss uses, and `serveArgs` stands in for what
+    // serve() would have recorded (see #reload).
     static forTest({ net, router, runner = null, dims = null, device = null,
                      vramLimit = Infinity, grow = false, onEvent = () => {},
-                     load = null, growRetryMs = GROW_RETRY_MS } = {}) {
+                     load = null, growRetryMs = GROW_RETRY_MS,
+                     openDevice = null, serveArgs = null } = {}) {
         const engine = new Engine({ onEvent });
         engine.#loadOverride = load;
+        engine.#openOverride = openDevice;
+        engine.#serveArgs = serveArgs;
         engine.#growRetryMs = growRetryMs;
         engine.#net = net;
         engine.#router = router;
@@ -106,6 +129,8 @@ export class Engine {
         engine.#canPrompt = true;
         engine.#role = runner ? 'worker' : 'spectator';
         engine.#vramLimit = vramLimit;
+        if (device) engine.#adopt(device);
+        if (runner) engine.#good = [runner.lo, runner.have];
         if (grow) engine.#growClaim(device, dims).catch((err) => console.error('growClaim:', err));
         return engine;
     }
@@ -235,6 +260,11 @@ export class Engine {
             const held = describeRange(lo, hi, d.n_layer);
             this.#emit('progress', { text: `downloading ${held} (you can chat meanwhile)` });
 
+            // `blocks`/`vram`/`at` fix the holding, so they turn growth off.
+            // `floor` only sets the starting size, so growth stays on.
+            const autoGrow = !at && blocks == null && vram == null;
+            this.#serveArgs = { sessions, slots, ctx: this.ctxMax, pageTokens, waitMs, autoGrow };
+
             await this.#fill(device, d, lo, hi, slowMs, sessions, slots, this.ctxMax, pageTokens, waitMs);
 
             const note = `Holding ${held} of ${manifest.model}: ${hi - lo} of ` +
@@ -243,14 +273,18 @@ export class Engine {
                 + (at ? ' Placed by hand (?at=), not by the server. A cluster that looks '
                       + 'broken may have a hole nobody was asked to fill.' : '');
 
-            // `blocks`/`vram`/`at` fix the holding, so they turn growth off.
-            // `floor` only sets the starting size, so growth stays on.
-            const autoGrow = !at && blocks == null && vram == null;
             if (autoGrow) {
                 this.#growClaim(device, d).catch((err) => console.error('growClaim:', err));
             }
             return { role: 'worker', held: [lo, hi], note, error: false, code: 'lending' };
         } catch (err) {
+            // The GPU was lost while filling the claim. #onLost() has given
+            // the claim back and is reloading or has given up.
+            await lossSettled(this.#device);
+            if (this.#losses > 0) {
+                return { role: this.#role, held: null, error: false, code: 'gpu-lost', cause: err,
+                         note: `Stopped filling the claim: the GPU was lost (${err.message}).` };
+            }
             console.warn('serve stopped:', err);
             const r = this.#runner;
 
@@ -338,6 +372,7 @@ export class Engine {
         device.pushErrorScope('validation');
         const runner = new Runner(device, d, { layers: [] },
             { lo, hi, have: lo, nMax: ctx, tMax: T_MAX, slots, sessions,
+              keepWarmMs: this.#keepWarm ? KEEP_WARM_MS : 0,
               ...(pageTokens ? { pageTokens } : {}),
               ...(waitMs !== undefined ? { waitMs } : {}) });
         const validation = await device.popErrorScope();
@@ -350,6 +385,7 @@ export class Engine {
         this.#runner = runner;
 
         for (let p = lo; p < hi; p++) {
+            if (this.#runner !== runner) throw new Error('the GPU was lost while downloading');
             if (slowMs && p > lo) {
                 this.#emit('progress', { text: `?slow=${slowMs}: holding at ` +
                     `${describeRange(lo, p, L)} before fetching the next position…` });
@@ -367,8 +403,10 @@ export class Engine {
 
             const weights = await this.#load(device, d, p, step);
 
-            this.#runner.append(weights);
-            const warm = await this.#runner.warmup(p);
+            if (this.#runner !== runner) throw new Error('the GPU was lost while downloading');
+            runner.append(weights);
+            const warm = await this.#check(runner);
+            if (this.#runner !== runner) throw new Error('the GPU was lost during a warm-up pass');
             if (warm) this.#sp = Math.max(this.#sp, warm.blocksPerSec);
 
             net.announceHave(p + 1);
@@ -384,6 +422,18 @@ export class Engine {
         }
     }
 
+    // Run one pass through the whole holding, the same single submit a real
+    // job makes, and record the holding as good. Some GPUs (D3D12 on shared
+    // memory) accept allocations past what they can make resident and only
+    // fail when one pass needs everything at once, which loses the device.
+    // Checking each new position this way makes that happen before it is
+    // announced, and tells #onLost() which step to undo.
+    async #check(r) {
+        const warm = await r.warmup(r.lo, r.have);
+        if (this.#runner === r) this.#good = [r.lo, r.have];
+        return warm;
+    }
+
     // After the initial claim is downloaded, add one position at a time toward
     // the less-covered neighbour (alternating on a tie) whenever the runner
     // has been idle. Stops when an allocation fails, a download fails for good
@@ -397,7 +447,7 @@ export class Engine {
         let side = 'left';
         for (;;) {
             const r = this.#runner;
-            if (!r) return;
+            if (!r || this.#device !== device) return;
             // A head holder takes the MTP draft head before widening.
             if (this.#mtpWanted && r.head && r.have === r.hi && d.mtp && !r.mtp && this.#mtpTried !== r) {
                 this.#mtpTried = r;
@@ -408,6 +458,15 @@ export class Engine {
                 this.#emit('status', {
                     code: 'whole',
                     text: `Holding the whole of ${manifest?.model ?? 'the model'}. Nothing left to grow into.`,
+                });
+                return;
+            }
+
+            if (r.hi - r.lo >= this.#ceiling) {
+                this.#emit('status', {
+                    code: 'ceiling',
+                    text: `Stopped growing at ${describeRange(r.lo, r.have, L)}: this GPU lost ` +
+                        `its device running more than ${this.#ceiling} positions at once.`,
                 });
                 return;
             }
@@ -474,13 +533,11 @@ export class Engine {
 
                 const weights = await this.#loadForGrowth(device, d, p, r);
 
-                if (dir === 'left') {
-                    r.prepend(weights, reserved);
-                    await r.warmup(r.lo, r.lo + 1);
-                } else {
-                    r.append(weights);
-                    await r.warmup(p);
-                }
+                if (this.#runner !== r) return;
+                if (dir === 'left') r.prepend(weights, reserved);
+                else r.append(weights);
+                await this.#check(r);
+                if (this.#runner !== r) return;
 
                 // Announced only once the position is downloaded and warmed up.
                 net.grow(r.lo, r.hi);
@@ -491,6 +548,9 @@ export class Engine {
                 // the last step taken.
                 side = dir === 'left' ? 'right' : 'left';
             } catch (err) {
+                // A lost GPU: #onLost() reloads and starts a new loop.
+                await lossSettled(device);
+                if (this.#runner !== r) return;
                 const r2 = this.#runner;
                 this.#emit('status', {
                     code: 'grow-stopped', cause: err,
@@ -604,14 +664,7 @@ export class Engine {
                 maxStorageBufferBindingSize: Math.min(want, adapter.limits.maxStorageBufferBindingSize),
             },
         });
-        device.lost.then((info) => {
-            if (info.reason === 'destroyed') return;
-            this.#emit('status', {
-                code: 'gpu-lost', cause: info,
-                text: `WebGPU device lost: ${info.message}. Reload the page.`,
-                error: true, pill: 'device lost',
-            });
-        });
+        this.#adopt(device);
         let gpuErrorNoted = false;
         device.addEventListener('uncapturederror', (ev) => {
             console.error('WebGPU error:', ev.error.message);
@@ -626,6 +679,103 @@ export class Engine {
             });
         });
         return device;
+    }
+
+    // Make `device` the one the runner lives on, and watch for its loss.
+    #adopt(device) {
+        this.#device = device;
+        device.lost?.then((info) => this.#onLost(device, info));
+        return device;
+    }
+
+    // The GPU device was lost, which frees every buffer on it. Give the
+    // holding back at once so other peers stop routing here, then reload a
+    // smaller one on a new device: the last holding a whole pass ran on if
+    // a newer position had not passed yet (that step failed), else one
+    // position fewer than held (a real job failed).
+    // Growth stops below the size that failed. After MAX_LOSSES, or with
+    // nothing left to hold, the tab stops lending.
+    #onLost(device, info) {
+        if (info.reason === 'destroyed' || device !== this.#device) return;
+        const r = this.#runner;
+        const held = r && r.have > r.lo ? [r.lo, r.have] : null;
+        const size = (x) => (x ? x[1] - x[0] : 0);
+        const good = this.#good;
+        const target = !held ? null
+            : size(good) < size(held) ? good
+            : size(held) > 1 ? [held[0], held[1] - 1] : null;
+        this.#device = null;
+        this.#runner = null;
+        this.#good = null;
+        this.#role = 'spectator';
+        const wake = this.#growWake;
+        this.#growWake = null;
+        wake?.();
+        this.#net?.release();
+        this.#losses++;
+        this.#emit('change');
+
+        const L = this.#dims?.n_layer;
+        const was = held ? describeRange(held[0], held[1], L) : 'nothing yet';
+        const n = target ? target[1] - target[0] : 0;
+        if (!target || n < Math.max(1, this.#net?.minBlocks || 1) || this.#losses > MAX_LOSSES
+            || !this.#serveArgs) {
+            this.#emit('status', {
+                code: 'gpu-lost', cause: info,
+                text: `WebGPU device lost while holding ${was}: ${info.message}. ` +
+                    `This tab has stopped lending. Reload the page.`,
+                error: true, pill: 'device lost',
+            });
+            return;
+        }
+        this.#ceiling = Math.min(this.#ceiling, n);
+        this.#emit('status', {
+            code: 'gpu-recovering', cause: info,
+            text: `WebGPU device lost while holding ${was}: ${info.message}. ` +
+                `Reloading ${describeRange(target[0], target[1], L)} on a new device, ` +
+                `and growing no further than ${n} positions.`,
+        });
+        this.#reload(target).catch((err) => console.error('reload:', err));
+    }
+
+    // Claim `[lo, hi)` again on a new device and fill it, then grow up to the
+    // ceiling if serve() was growing.
+    async #reload([lo, hi]) {
+        const { net } = this;
+        const d = this.#dims;
+        const a = this.#serveArgs;
+        let device = null;
+        try {
+            device = this.#openOverride ? this.#adopt(await this.#openOverride())
+                : await this.#openDevice();
+            const range = await net.claim(hi - lo, [lo, hi]);
+            if (!range || range[0] !== lo || range[1] !== hi) {
+                throw new Error(`the server did not give back positions ${lo}-${hi - 1}`);
+            }
+            await this.#fill(device, d, lo, hi, 0, a.sessions, a.slots, a.ctx, a.pageTokens, a.waitMs);
+            this.#emit('status', {
+                code: 'gpu-recovered',
+                text: `Lending again, holding ${describeRange(lo, hi, d.n_layer)}.`,
+            });
+            if (a.autoGrow) this.#growClaim(device, d).catch((err) => console.error('growClaim:', err));
+        } catch (err) {
+            // Lost again: that loss's #onLost() has taken over.
+            await lossSettled(device);
+            if (device && this.#device !== device) return;
+            this.#device = null;
+            device?.destroy();
+            this.#runner = null;
+            this.#role = 'spectator';
+            net.release();
+            this.#emit('status', {
+                code: 'gpu-lost', cause: err,
+                text: `Could not reload after losing the GPU (${err.message}). ` +
+                    `This tab has stopped lending. Reload the page.`,
+                error: true, pill: 'device lost',
+            });
+        } finally {
+            this.#emit('change');
+        }
     }
 
     async #selfCheck(device) {

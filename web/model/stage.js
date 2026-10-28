@@ -48,6 +48,50 @@ const REFUSED_MS = 60_000;
 // the gap between a reply's tokens and a short pause between turns.
 export const ACTIVE_MS = 5000;
 
+// Keep-warm: while jobs are arriving, the GPU runs a small kernel whenever
+// this Runner's queue is empty, so the driver does not drop the clocks
+// between tokens. It stops KEEP_WARM_MS after the last job. WARM_DEPTH rounds
+// are kept in flight, because a round's completion is reported about 2 ms
+// after it ends: with one, the GPU is busy under 20% of the time and an
+// RTX 3090 stays at P5. Three hold it at P0. A round of WARM_ITERS takes about
+// 0.5 ms there, so a new job waits at most about 1.5 ms behind them.
+export const KEEP_WARM_MS = 3000;
+const WARM_DEPTH = 3;
+const WARM_ITERS = 16384;
+
+// One workgroup running a dependent fma chain: the GPU counts as busy while
+// it runs, and it uses one SM and no memory bandwidth. b = [x0, a, c, out].
+const WARM_WGSL = /* wgsl */`
+@group(0) @binding(0) var<storage, read_write> b: array<f32, 4>;
+@group(0) @binding(1) var<uniform> n: u32;
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_index) i: u32) {
+    var x = b[0] + f32(i);
+    let a = b[1];
+    let c = b[2];
+    for (var k = 0u; k < n; k++) { x = fma(x, a, c); }
+    if (i == 0u) { b[3] = x; }
+}`;
+
+function makeWarmKernel(device) {
+    const buf = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(buf, 0, new Float32Array([0, 0.5, 0.25, 0]));
+    const iters = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(iters, 0, new Uint32Array([WARM_ITERS]));
+    const pipe = device.createComputePipeline({
+        layout: 'auto',
+        compute: { module: device.createShaderModule({ code: WARM_WGSL }), entryPoint: 'main' },
+    });
+    const bind = device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: { buffer: buf } },
+        { binding: 1, resource: { buffer: iters } },
+    ] });
+    const k = { pipe, bind, bytes: 32, lost: false };
+    // On a lost device a round completes at once, so the lanes stop.
+    device.lost?.then(() => { k.lost = true; });
+    return k;
+}
+
 // A replay layer's buffers (model.js makeReplayLayer).
 const SLOT_BUFS = ['S', 'histQ', 'histK', 'histV', 'linQ', 'linK', 'linV', 'linA', 'linB'];
 
@@ -62,7 +106,8 @@ export class Runner {
     // at a time by append(), `hi` (the default) for one given a whole range.
     constructor(device, d, w, { lo, hi, have = hi, nMax, tMax, slots = 5,
                                 sessions = slots, pageTokens = PAGE_TOKENS,
-                                idleMs = IDLE_MS, waitMs = WAIT_MS, specSlots = slots }) {
+                                idleMs = IDLE_MS, waitMs = WAIT_MS, specSlots = slots,
+                                keepWarmMs = 0 }) {
         const [blockLo, blockHi] = blockRange(lo, hi, d.n_layer);
         const held = blockRange(lo, have, d.n_layer)[1] - blockLo;
         if (held !== w.layers.length) {
@@ -176,6 +221,13 @@ export class Runner {
         this.specLive = new Map();                           // session -> slot
         this.specReadback = null;                            // the head's verify rows
         this.topk = null;                                    // GPU sampling's buffers
+
+        // Keep-warm (see KEEP_WARM_MS). 0 turns it off.
+        this.keepWarmMs = keepWarmMs;
+        this.warmKernel = null;
+        this.warming = false;
+        this.activeAt = 0;                                   // when run() last took or settled a job
+        this.onIdle = [];                                    // resolved when the queue drains
     }
 
     // `embed` needs `w.wte`. `head` needs `w.norm` and `w.lm_head` (or `w.wte`
@@ -195,6 +247,7 @@ export class Runner {
         for (const slot of [...this.specFree, ...this.specLive.values()]) bytes += slot.bytes;
         if (this.specReadback) bytes += this.specReadback.size;
         if (this.topk) bytes += this.topk.bytes;
+        if (this.warmKernel) bytes += this.warmKernel.bytes;
         return bytes + (this.mtpBytes ?? 0);
     }
 
@@ -542,9 +595,11 @@ export class Runner {
         }
         this.backlog++;
         this.pending.set(s, (this.pending.get(s) ?? 0) + 1);
+        this.#keepWarm();
         return new Promise((resolve, reject) => {
             this.#submit({ h, hidden, want, queuedAt: performance.now(), resolve, reject });
         }).finally(() => {
+            this.activeAt = performance.now();
             this.backlog--;
             const n = this.pending.get(s) - 1;
             if (n > 0) this.pending.set(s, n);
@@ -590,6 +645,40 @@ export class Runner {
             try { await task.run(); } catch { /* a task reports its own failure */ }
         }
         this.draining = false;
+        for (const wake of this.onIdle.splice(0)) wake();
+    }
+
+    // Start the keep-warm loop, unless it is off or already running.
+    #keepWarm() {
+        this.activeAt = performance.now();
+        if (!this.keepWarmMs || this.warming) return;
+        this.warming = true;
+        this.#warmLoop().catch(() => { /* a lost device: the next job reports it */ })
+            .finally(() => { this.warming = false; });
+    }
+
+    // WARM_DEPTH lanes, each submitting one round at a time while the queue
+    // is empty.
+    async #warmLoop() {
+        const { device } = this;
+        const k = this.warmKernel ??= makeWarmKernel(device);
+        const lane = async () => {
+            while (!k.lost && performance.now() - this.activeAt < this.keepWarmMs) {
+                if (this.draining) {
+                    await new Promise((wake) => this.onIdle.push(wake));
+                    continue;
+                }
+                const enc = device.createCommandEncoder();
+                const pass = enc.beginComputePass();
+                pass.setPipeline(k.pipe);
+                pass.setBindGroup(0, k.bind);
+                pass.dispatchWorkgroups(1);
+                pass.end();
+                device.queue.submit([enc.finish()]);
+                await device.queue.onSubmittedWorkDone();
+            }
+        };
+        await Promise.all(Array.from({ length: WARM_DEPTH }, lane));
     }
 
     // Which queued task runs next: the oldest. A task carries its session and

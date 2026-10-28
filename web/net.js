@@ -698,6 +698,20 @@ export class Mesh {
         this.#ws({ type: 'shrink' });
     }
 
+    // Give up the whole holding, ready or not, and become a client. Used
+    // when the GPU is lost: other peers stop routing here at once. A later
+    // claim() starts the announcements from scratch.
+    release() {
+        this.range = null;
+        this.#wantReady = false;
+        this.#announced = false;
+        this.#wantHave = null;
+        this.#have = null;
+        clearTimeout(this.#held?.timer);
+        this.#held = null;
+        this.#ws({ type: 'release' });
+    }
+
     // Announce a range widened by one position on either edge. Unlike claim(),
     // this widens a ready peer's range in place, and the server accepts both
     // numbers as given. No reply.

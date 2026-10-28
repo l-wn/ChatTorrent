@@ -1293,6 +1293,47 @@ console.log('\nsignal-server: grow, a claim widening in either direction');
     g.close();
 }
 
+console.log('\nsignal-server: release, a ready peer giving back everything');
+{
+    // A peer whose GPU was lost releases its range and stays connected as a
+    // client, then claims a smaller range again.
+    const g = connect();
+    const wg = await g.next((m) => m.type === 'welcome');
+    g.send({ type: 'capacity', cap: 10, lo: 10, hi: 20 });
+    await g.next(isAssign);
+    g.send({ type: 'ready' });
+    const mine = (m) => m.peers.find((p) => p.id === wg.id);
+    await g.next((m) => m.type === 'roster' && mine(m)?.ready);
+
+    g.msgs.length = 0;
+    g.send({ type: 'release' });
+    {
+        const me = mine(await g.next((m) => m.type === 'roster' && mine(m)?.lo == null));
+        eq('a released peer holds nothing and is not ready',
+            [me.lo, me.hi, me.have, me.ready], [null, null, null, false]);
+    }
+
+    g.msgs.length = 0;
+    g.send({ type: 'capacity', cap: 9, lo: 10, hi: 19 });
+    const again = await g.next(isAssign);
+    eq('and can claim a smaller range again', [again.lo, again.hi], [10, 19]);
+    g.send({ type: 'ready' });
+    {
+        const me = mine(await g.next((m) => m.type === 'roster' && mine(m)?.ready));
+        eq('which becomes ready again', [me.lo, me.hi], [10, 19]);
+    }
+
+    // A client has nothing to release.
+    const s = connect();
+    await s.next((m) => m.type === 'welcome');
+    s.msgs.length = 0;
+    s.send({ type: 'release' });
+    await new Promise((r) => setTimeout(r, 200));
+    eq('a release with no claim changes nothing', s.msgs.filter((m) => m.type === 'roster').length, 0);
+
+    g.close(); s.close();
+}
+
 console.log('\nsignal-server: grow is refused before a peer is placed or ready');
 {
     // Not ready: `grow` is ignored, as `have` must not be credited for a

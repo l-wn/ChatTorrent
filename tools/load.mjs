@@ -20,7 +20,7 @@
 //   --turns N          prompts each visitor sends (default 2; 0 = join only)
 //   --think S          pause before each prompt, 0.5x to 1.5x this (default 10)
 //   --tokens N         the page's "Max tokens" setting for every reply (default 64)
-//   --spec             turn the page's Speculative decoding setting on
+//   --no-spec          turn the page's Speculative decoding setting off (on by default)
 //   --greedy           temperature 0 and every repetition penalty off
 //   --prompts SET      chat (default): short questions; copy: replies that
 //                      repeat text (lists, code twice, tables), where
@@ -71,7 +71,7 @@ const RAMP       = Number(opt('ramp', 30));
 const TURNS      = Number(opt('turns', 2));
 const THINK      = Number(opt('think', 10));
 const TOKENS     = Number(opt('tokens', 64));
-const SPEC       = has('spec');
+const SPEC       = !has('no-spec');
 const GREEDY     = has('greedy');
 const PROMPT_SET = opt('prompts', 'chat');
 const LEAVE      = Number(opt('leave', 0));

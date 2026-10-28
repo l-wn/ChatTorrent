@@ -177,6 +177,108 @@ console.log('\na GPU out of memory still ends growth');
     ok('and nothing grown', !events.some((e) => e.type === 'grow'));
 }
 
+// A GPU that allocates without complaint but loses its device when one pass
+// runs more than `fits` positions, as D3D12 does on a shared-memory GPU. Each
+// device it opens behaves the same way. `lose()` loses the current device.
+function lossy({ fits, vramLimit = Infinity, minBlocks = 1 }) {
+    const net = new Mesh({});
+    net.ready.catch(() => {});
+    Object.assign(net, {
+        id: 0, blocks: L, positions: N, minBlocks, range: [2, 4],
+        peers: [{ id: 0, lo: 2, hi: 4, have: 4, ready: true }],
+    });
+    net.send = () => false;
+    const claims = [];
+    net.claim = async (cap, at) => { claims.push(at); net.range = at; return at; };
+    const released = [];
+    const release = net.release.bind(net);
+    net.release = () => { released.push(true); release(); };
+
+    let engine = null, lose = null, opened = 0;
+    const open = () => {
+        opened++;
+        const { device } = makeGpu();
+        device.lost = new Promise((resolve) => { lose = resolve; });
+        const submit = device.queue.submit;
+        device.queue.submit = (cmds) => {
+            const r = engine?.runner;
+            if (r && r.have - r.lo > fits) lose({ reason: 'unknown', message: 'MakeResident failed' });
+            return submit(cmds);
+        };
+        return device;
+    };
+
+    const device = open();
+    const runner = new Runner(device, D, weightsFor(2, 4),
+        { lo: 2, hi: 4, have: 4, nMax: N_MAX, tMax: 8, slots: SLOTS, idleMs: 0 });
+    runner.lastJobAt = -60000;
+
+    const events = [];
+    engine = Engine.forTest({
+        net, router: null, runner, dims: D, device, vramLimit, grow: true,
+        load: async (p) => pieceFor(p), openDevice: async () => open(),
+        serveArgs: { sessions: undefined, slots: SLOTS, ctx: N_MAX, autoGrow: true },
+        onEvent: (type, detail) => events.push({ type, detail }),
+    });
+    const codes = () => events.filter((e) => e.type === 'status').map((e) => e.detail.code);
+    const grown = () => events.filter((e) => e.type === 'grow').map((e) => [e.detail.lo, e.detail.hi]);
+    return { engine, events, codes, grown, claims, released, lose: (i) => lose(i), opened: () => opened };
+}
+
+console.log('\na GPU that loses its device past what one pass can run rolls back and stops');
+{
+    const { engine, codes, grown, claims, released, opened } = lossy({ fits: 4 });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const r = engine.runner;
+    ok('it holds the most positions a pass ran on', r && r.have - r.lo === 4,
+        r ? `holds ${r.lo}-${r.have}` : 'no runner');
+    ok('the step that failed was never announced', grown().every(([lo, hi]) => hi - lo <= 4),
+        JSON.stringify(grown()));
+    ok('it gave the holding back, then claimed the good one on a new device',
+        released.length === 1 && claims.length === 1 && claims[0][1] - claims[0][0] === 4
+        && opened() === 2, `released ${released.length}, claims ${JSON.stringify(claims)}, opened ${opened()}`);
+    ok('the reload is reported, then lending again, then the ceiling',
+        JSON.stringify(codes().filter((c) => /gpu|ceiling/.test(c)))
+        === JSON.stringify(['gpu-recovering', 'gpu-recovered', 'ceiling']), JSON.stringify(codes()));
+    ok('and no growth failure or GPU-lost error', !codes().some((c) => c === 'grow-stopped' || c === 'gpu-lost'),
+        JSON.stringify(codes()));
+    ok('the tab is a worker again', engine.role === 'worker', engine.role);
+}
+
+console.log('\na loss outside a check drops one position');
+{
+    // Parked at the limit, so the loss comes from "a real job", not a check.
+    const { engine, codes, claims, lose } = lossy({ fits: 99, vramLimit: 1 });
+    await settle();
+    lose({ reason: 'unknown', message: 'MakeResident failed' });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    ok('it reloads one position fewer', JSON.stringify(claims) === JSON.stringify([[2, 3]]),
+        JSON.stringify(claims));
+    const r = engine.runner;
+    ok('and holds it', r && r.lo === 2 && r.have === 3, r ? `holds ${r.lo}-${r.have}` : 'no runner');
+    ok('growth stays at that size', codes().includes('ceiling'), JSON.stringify(codes()));
+}
+
+console.log('\na loss with nothing smaller to hold stops lending');
+{
+    const { engine, codes, claims, lose } = lossy({ fits: 99, vramLimit: 1, minBlocks: 2 });
+    await settle();
+    lose({ reason: 'unknown', message: 'MakeResident failed' });
+    await settle();
+    ok('no reload below the minimum', claims.length === 0, JSON.stringify(claims));
+    ok('the GPU-lost error is shown', codes().includes('gpu-lost'), JSON.stringify(codes()));
+    ok('and the tab is a spectator', engine.role === 'spectator' && !engine.runner, engine.role);
+}
+
+console.log('\na destroyed device is not a loss');
+{
+    const { codes, claims, lose } = lossy({ fits: 99, vramLimit: 1 });
+    await settle();
+    lose({ reason: 'destroyed', message: '' });
+    await settle();
+    ok('nothing happens', claims.length === 0 && !codes().some((c) => /gpu/.test(c)), JSON.stringify(codes()));
+}
+
 console.log('\na tab pinned by ?at=/?blocks=/?gb= has no loop to wake');
 {
     const { engine, runner, notes } = grower({ vramLimit: 1, grow: false });
