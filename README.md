@@ -28,7 +28,7 @@ Everyone gets their own chat, several replies run at once, and anyone can leave 
 
 <br />
 
-<img src="docs/img/cluster.png" alt="Four computers in one cluster. Each lends a different amount of GPU memory and each person has their own chat, three of them writing replies at the same time." width="900" />
+<img src="docs/img/demo.gif" alt="Four computers join one cluster, each lending a different amount of GPU memory. Each person asks their own question and the replies are written at the same time. Ana closes her laptop mid-reply, the other chats keep going, and Mia starts a new one." width="900" />
 
 </div>
 
