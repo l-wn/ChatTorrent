@@ -139,6 +139,18 @@ p { margin: 0; }
 .eyebrow { font: 500 var(--t-xs)/1 var(--mono); text-transform: uppercase; letter-spacing: .08em; color: var(--signal-ink); margin-bottom: 10px; }
 .demo-head h2 { font-size: clamp(22px, 2.4vw, 30px); letter-spacing: -0.02em; line-height: 1.15; }
 
+/* The GitHub star links: a button in the header and a closing band under
+   the demo. */
+.site-header nav { align-items: center; }
+.site-header nav a.star-btn { color: var(--ink); gap: 6px; white-space: nowrap; }
+.site-header nav a.star-btn:hover { color: var(--ink); }
+.star-btn .star { width: 14px; height: 14px; fill: var(--signal); }
+.oss { text-align: center; padding: clamp(56px, 8vw, 96px) 0; border-top: 1px solid var(--rule); }
+.oss h2 { font-size: clamp(22px, 2.4vw, 30px); letter-spacing: -0.02em; line-height: 1.15; }
+.oss-line { margin: 14px auto 0; max-width: 34rem; color: var(--muted); }
+.oss .star-cta { margin-top: 28px; height: 52px; padding: 0 24px; font-size: 16px; }
+.star-cta .gh { width: 20px; height: 20px; fill: currentColor; }
+
 /* Steps, proof points and the honesty callout, on the about page */
 .callout {
   margin-top: 40px; max-width: 40rem;
@@ -268,6 +280,7 @@ p { margin: 0; }
 
 @media (max-width: 760px) {
   .site-header .wrap { gap: 16px; }
+  .site-header nav { gap: 16px; }
   .hero .btn { width: 100%; justify-content: center; }
   .demo-top { grid-template-columns: 1fr auto; }
   .demo-top .label { display: none; }
@@ -277,6 +290,8 @@ p { margin: 0; }
   .demo-captions li:not(.now) { display: none; }
   .demo.static .demo-captions li { display: block; }
 }
+
+@media (max-width: 400px) { .star-long { display: none; } }
 
 @media (max-width: 480px) {
   .demo-frames { grid-template-columns: 1fr; }

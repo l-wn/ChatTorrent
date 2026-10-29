@@ -443,7 +443,7 @@ function startNetwork(canvas) {
 
 // --- The headline: three words fly in, snap together and light up ---
 //
-// "Cluster", "your" and "computers." arrive from the left, from below and
+// "Yours.", "Mine." and "Ours." arrive from the left, from below and
 // from the right, stop just apart, then snap together with a little
 // overshoot. Sparks flash at the two joins and a violet pulse runs through
 // the words, as a message runs through a cluster. Then the subline and the
