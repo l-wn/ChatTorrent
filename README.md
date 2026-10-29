@@ -109,7 +109,7 @@ coding agent, and its license is AGPL. See
 How fast each chat writes, in tokens per second. Qwen3.8-27B q8 on two RTX
 3090s, either both in one PC or in two PCs, one in France and one in Spain.
 
-| | One PC | Two PCs, France and Spain |
+| | One PC | Two PCs, France and Spain (28ms apart) |
 |---|--:|--:|
 | One person chatting | **19.7 tok/s** | **8.1 tok/s** |
 | Twelve people chatting at once | **about 7 tok/s** | **about 5 tok/s** |
