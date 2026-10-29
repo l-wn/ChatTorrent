@@ -15,8 +15,8 @@
 // See docs/architecture.md (KV cache and admission, Routing, Failures).
 
 import { F32, makeStorage, makeReadback, readF32, gatherEmbedNoPos, rmsnorm, matmulNobias,
-         withPass, counters, copyF32, topkRows, topkPairs, roundF16 } from './kernels.js';
-import { block, makeCache, makeScratch, makeRecurrentState, recurrentStateBytes,
+         withPass, counters, copyF32, topkRows, topkPairs, roundF16, GEMV_ROWS_MAX } from './kernels.js';
+import { blockSegs, makeSegScratch, makeCache, makeScratch, makeRecurrentState, recurrentStateBytes,
          makePagePool, makeSessionFrame, ensurePages, freePages, makeReplayLayer,
          replayLayerBytes, mtpBlock, mtpChain, makeMtpScratch } from './model.js';
 import { makeGpuProf } from './gpuprof.js';
@@ -107,7 +107,7 @@ export class Runner {
     constructor(device, d, w, { lo, hi, have = hi, nMax, tMax, slots = 5,
                                 sessions = slots, pageTokens = PAGE_TOKENS,
                                 idleMs = IDLE_MS, waitMs = WAIT_MS, specSlots = slots,
-                                keepWarmMs = 0 }) {
+                                keepWarmMs = 0, batchRows = GEMV_ROWS_MAX }) {
         const [blockLo, blockHi] = blockRange(lo, hi, d.n_layer);
         const held = blockRange(lo, have, d.n_layer)[1] - blockLo;
         if (held !== w.layers.length) {
@@ -128,6 +128,13 @@ export class Runner {
         this.nMax = nMax;
         this.tMax = tMax;
         this.scratch = makeScratch(device, d, tMax, nMax);
+        // Batching (see #batchWith): the most rows one pass carries for
+        // several jobs. 1 turns it off. Capped where the projections stop
+        // giving each row a one-row call's bits (kernels.js GEMV_ROWS_MAX).
+        this.batchRows = Math.max(1, Math.min(batchRows, GEMV_ROWS_MAX, tMax));
+        // Rows the head may sample in one pass: a verify job's, or a batch's.
+        this.sampleRows = Math.max(SPEC_COLS, this.batchRows);
+        this.seg = this.batchRows > 1 ? makeSegScratch(device, d, this.batchRows, this.scratch) : null;
         this.ids = makeStorage(device, tMax * F32);          // token ids, for the embedding
         // Bytes of weights uploaded for this Runner, as measured by loader.js
         // (`weights.bytes`). Used by vramBytes.
@@ -194,7 +201,7 @@ export class Runner {
         // null until the first decode. With msPerPos it gives a job's cost.
         this.overheadMs = null;
         // How long jobs have waited in this runner's queue lately, averaged.
-        this.waitMs = 0;
+        this.queueAvgMs = 0;
         // When the last non-warm-up job ran. 0 until the first one.
         this.lastJobAt = 0;
 
@@ -210,7 +217,7 @@ export class Runner {
         // The waiting session whose jobs are back on the queue to be admitted.
         this.turn = null;
         this.counts = { admitted: 0, evicted: 0, cold: 0, released: 0, refused: 0, waited: 0,
-                        nospec: 0 };
+                        nospec: 0, batched: 0, batchedJobs: 0 };
 
         // Speculative decoding's replay slots (see #specSlot()): at most
         // `specSlots` sessions speculate through this Runner's linear_attention
@@ -240,7 +247,7 @@ export class Runner {
     // allocations, so it can be checked against a VRAM limit.
     get vramBytes() {
         let bytes = this.weightBytes + this.pool.bytes + this.scratch.bytes
-            + Math.max(this.tMax * F32, 16);
+            + Math.max(this.tMax * F32, 16) + (this.seg?.bytes ?? 0);
         for (const frame of this.free) bytes += frame.bytes;
         for (const frame of this.live.values()) bytes += frame.bytes;
         if (this.warm) bytes += this.warm.bytes;
@@ -272,11 +279,13 @@ export class Runner {
         this.mtpV = makeStorage(device, kv);
         this.mtpScratch = makeMtpScratch(device, d, m.draftVocab, this.tMax, this.nMax);
         this.mtpReadback = makeReadback(device, SPEC_COLS * F32);
+        this.mtpBatchIds = makeStorage(device, this.sampleRows * F32);    // a batch's ids, by row
         const row = d.hidden * F32;
         const frames = [...this.free, ...this.live.values()];
         for (const frame of frames) frame.mtpH = makeStorage(device, row);
         this.weightBytes += m.bytes ?? 0;
-        this.mtpBytes = 2 * kv + this.mtpScratch.bytes + SPEC_COLS * F32 + frames.length * row;
+        this.mtpBytes = 2 * kv + this.mtpScratch.bytes + (SPEC_COLS + this.sampleRows) * F32
+            + frames.length * row;
     }
 
     #mtpCache(frame) {
@@ -286,7 +295,8 @@ export class Runner {
 
     // After sampling `t` from row `a` of a job: keep that row's hidden state
     // and, when asked, chain drafts after `t`. Returns the drafts, or null.
-    async #mtpAfter(h, frame, a, t) {
+    // `rowOff` is the job's first row in the pass that ran it.
+    async #mtpAfter(h, frame, a, t, rowOff = 0) {
         const { device, d } = this;
         const ms = this.mtpScratch, H = d.hidden;
         const pos = h.past + a + 1;
@@ -295,7 +305,7 @@ export class Runner {
         device.queue.writeBuffer(ms.mtpIds, 0, new Float32Array([t]));
         const enc = device.createCommandEncoder({ label: 'mtp draft' });
         withPass(enc, (pass) => {
-            copyF32(device, pass, this.scratch.x, frame.mtpH, H, a * H, 0);
+            copyF32(device, pass, this.scratch.x, frame.mtpH, H, (rowOff + a) * H, 0);
             if (K > 0) mtpChain(device, pass, d, this.mtp, this.#mtpCache(frame), ms, frame.mtpH,
                                 ms.mtpIds, pos, K);
         }, 'mtp draft');
@@ -316,7 +326,7 @@ export class Runner {
     // alone how many of the verify's tokens survived. Full-attention KV is
     // addressed by position and needs nothing. A linear_attention block's
     // recurrent state folded every row in, so it is put back from the
-    // session's replay slot and the kept rows re-run (model.js linearBlock).
+    // session's replay slot and the kept rows re-run (model.js restoreSpec).
     //
     // Every piece of this is per session: the markers live on the session's
     // frame and the replay data in its own slot, so chats interleaving on one
@@ -396,22 +406,22 @@ export class Runner {
     }
 
     // GPU sampling's buffers (kernels.js topkRows): the two it ping-pongs
-    // between, and the readback of the candidates, sized for SPEC_COLS rows of
-    // TOPK_MAX. Made the first time this Runner samples.
+    // between, and the readback of the candidates, sized for `sampleRows` rows
+    // of TOPK_MAX. Made the first time this Runner samples.
     #topkBuffers() {
         if (this.topk) return this.topk;
-        const pairs = topkPairs(SPEC_COLS, this.d.vocab, TOPK_MAX) * 8;
-        const readback = SPEC_COLS * TOPK_MAX * 8;
+        const pairs = topkPairs(this.sampleRows, this.d.vocab, TOPK_MAX) * 8;
+        const readback = this.sampleRows * TOPK_MAX * 8;
         return this.topk = {
             a: makeStorage(this.device, pairs), b: makeStorage(this.device, pairs),
             readback: makeReadback(this.device, readback), bytes: 2 * pairs + readback,
         };
     }
 
-    // The buffer the head reads verify rows back into: SPEC_COLS logits rows,
-    // made the first time this Runner verifies.
+    // The buffer the head reads whole logits rows back into, `sampleRows` of
+    // them (a verify job's, or a batch's). Made the first time it is needed.
     #verifyReadback() {
-        return this.specReadback ??= makeReadback(this.device, SPEC_COLS * this.d.vocab * F32);
+        return this.specReadback ??= makeReadback(this.device, this.sampleRows * this.d.vocab * F32);
     }
 
     // The warm-up cache is sized for the blocks held, so growth replaces it.
@@ -613,13 +623,7 @@ export class Runner {
     // Queue one job. A job that finds no frame for its session is parked, so
     // the jobs behind it, which belong to other chats, are not delayed.
     #submit(job) {
-        this.#enqueue({
-            s: job.h.s, fill: !!job.h.fill,
-            run: () => this.#run(job.h, job.hidden, job.want, job.queuedAt).then(job.resolve, (err) => {
-                if (err === WAIT) this.#park(job);
-                else job.reject(err);
-            }),
-        });
+        this.#enqueue({ s: job.h.s, fill: !!job.h.fill, job });
     }
 
     // Run `fn` on the queue, after the work queued ahead of it. Resolves with
@@ -642,7 +646,8 @@ export class Runner {
     async #drain() {
         while (this.tasks.length) {
             const [task] = this.tasks.splice(this.#next(), 1);
-            try { await task.run(); } catch { /* a task reports its own failure */ }
+            const run = task.job ? this.#runJobs([task.job, ...this.#batchWith(task.job)]) : task.run();
+            try { await run; } catch { /* a task reports its own failure */ }
         }
         this.draining = false;
         for (const wake of this.onIdle.splice(0)) wake();
@@ -687,6 +692,39 @@ export class Runner {
     // keep each session's tasks, and every task with no session, in order.
     #next() {
         return 0;
+    }
+
+    // Batching: the queued jobs that run in one pass with `lead`, taken off
+    // the queue. Decode is bound by reading the weights, which a pass does
+    // once for all its rows, so several chats' tokens cost about what one
+    // does. A job joins if it enters at the same cursor and fits in
+    // `batchRows` with the others. Replays, prefill chunks, warm-ups and
+    // profiled jobs run alone. Order is kept: a session's later jobs never
+    // pass its earlier ones, and nothing passes a task with no session.
+    // Nothing waits for a batch to fill: jobs that arrive while a pass runs
+    // make the next one.
+    #batchWith(lead) {
+        if (this.batchRows < 2 || !this.#batchable(lead.h)) return [];
+        const seen = new Set([lead.h.s]);
+        const jobs = [];
+        let rows = lead.h.n;
+        for (let i = 0; i < this.tasks.length && rows < this.batchRows; i++) {
+            const task = this.tasks[i];
+            if (task.s === null) break;
+            const fits = !seen.has(task.s) && this.#batchable(task.job.h)
+                && task.job.h.pos === lead.h.pos && rows + task.job.h.n <= this.batchRows;
+            seen.add(task.s);
+            if (!fits) continue;
+            jobs.push(task.job);
+            rows += task.job.h.n;
+            this.tasks.splice(i--, 1);
+        }
+        return jobs;
+    }
+
+    #batchable(h) {
+        return h.s !== WARMUP && !h.replay && !h.fill && !h.prof
+            && Number.isInteger(h.n) && h.n >= 1 && h.n <= this.batchRows;
     }
 
     // The waiting list: jobs whose session has no frame yet, in arrival order.
@@ -846,7 +884,22 @@ export class Runner {
 
     // How long a job arriving now would wait, by recent jobs. Zero once the
     // runner has been quiet for ACTIVE_MS.
-    get queueMs() { return performance.now() - this.lastJobAt < ACTIVE_MS ? this.waitMs : 0; }
+    get queueMs() { return performance.now() - this.lastJobAt < ACTIVE_MS ? this.queueAvgMs : 0; }
+
+    // Where this runner's active sessions that entered at `pos` leave, and
+    // how many leave at each: cut -> count. Sessions with the same entry and
+    // cut can share a pass (#batchWith), so route.js puts a new session on
+    // the cut most of them use.
+    groups(pos) {
+        const now = performance.now();
+        const out = new Map();
+        for (const [s, frame] of this.live) {
+            if (!this.pending.has(s) && now - (frame.lastUse ?? 0) >= ACTIVE_MS) continue;
+            const to = this.cuts.get(s)?.get(pos);
+            if (to !== undefined) out.set(to, (out.get(to) ?? 0) + 1);
+        }
+        return out;
+    }
 
     #activity() {
         const now = performance.now();
@@ -1096,11 +1149,52 @@ export class Runner {
         log.len = need;
     }
 
-    async #run(h, hidden, want, queuedAt = performance.now()) {
-        const { device, d, scratch: s } = this;
+    // Run queued jobs, as one pass where they can share one. Each is prepared
+    // in turn. One that cannot run (no frame yet, a cold cache, a bad header)
+    // leaves the batch the way it would fail a pass of its own, and the rest
+    // run. Jobs that leave at different positions run as separate passes.
+    async #runJobs(jobs) {
+        let t0 = performance.now(), c0 = counters();
+        const groups = new Map();
+        for (const job of jobs) {
+            let plan;
+            try { plan = await this.#prepare(job.h, job.hidden, job.want); } catch (err) {
+                this.#failed(job, err);
+                continue;
+            }
+            const key = `${plan.to}:${plan.head}:${plan.filling}:${plan.spent}`;
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push({ job, plan });
+        }
+        for (const group of groups.values()) {
+            let results;
+            try {
+                results = await this.#pass(group.map((g) => g.plan), group.map((g) => g.job.queuedAt), t0, c0);
+            } catch (err) {
+                for (const { job } of group) this.#failed(job, err);
+                continue;
+            } finally {
+                t0 = performance.now();
+                c0 = counters();
+            }
+            group.forEach(({ job }, i) => {
+                if ('err' in results[i]) this.#failed(job, results[i].err);
+                else job.resolve(results[i].value);
+            });
+        }
+    }
+
+    #failed(job, err) {
+        if (err === WAIT) this.#park(job);
+        else job.reject(err);
+    }
+
+    // Check a job and get its session ready to run: the cut, the frame, the
+    // rows each block holds, the replay slot, the KV pages. Throws before
+    // anything changes if the job cannot run. Returns what #pass needs.
+    async #prepare(h, hidden, want) {
+        const { d } = this;
         const T = h.n, H = d.hidden;
-        const t0 = performance.now();
-        const c0 = counters();
 
         // When this peer last ran a non-warm-up job. engine.js's #growClaim()
         // backs off while jobs are arriving.
@@ -1209,24 +1303,62 @@ export class Runner {
             const m = candidatesFor(optsOf(i), d.vocab);
             M = m === null ? null : Math.max(M, m);
         }
+        return { h, hidden, T, at, to, first, last, head, filling, spent, gather, verify, drafts,
+                 cache, reset, spec, mtp, fill, sampled, optsOf, M };
+    }
+
+    // Encode, submit and read back one pass for prepared jobs that enter at
+    // the same cursor and leave at the same cut. Their rows are packed in
+    // order from row 0 (see model.js blockSegs). Returns one { value } or
+    // { err } per job.
+    async #pass(plans, queued, t0, c0) {
+        const { device, d, scratch: s } = this;
+        const H = d.hidden;
+        const one = plans.length === 1;
+        const { h: h0, at, to, first, last, head, filling, spent, gather } = plans[0];
+        let T = 0, sampled = 0;
+        for (const p of plans) {
+            p.rowOff = T;
+            p.sampledOff = sampled;
+            T += p.T;
+            sampled += p.sampled;
+        }
+        // Rows sampled in one pass share a top-M: the largest any row needs,
+        // or the whole row if any needs it.
+        let M = sampled ? 0 : null;
+        for (const p of plans) {
+            if (!p.sampled) continue;
+            M = M === null || p.M === null ? null : Math.max(M, p.M);
+        }
         const topk = M ? this.#topkBuffers() : null;
         let picked = null;
-        if (fill) device.queue.writeBuffer(this.mtpScratch.mtpIds, 0, Float32Array.from(h.ids));
+        const ms = this.mtpScratch;
+        if (one && plans[0].fill) device.queue.writeBuffer(ms.mtpIds, 0, Float32Array.from(h0.ids));
+        else if (plans.some((p) => p.fill)) {
+            for (const p of plans) {
+                if (p.fill) device.queue.writeBuffer(this.mtpBatchIds, p.rowOff * F32, Float32Array.from(p.h.ids));
+            }
+        }
 
         // writeBuffer is ordered on the queue, so these are applied before the
         // command buffer below runs.
-        if (gather) device.queue.writeBuffer(this.ids, 0, Float32Array.from(h.ids));
-        else        device.queue.writeBuffer(s.x, 0, hidden);
+        if (gather) device.queue.writeBuffer(this.ids, 0, Float32Array.from(plans.flatMap((p) => p.h.ids)));
+        else for (const p of plans) device.queue.writeBuffer(s.x, p.rowOff * H * F32, p.hidden);
 
         // GPU timing requested by the enqueuer (gpuprof.js). Not for a replay
-        // or a warm-up: neither produces a token.
-        const prof = h.replay || h.s === WARMUP ? null : makeGpuProf(device, h.prof);
+        // or a warm-up: neither produces a token. A job asking for it runs
+        // alone.
+        const prof = !one || h0.replay || h0.s === WARMUP ? null : makeGpuProf(device, h0.prof);
 
+        const segs = plans.map((p) => ({ cache: p.cache, T_past: p.h.past, n: p.T, rowOff: p.rowOff,
+                                         spec: p.spec }));
         const enc = device.createCommandEncoder({ label: `positions ${at}–${to - 1}` });
         // Clear recurrent state that holds rows when the job restarts from
         // `past` 0 (see #checkFed), before the pass that reads it.
-        for (const rc of reset) {
-            for (const buf of [rc.S, rc.histQ, rc.histK, rc.histV]) enc.clearBuffer(buf);
+        for (const p of plans) {
+            for (const rc of p.reset) {
+                for (const buf of [rc.S, rc.histQ, rc.histK, rc.histV]) enc.clearBuffer(buf);
+            }
         }
         withPass(enc, (pass) => {
             prof?.at('embed');
@@ -1242,7 +1374,7 @@ export class Runner {
             for (let p = first; p < last; p++) {
                 const layer = p - 1 - this.blockLo;
                 prof?.at(this.w.layers[layer].kind === 'linear_attention' ? 'linear' : 'full');
-                block(device, pass, d, this.w, layer, cache, s, T, h.past, spec);
+                blockSegs(device, pass, d, this.w, layer, segs, s, this.seg);
             }
 
             // Sample when the cut reaches the end of the line. A peer that
@@ -1251,12 +1383,20 @@ export class Runner {
             //
             // A verify samples every row. Any other job samples only its last,
             // so the head runs on that row alone. `s.down` is free once the
-            // blocks have run.
+            // blocks have run. A batch gathers every job's sampled rows there.
             if (head) {
                 prof?.at('head');
                 let src = s.x;
-                if (!verify && T > 1) {
-                    copyF32(device, pass, s.x, s.down, H, (T - 1) * H, 0);
+                if (one) {
+                    if (!plans[0].verify && T > 1) {
+                        copyF32(device, pass, s.x, s.down, H, (T - 1) * H, 0);
+                        src = s.down;
+                    }
+                } else {
+                    for (const p of plans) {
+                        copyF32(device, pass, s.x, s.down, p.sampled * H,
+                                (p.rowOff + p.T - p.sampled) * H, p.sampledOff * H);
+                    }
                     src = s.down;
                 }
                 rmsnorm(device, pass, src, this.w.norm, s.h, sampled, H, d.rms_eps);
@@ -1268,26 +1408,27 @@ export class Runner {
             // The MTP layer's KV for this job's positions. Row r pairs the
             // token at past + r with the trunk's hidden state at past + r - 1:
             // the session's kept row for r = 0, this job's rows after.
-            if (fill) {
-                const ms = this.mtpScratch;
-                copyF32(device, pass, cache.mtpH, ms.mtpIn, H);
-                if (T > 1) copyF32(device, pass, s.x, ms.mtpIn, (T - 1) * H, 0, H);
-                mtpBlock(device, pass, d, this.mtp, this.#mtpCache(cache), ms, ms.mtpIn,
-                         ms.mtpIds, T, h.past);
+            for (const p of plans) {
+                if (!p.fill) continue;
+                const off = p.rowOff * H;
+                if (!one) copyF32(device, pass, this.mtpBatchIds, ms.mtpIds, p.T, p.rowOff, 0);
+                copyF32(device, pass, p.cache.mtpH, ms.mtpIn, H);
+                if (p.T > 1) copyF32(device, pass, s.x, ms.mtpIn, (p.T - 1) * H, off, H);
+                mtpBlock(device, pass, d, this.mtp, this.#mtpCache(p.cache), ms, ms.mtpIn,
+                         ms.mtpIds, p.T, p.h.past);
                 // A prefill chunk samples nothing, so #mtpAfter does not run.
                 // Its last row is the next job's row 0.
-                if (filling) copyF32(device, pass, s.x, cache.mtpH, H, (T - 1) * H, 0);
+                if (filling) copyF32(device, pass, s.x, p.cache.mtpH, H, off + (p.T - 1) * H, 0);
             }
         }, `positions ${at}–${to - 1}`, prof);
 
         // The readback copy is on the same encoder, outside the pass, in the
-        // same submit. A job that ends at the head reads back the logits row
-        // it sampled, or every row of a verify job. A prefill chunk at the end
-        // reads back nothing. Any other job reads back the hidden state.
+        // same submit. A job that ends at the head reads back the logits rows
+        // it sampled (or their top M). A prefill chunk at the end reads back
+        // nothing. Any other job reads back the hidden state.
         const rowBytes = d.vocab * F32;
-        const rows = head && verify;
-        const bytes = topk ? sampled * M * 8 : rows ? T * rowBytes : head ? rowBytes : T * H * F32;
-        const readback = topk ? topk.readback : rows ? this.#verifyReadback() : s.readback;
+        const bytes = topk ? sampled * M * 8 : head ? sampled * rowBytes : T * H * F32;
+        const readback = topk ? topk.readback : head && sampled > 1 ? this.#verifyReadback() : s.readback;
         if (topk) {
             enc.copyBufferToBuffer(picked, 0, readback, 0, bytes);
         } else if (!spent && !filling) {
@@ -1298,17 +1439,22 @@ export class Runner {
         const t1 = performance.now();
         device.queue.submit([cmd]);
         const t2 = performance.now();
-        if (h.s !== WARMUP) {
+        if (!one) {
+            this.counts.batched++;
+            this.counts.batchedJobs += plans.length;
+        }
+        for (const { h, T: n, cache, verify } of plans) {
+            if (h.s === WARMUP) continue;
             for (let p = first; p < last; p++) {
-                cache.fed.set(p - 1, h.past + T);
-                if (verify) cache.specAt.set(p - 1, { base: h.past, n: T });
+                cache.fed.set(p - 1, h.past + n);
+                if (verify) cache.specAt.set(p - 1, { base: h.past, n });
                 else cache.specAt.delete(p - 1);
             }
         }
 
         // A replay that reached the end returns neither a token nor a hidden
         // state. route.js uses that to tell the three cases apart.
-        if (spent) return { at: to };
+        if (spent) return plans.map(() => ({ value: { at: to } }));
 
         // The timestamps are mapped in parallel with the readback, so
         // profiling adds no latency. The readback is read first. A prefill
@@ -1324,36 +1470,56 @@ export class Runner {
         }
         const t4 = performance.now();
         const gpu = prof?.collect();
+        const c1 = counters();
+        const pass = { out, M, topk, t0, t1, t2, t3, t4, c0, c1, gpu, batch: plans.length };
+        const results = [];
+        for (let i = 0; i < plans.length; i++) {
+            try { results.push({ value: await this.#finish(plans[i], queued[i], pass) }); }
+            catch (err) { results.push({ err }); }
+        }
+        return results;
+    }
+
+    // One job's part of a pass, after its readback: sample at the head, or
+    // log and hand on the rows it leaves with.
+    async #finish(p, queuedAt, { out, M, topk, t0, t1, t2, t3, t4, c0, c1, gpu, batch }) {
+        const { d } = this;
+        const H = d.hidden;
+        const { h, T, at, to, head, filling, verify, drafts, cache, mtp, optsOf } = p;
+        const tf = performance.now();
 
         // Where this job's time went, on this machine's clock. `encode` is the
         // CPU cost of launching the work (cache lookup, uploads, recording
         // dispatches). `wait` is from submit until the readback mapped. The
-        // counters are dispatches recorded and bind-group cache misses.
-        const c1 = counters();
+        // counters are dispatches recorded and bind-group cache misses. In a
+        // batch these are the pass's, shared by its jobs.
         const ms = (a, b) => Math.round((b - a) * 100) / 100;
         const phases = {
             queue: ms(queuedAt, t0), encode: ms(t0, t1), submit: ms(t1, t2),
             wait: ms(t2, t3), copy: ms(t3, t4),
             dispatches: c1.dispatches - c0.dispatches,
             bindGroups: c1.bindGroupsBuilt - c0.bindGroupsBuilt,
+            ...(batch > 1 && { batch }),
         };
+        const timed = () => this.#timed(h, queuedAt, t0, t3, to - at, batch);
         if (filling) {
-            this.#timed(h, queuedAt, t0, t3, to - at);
+            timed();
             return { at: to, filled: true, phases, ...(gpu && { gpu }) };
         }
 
-        // Sample row i of those read back: from its candidates, or from the
-        // whole logits row.
+        // Sample row i of this job's sampled rows: from its candidates, or
+        // from the whole logits row.
         const ids = topk ? new Uint32Array(out.buffer, out.byteOffset, out.length) : null;
         const sampleRow = (i) => {
-            if (!topk) return sampleFromLogitsRow(out.subarray(i * d.vocab, (i + 1) * d.vocab), optsOf(i));
+            const r = p.sampledOff + i;
+            if (!topk) return sampleFromLogitsRow(out.subarray(r * d.vocab, (r + 1) * d.vocab), optsOf(i));
             const c = [], v = [];
-            for (let m = 0; m < M; m++) { v.push(out[(i * M + m) * 2]); c.push(ids[(i * M + m) * 2 + 1]); }
+            for (let m = 0; m < M; m++) { v.push(out[(r * M + m) * 2]); c.push(ids[(r * M + m) * 2 + 1]); }
             return sampleFromCandidates(c, v, optsOf(i), d.vocab);
         };
 
         // `at` is the cursor's new position. The caller routes on it.
-        if (head && rows) {
+        if (head && verify) {
             // Row i predicts the token after ids[i]. Each is sampled exactly as
             // plain decoding would sample it: with the repetition summary for
             // the context up to it (`rowOpts[i - 1]`, built assuming the drafts
@@ -1366,10 +1532,10 @@ export class Runner {
                 tokens.push(t);
                 if (i === T - 1 || t !== drafts[i]) break;
             }
-            phases.sample = ms(t4, performance.now());
-            const next = mtp ? await this.#mtpAfter(h, cache, tokens.length - 1, tokens.at(-1)) : null;
-            if (mtp) phases.mtp = ms(t4, performance.now()) - phases.sample;
-            this.#timed(h, queuedAt, t0, t3, to - at);
+            phases.sample = ms(tf, performance.now());
+            const next = mtp ? await this.#mtpAfter(h, cache, tokens.length - 1, tokens.at(-1), p.rowOff) : null;
+            if (mtp) phases.mtp = ms(tf, performance.now()) - phases.sample;
+            timed();
             return { at: to, token: tokens[tokens.length - 1], tokens, phases, ...(gpu && { gpu }),
                      ...(next && { mtp: next }) };
         }
@@ -1378,28 +1544,31 @@ export class Runner {
             // token history by the enqueuer or by the head in a closed loop
             // (route.js's jobOpts()).
             const token = sampleRow(0);
-            phases.sample = ms(t4, performance.now());
-            const next = mtp ? await this.#mtpAfter(h, cache, T - 1, token) : null;
-            if (mtp) phases.mtp = ms(t4, performance.now()) - phases.sample;
-            this.#timed(h, queuedAt, t0, t3, to - at);
+            phases.sample = ms(tf, performance.now());
+            const next = mtp ? await this.#mtpAfter(h, cache, T - 1, token, p.rowOff) : null;
+            if (mtp) phases.mtp = ms(tf, performance.now()) - phases.sample;
+            timed();
             return { at: to, token, phases, ...(gpu && { gpu }), ...(next && { mtp: next }) };
         }
         // The rows leave as half bits, rounded once here: the next peer, the
         // boundary log and any replay of it all see the same values.
-        const bits = toF16(out);
+        const rows = batch > 1 ? out.subarray(p.rowOff * H, (p.rowOff + T) * H) : out;
+        const bits = toF16(rows);
         this.#log(h.s, to, h.past, bits);
-        phases.log = ms(t4, performance.now());
-        this.#timed(h, queuedAt, t0, t3, to - at);
+        phases.log = ms(tf, performance.now());
+        timed();
         return { at: to, hidden: bits, phases, ...(gpu && { gpu }), ...(h.s === WARMUP && { f32: out }) };
     }
 
     // Update the timings route.js balances on, after a job. `t0` is when it
     // left the queue and `t3` when its readback mapped; what follows is the
     // part that does not scale with positions.
-    #timed(h, queuedAt, t0, t3, positions) {
+    // A batch's pass time is shared by its jobs, so only a pass of one job
+    // updates the speed.
+    #timed(h, queuedAt, t0, t3, positions, batch = 1) {
         if (h.s === WARMUP || h.replay) return;
-        this.waitMs = 0.8 * this.waitMs + 0.2 * (t0 - queuedAt);
-        if (h.n !== 1 || positions < 1) return;
+        this.queueAvgMs = 0.8 * this.queueAvgMs + 0.2 * (t0 - queuedAt);
+        if (h.n !== 1 || positions < 1 || batch > 1) return;
         const per = (t3 - t0) / positions;
         const over = performance.now() - t3;
         // The first decode token replaces the warm-up estimate.

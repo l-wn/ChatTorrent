@@ -9,8 +9,8 @@
 //
 // One Engine is one mesh identity and one active generation at a time.
 
-import { adapterLabel } from './model/kernels.js';
-import { checkDims, scratchBytes } from './model/model.js';
+import { adapterLabel, GEMV_ROWS_MAX } from './model/kernels.js';
+import { checkDims, scratchBytes, segScratchBytes } from './model/model.js';
 import { loadManifest, loadBlock, loadEmbed, loadHead, loadMtp, dimsFromManifest } from './model/loader.js';
 import { Runner, KEEP_WARM_MS } from './model/stage.js';
 import { encode, decode, source as tokenizerSource } from './model/tokenizer.js';
@@ -77,6 +77,7 @@ export class Engine {
     #mtpTried = null;        // the runner the MTP head was last tried on
     #mtpWanted = false;      // load the MTP head at the head (constructor option)
     #keepWarm = true;        // run the keep-warm kernel while serving (constructor option)
+    #batch = true;           // run queued chats' jobs in one pass (constructor option)
     #sp = 0;                 // blocks/sec measured by warmup() in #fill()
     #lastStopReason = null;  // 'length' | 'context' | 'eos' | 'stopped', set by generate()
     #lastPromptTokens = 0;
@@ -96,10 +97,12 @@ export class Engine {
 
     // `mtp`: a runner holding the head also loads the MTP draft head, when
     // the checkpoint has one (on unless the page has ?mtp=0).
-    constructor({ onEvent = () => {}, mtp = false, warm = true } = {}) {
+    // `batch`: the runner batches jobs (stage.js #batchWith; off with ?batch=0).
+    constructor({ onEvent = () => {}, mtp = false, warm = true, batch = true } = {}) {
         this.#onEvent = onEvent;
         this.#mtpWanted = mtp;
         this.#keepWarm = warm;
+        this.#batch = batch;
     }
 
     // Test-only: build an Engine around an existing net/router/runner,
@@ -354,6 +357,7 @@ export class Engine {
             // cost and one end is assumed (a claim short of the whole model
             // holds at most one). The scratch is needed whatever is held.
             const fixed = scratchBytes(d, T_MAX, ctx)
+                + (this.#batch ? segScratchBytes(d, GEMV_ROWS_MAX) : 0)
                 + Math.max(endBytes(d, 'embed'), endBytes(d, 'head'));
             return clamp((vram - fixed) / blockBytes(d, { nMax: ctx, sessions, slots }));
         }
@@ -373,6 +377,7 @@ export class Engine {
         const runner = new Runner(device, d, { layers: [] },
             { lo, hi, have: lo, nMax: ctx, tMax: T_MAX, slots, sessions,
               keepWarmMs: this.#keepWarm ? KEEP_WARM_MS : 0,
+              ...(this.#batch ? {} : { batchRows: 1 }),
               ...(pageTokens ? { pageTokens } : {}),
               ...(waitMs !== undefined ? { waitMs } : {}) });
         const validation = await device.popErrorScope();

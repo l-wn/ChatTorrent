@@ -42,9 +42,10 @@ running a model instead of the pieces of a file.
 
 - **Built for many people at once.** Everyone gets their own chat, saved in
   their own browser. One cluster writes several replies at the same time,
-  each with its own KV cache on every machine, for up to 64 people. In a test
-  with twelve people on two RTX 3090s, 32 of 33 replies finished
-  ([numbers](#several-people-at-once)).
+  each with its own KV cache on every machine, for up to 64 people. Each
+  browser runs the waiting chats' next tokens as one GPU pass, so with twelve
+  people on two RTX 3090s, a reply still writes at 7.1 tok/s while 5 to 8
+  others are being written ([numbers](#several-people-at-once)).
 - **Nobody has to stay.** There is no host. Each piece of the model can be
   held by more than one browser. When someone leaves mid-reply, the browser
   before them replays the lost work into another holder, and the reply
@@ -132,17 +133,28 @@ Twelve people who only chat, arriving over 30 seconds, three prompts each,
 page defaults, both GPUs in one machine. Tokens per second for each reply, by
 how many replies were being written at the time:
 
-| Replies at once | Prompt lookup | Prompt lookup + MTP |
-|---|--:|--:|
-| 1 | 10.6 | **13.3** |
-| 2 | 4.6 | **10.6** |
-| 3 to 4 | 3.0 | 2.6 |
-| 5 to 8 | 2.2 | 2.7 |
+| Replies at once | Prompt lookup | Prompt lookup + MTP | + MTP, batched | Batched, two machines 28 ms apart |
+|---|--:|--:|--:|--:|
+| 1 | 10.6 | 13.3 | **13.9** | 9.0 |
+| 2 | 4.6 | 10.6 | 4.9 | 6.3 |
+| 3 to 4 | 3.0 | 2.6 | **7.2** | 5.9 |
+| 5 to 8 | 2.2 | 2.7 | **7.1** | 4.0 |
+| 9 to 16 | | | | 5.0 |
 
-Medians. With MTP, 32 of 33 replies finished, and the median first token
-came after 1 to 6 seconds. The GPUs share their time between everyone, so
-each reply slows as more run. Routing spreads chats across browsers that
-hold the same pieces of the model, so every GPU that joins takes a share.
+Medians. In the batched run all 36 replies finished, the median first token
+came after 2 to 5 seconds, and the cluster wrote 19.1 tok/s in total while any
+reply was being written, against 4.9 without batching. The "2 at once" row
+has only three replies. The last column is the same test with one RTX 3090
+in France and one in Spain, linked directly: all 36 replies finished, at
+16.0 tok/s in total.
+
+A browser runs the jobs of every chat waiting in its queue as one GPU pass of
+up to 32 rows. A pass costs about one read of the weights however many rows it
+carries (on an RTX 3090, 32 rows take twice as long as one), and each chat
+gets exactly the tokens it would get alone. Chats that run through the same
+browsers leave each one at the same place, so they share passes. Earlier runs
+had one to three replies that stalled for about five minutes before
+finishing, a bug being fixed.
 
 Measured with [`tools/load.mjs`](tools/load.mjs):
 

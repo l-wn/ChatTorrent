@@ -12,7 +12,7 @@
 // prefix. A repair or rebuild that drops or repeats part of the context gives
 // different tokens.
 
-import { Runner } from '../web/model/stage.js';
+import { Runner, ACTIVE_MS } from '../web/model/stage.js';
 import { makeGpu, D, DH, L, N, SINGLE, weightsFor, pieceFor, hybridWeightsFor } from './stub-gpu.mjs';
 import { SLOTS, coverage, served } from '../web/split.js';
 import { fromF16 } from '../web/f16.js';
@@ -153,6 +153,7 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null
         get overheadMs() { return real.overheadMs; },
         get active() { return real.active; },
         get queueMs() { return real.queueMs; },
+        groups: (pos) => real.groups(pos),
         resetTrace, takeTrace,
         holds: (p) => real.holds(p),
         append: (w) => real.append(w),
@@ -2642,22 +2643,35 @@ console.log('\nload-aware routing: sessions spread across peers that overlap');
         return () => [...seen.values()];
     };
 
-    // Idle: one chat takes the furthest exit, as routing always has.
+    // Idle. The first chat takes the furthest exit: peer 0 has no report of
+    // peer 1's speed yet. Once that chat is no longer active (ACTIVE_MS), the
+    // next one leaves earlier, at the exit that evens out the two peers'
+    // work, in the same two hops. Peer 0 holds 0-5 and peer 1 2-7 at equal
+    // speeds. Which exit exactly depends on peer 1's last report, which can
+    // still count the first chat.
     {
         const w = new World({ maxRepairs: 200 });
-        const cutsAt0 = recordCuts(w.join(0, 0, 6));
-        w.join(1, 2, N);
-        const got = await streamed(w.join(100), prompts[0], 10);
-        eq('idle: a lone chat matches its control', got, controls[0]);
-        eq('idle: it runs to the furthest exit, as before', cutsAt0(), [6]);
+        const p0 = w.join(0, 0, 6);
+        const p1 = w.join(1, 2, N);
+        fixSpeed(p0, 0.05, 0.03);
+        fixSpeed(p1, 0.05, 0.03);
+        const cutsAt0 = recordCuts(p0);
+        const asker = w.join(100);
+        eq('idle: a lone chat matches its control', await streamed(asker, prompts[0], 10), controls[0]);
+        await settleMs(ACTIVE_MS + 500);
+        eq('idle: so does the next, in a new chat',
+            await streamed(w.join(101), prompts[1], 10), controls[1]);
+        const [first, next] = cutsAt0();
+        eq('idle: the first takes the furthest exit', first, 6);
+        ok('idle: the next leaves earlier, evening out the work', next < 6 && next >= 4, String(next));
         ok('idle: nothing left running', await quiet(w));
     }
 
-    // Busy: four chats at once on a mesh already in use. Peer 0 alone holds
-    // the embedding, so it would run 0-5 for all of them. Balanced, later
-    // sessions leave it early and peer 1 takes more of the overlap. The peers
-    // warm up as loading does, which gives each a speed, and one chat runs
-    // first, whose acks tell peer 0 peer 1's speed and load.
+    // Busy: four chats at once on a mesh already in use. Every chat leaves
+    // peer 0 where the chat already running there does, so they can share
+    // passes on both peers (stage.js batching). The peers warm up as loading
+    // does, which gives each a speed, and one chat runs first, whose acks
+    // tell peer 0 peer 1's speed and load.
     {
         const w = new World({ maxRepairs: 200 });
         const p0 = w.join(0, 0, 6, { slots: 5 });
@@ -2676,9 +2690,7 @@ console.log('\nload-aware routing: sessions spread across peers that overlap');
         const got = await Promise.all(askers.map((a, i) => streamed(a, prompts[i], 10)));
         eq('busy: every reply is its own', got, controls);
         const cuts = cutsAt0();
-        ok('busy: sessions were cut at different places', new Set(cuts).size >= 2, JSON.stringify(cuts));
-        ok('busy: and peer 1 took more than the idle share',
-            cuts.reduce((n, c) => n + (N - c), 0) / cuts.length > N - 6, JSON.stringify(cuts));
+        eq('busy: every session leaves at one exit', new Set(cuts).size, 1);
         eq('busy: no ledger violations', w.violations, []);
         ok('busy: nothing left running', await quiet(w));
     }

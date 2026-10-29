@@ -323,26 +323,34 @@ Two invariants hold it up:
   no error.
 
 **Where a job stops** (`plan()`): decided on a session's first job at a peer,
-then pinned (see Cuts). On an idle mesh it is the furthest position this peer
-holds that someone else can pick up, preferring positions with an open link.
-Hops dominate decode latency, so running further is better, and stopping short
-lets the mesh route around a hole.
+then pinned (see Cuts). Only exits with an open link are candidates, and of
+those only the ones whose next peer reaches as far as the furthest exit's would,
+so the choice never adds a hop. Stopping short of the last position also lets
+the mesh route around a hole. Among the candidates:
 
-Under load it balances. Among the exits whose next peer reaches as far as the
-furthest exit's would, so balancing never adds a hop, it picks the one where
-the busier of the two peers ends up carrying least. A peer's busy time per
-token round is `n * o + w * p`: `n` active sessions (`Runner.active`: those
-that ran within `ACTIVE_MS`, 5 s, or have a job queued), `w` the positions they
-run there (`Runner.load`), `p` its ms per position (`Runner.msPerPos`), and `o`
-its fixed ms per job (`Runner.overheadMs`: reading back, sampling at the head,
-logging the hand-off). The fixed part is why a path through fewer, larger
-holders is cheaper. `p` is seeded from the warm-up pass each loaded position
-gets (the first, which compiles shaders, is skipped); real decode tokens
-replace it and measure `o`. Until every peer compared has a `p`, the idle path
-is taken: counted in positions, a slow peer would look as fast as a quick one.
-An earlier exit, which hands the next peer more, is skipped when that peer's
-measured queue wait (`Runner.queueMs`) is more than 20 ms longer than mine:
-the queue is measured, the model is an estimate.
+- **Join.** If sessions running here from the same cursor already leave at one
+  of them, the one most of them use (`Runner.groups()`, plus sessions planned
+  and not yet run). Sessions with the same entry and exit share GPU passes
+  here and at the next peer (see Batching), so another one costs almost
+  nothing. Splitting them across exits would halve every pass.
+- **Balance.** Otherwise the exit after which the busier of the two peers
+  carries least. A lone chat crosses the same positions in the same hops
+  whatever the exit, so this costs it nothing, and a pipeline of peers is not
+  held up by one of them.
+- **Furthest**, until every peer compared has a measured speed: counted in
+  positions, a slow peer would look as fast as a quick one.
+
+A peer's busy time per token round is `n * o + w * p`: `n` active sessions
+(`Runner.active`: those that ran within `ACTIVE_MS`, 5 s, or have a job
+queued), `w` the positions they run there (`Runner.load`), `p` its ms per
+position (`Runner.msPerPos`), and `o` its fixed ms per job
+(`Runner.overheadMs`: reading back, sampling at the head, logging the
+hand-off). The fixed part is why a path through fewer, larger holders is
+cheaper. `p` is seeded from the warm-up pass each loaded position gets (the
+first, which compiles shaders, is skipped); real decode tokens replace it and
+measure `o`. An earlier exit, which hands the next peer more, is skipped when
+that peer's measured queue wait (`Runner.queueMs`) is more than 20 ms longer
+than mine: the queue is measured, the model is an estimate.
 
 Every ack carries the receiver's `w`, `n`, `p`, `o` and `q` (its queue wait),
 so a peer learns the load of exactly the peers it hands work to, once per
@@ -531,6 +539,33 @@ the first token and opens the loop.
   tiling or double buffering. pooled's register-tiled, double-buffered GEMM
   made its prefill pass 1.64x faster.
 
+**Batching** (`Runner.#batchWith`). Decode is bound by reading the weights,
+and a pass reads a peer's weights once however many rows it carries. So when a
+runner takes a job off its queue, it also takes the other queued jobs that can
+share its pass, and runs them together:
+
+- A job joins if it enters at the same cursor and the pass stays within
+  `batchRows` rows (32, `GEMV_ROWS_MAX`, so about four chats' 8-row verify
+  jobs). Jobs that leave at different cuts are split into separate passes. A
+  verify job counts all its rows.
+- Replays, prefill chunks, warm-ups and profiled jobs run alone.
+- Order is kept: a session's later job never passes its earlier one, and no
+  job passes a queued task with no session (a release, the waiting list's
+  barrier). At most one job per session joins a pass.
+- Nothing waits for a batch to fill. Jobs that arrive while a pass runs make
+  up the next one, so a lone chat is not slowed.
+- Each job is prepared on its own first (`#prepare`: its frame, rows, replay
+  slot and pages). One that cannot run leaves the batch with the error it
+  would have had alone, and the rest run.
+- Each job gets the bits it gets alone (model.md, Batching several sessions
+  in one pass), so a reply does not depend on who else is chatting.
+- At the head, every job's sampled rows go through one LM head, and each job
+  samples its own.
+
+`?batch=0` on the mesh page runs every job in a pass of its own. A batched
+job's profile shows `batch`, the jobs its pass carried, and the runner counts
+`batched` passes and the `batchedJobs` in them.
+
 **Sampling** happens on the peer holding the head, which has the logits but no
 token ids. Each job's `opts` carry a short repetition summary (`jobOpts()`,
 built from `penaltyState()`): the most repeated recent ids with counts, and the
@@ -576,7 +611,7 @@ the last draft, is the next token. The `tok` carries `tokens`: the accepted
 drafts and that token, cut after end-of-text. Accepted drafts spend the loop's
 budget and reach the enqueuer as fed answers.
 
-**Rollback** (`Runner.#checkFed`, `model.js` `linearBlock`). The next job
+**Rollback** (`Runner.#checkFed`, `model.js` `restoreSpec`). The next job
 starts at `past + tokens.length`, so each block tells from `past` alone how
 many of the verify's rows the session keeps. A full-attention block's KV is
 addressed by position and needs nothing. A linear_attention block's recurrent
@@ -740,6 +775,12 @@ Known gaps:
 - One job queue per runner, first come first served, so a long prompt's
   prefill chunks delay other chats' decode jobs on the same peers (by at most
   `PREFILL_WINDOW` chunks each).
+- Routing's cost model counts one pass per active session (`n * o + w * p`).
+  With batching, a busy peer runs several sessions per pass, so the model
+  overstates its load. It only decides where a new group of sessions leaves;
+  later sessions join that group.
+- The MTP head's drafts (`Runner.#mtpAfter`) run after the readback as one
+  small submit per session, even for the jobs of a batch.
 - A session waiting for a frame at one peer is idle at the peers before it, and
   can lose its frame there if it waits past `IDLE_MS`; its next job then comes
   back `no longer cached` and the chat is rebuilt.
@@ -790,7 +831,8 @@ npm run test:gpu    builds a tiny model (tools/tinymodel.mjs) and runs
   including rooms kept disjoint, the join, the caps, a log that never carries a
   token, and a Mesh that refuses unsealed offers and a mesh it did not ask for.
 - `stage.test.mjs`: a chain of Runners over a stub GPU, against the single-tab
-  dispatch order, for every way of cutting the line.
+  dispatch order, for every way of cutting the line. Also which queued jobs
+  share a pass, and that each gets its own rows and tokens back.
 - `mesh.test.mjs`: N routers over N Runners on a simulated wire, with a digest
   model standing in for the numbers. It covers repairs, rebuilds, evictions and
   growth, plus a seeded soak that kills peers at random (`--seed N` to
@@ -827,7 +869,10 @@ npm run test:gpu    builds a tiny model (tools/tinymodel.mjs) and runs
 `web/dev.html` runs the kernel tests, the speculative decoding tests
 (`web/dev/spec.test.js`: a DeltaNet block that verifies n rows and keeps k
 holds the state and gives the output of k plain steps, to the bit, at small
-and at Qwen3.8-27B's head shapes, sessions interleaved), the smoke check, the
+and at Qwen3.8-27B's head shapes, sessions interleaved), the batching tests
+(`web/dev/batch.test.js`: sessions run as one pass get, to the bit, the output
+rows, KV and recurrent state they get alone, with a verify and a rollback
+inside the batch, for f32 and q8 weights), the smoke check, the
 tokenizer self-test, and a full oracle diff and generation in one tab. Parameters:
 `?weights=<url>`, `?oracle=<url>`, `?stream=1` (verify a block at a time, for
 a model larger than this GPU), `?decodeSteps=N`, `?bench=…`. The oracle dumps in

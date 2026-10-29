@@ -502,13 +502,22 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>,
 
 // --- a few rows (batched GEMV) ---
 //
-// For 2 <= M <= GEMV_ROWS_MAX: a speculative verify job or a short prefill
-// tail. The GEMV above with R rows per workgroup: each weight is read once and
-// used for every row. Each row's arithmetic is the GEMV's (the same lane
-// split, the same accumulation expression, the same reduction tree), so every
-// row is bit-identical to a one-row call. That is what makes a verified token
-// the token plain decoding would have produced.
-export const GEMV_ROWS_MAX = 8;
+// For 2 <= M <= GEMV_ROWS_MAX: a speculative verify job, a batch of several
+// chats' jobs, or a short prefill tail. The GEMV above with R rows per
+// workgroup: each weight is read once and used for every row. Each row's
+// arithmetic is the GEMV's (the same lane split, the same accumulation
+// expression, the same reduction tree), so every row is bit-identical to a
+// one-row call. That is what makes a verified token the token plain decoding
+// would have produced, and a batched chat's token the one it gets alone.
+//
+// The reduction runs RED_ROWS rows at a time through one shared buffer, so
+// the workgroup memory stays within WebGPU's default 16 KiB at any R. Up to
+// RED_ROWS rows R is M. Past it R is M rounded up to a multiple of RED_ROWS,
+// so few variants are compiled, and rows from M on are not stored. Past
+// RED_ROWS q8 weights use matmulRowsQ8Src below, which is faster there.
+export const GEMV_ROWS_MAX = 32;
+const RED_ROWS = 8;
+export const gemvRows = (M) => (M <= RED_ROWS ? M : Math.ceil(M / RED_ROWS) * RED_ROWS);
 
 export const matmulGemvRowsSrc = (f16, vec4, R) =>
     memoSrc(`matmul_gemv_rows:${f16}:${vec4}:${R}`, () => /* wgsl */ `${wEnable(f16)}
@@ -524,7 +533,8 @@ ${vec4 ? `
 @group(0) @binding(3) var<uniform>             u: U;
 
 const R = ${R}u;
-var<workgroup> red: array<f32, ${GEMV_WG * R}u>;
+const RED = ${Math.min(R, 8)}u;
+var<workgroup> red: array<f32, ${GEMV_WG * Math.min(R, 8)}u>;
 
 @compute @workgroup_size(${GEMV_WG})
 fn main(@builtin(workgroup_id) wg: vec3<u32>,
@@ -553,19 +563,23 @@ ${vec4 ? `
 `}
     }
 
-    for (var r = 0u; r < R; r++) { red[r * ${GEMV_WG}u + tid] = acc[r]; }
-    workgroupBarrier();
-    for (var s = ${GEMV_LANES}u / 2u; s > 0u; s >>= 1u) {
-        if (lane < s) {
-            for (var r = 0u; r < R; r++) {
-                red[r * ${GEMV_WG}u + tid] += red[r * ${GEMV_WG}u + tid + s];
+    for (var r0 = 0u; r0 < R; r0 += RED) {
+        for (var r = 0u; r < RED; r++) { red[r * ${GEMV_WG}u + tid] = acc[r0 + r]; }
+        workgroupBarrier();
+        for (var s = ${GEMV_LANES}u / 2u; s > 0u; s >>= 1u) {
+            if (lane < s) {
+                for (var r = 0u; r < RED; r++) {
+                    red[r * ${GEMV_WG}u + tid] += red[r * ${GEMV_WG}u + tid + s];
+                }
+            }
+            workgroupBarrier();
+        }
+        if (lane == 0u && liveCol) {
+            for (var r = 0u; r < RED; r++) {
+                if (r0 + r < u.M) { Y[(r0 + r) * u.N + col] = red[r * ${GEMV_WG}u + tid]; }
             }
         }
         workgroupBarrier();
-    }
-
-    if (lane == 0u && liveCol) {
-        for (var r = 0u; r < R; r++) { Y[r * u.N + col] = red[r * ${GEMV_WG}u + tid]; }
     }
 }
 `);
@@ -585,7 +599,8 @@ struct U { M: u32, K: u32, N: u32, _p: u32 }
 @group(0) @binding(4) var<storage, read>       S: array<f32>;
 
 const R = ${R}u;
-var<workgroup> red: array<f32, ${WG * R}u>;
+const RED = ${Math.min(R, 8)}u;
+var<workgroup> red: array<f32, ${WG * Math.min(R, 8)}u>;
 
 @compute @workgroup_size(${WG})
 fn main(@builtin(workgroup_id) wg: vec3<u32>,
@@ -613,19 +628,123 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>,
         }
     }
 
-    for (var r = 0u; r < R; r++) { red[r * ${WG}u + tid] = acc[r]; }
-    workgroupBarrier();
-    for (var s = ${LANES}u / 2u; s > 0u; s >>= 1u) {
-        if (lane < s) {
-            for (var r = 0u; r < R; r++) {
-                red[r * ${WG}u + tid] += red[r * ${WG}u + tid + s];
+    for (var r0 = 0u; r0 < R; r0 += RED) {
+        for (var r = 0u; r < RED; r++) { red[r * ${WG}u + tid] = acc[r0 + r]; }
+        workgroupBarrier();
+        for (var s = ${LANES}u / 2u; s > 0u; s >>= 1u) {
+            if (lane < s) {
+                for (var r = 0u; r < RED; r++) {
+                    red[r * ${WG}u + tid] += red[r * ${WG}u + tid + s];
+                }
+            }
+            workgroupBarrier();
+        }
+        if (lane == 0u && liveCol) {
+            for (var r = 0u; r < RED; r++) {
+                if (r0 + r < u.M) { Y[(r0 + r) * u.N + col] = red[r * ${WG}u + tid]; }
+            }
+        }
+        workgroupBarrier();
+    }
+}
+`;
+    });
+
+// --- many rows, q8 (batched decode) ---
+//
+// The q8 GEMV for 9 to GEMV_ROWS_MAX rows, each row bit-identical to a
+// one-row call. matmulGemvRowsQ8Src has every thread read its rows of X from
+// memory for every weight word, which past ~8 rows costs more than reading
+// the weights. Here the workgroup stages ROWS_KCW words of every row of X in
+// workgroup memory at a time, and threads read them from there. On a 1070 Ti
+// at Qwen3.8-27B's gate shape, 16 rows then take what 8 do and 32 rows twice
+// that, against 5x for the plain rows kernel.
+//
+// Per (row, column) the arithmetic is the GEMV's: lane `l` of LANES takes
+// words g * LANES + l for g in increasing order, accumulates
+// `acc += scale * dot(x, q)`, and the lanes are summed by the same tree, 8
+// rows at a time. Only where X is read from changes.
+//
+// R is a multiple of 8 (gemvRows). Rows from M on are computed on whatever X
+// holds there and not stored.
+const ROWS_WORDS = 16;                       // words of X staged per row
+const rowsKcw = (group) => Math.max(group / 4, ROWS_WORDS);
+// Whether the staged X and the reduction fit WebGPU's default 16 KiB of
+// workgroup memory. If not, matmulNobias uses matmulGemvRowsQ8Src.
+export const rowsQ8Fits = (group, R) => R * rowsKcw(group) * 16 + 256 * 8 * 4 <= 16384;
+
+export const matmulRowsQ8Src = (group, R) =>
+    memoSrc(`matmul_rows_q8:${group}:${R}`, () => {
+        const LANES = group / 4;
+        const COLS  = Math.floor(256 / LANES);
+        const WG    = LANES * COLS;
+        const KCW   = rowsKcw(group);
+        return /* wgsl */ `
+struct U { M: u32, K: u32, N: u32, _p: u32 }
+@group(0) @binding(0) var<storage, read>       X: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       W: array<u32>;
+@group(0) @binding(2) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(3) var<uniform>             u: U;
+@group(0) @binding(4) var<storage, read>       S: array<f32>;
+
+const R = ${R}u;
+var<workgroup> red: array<f32, ${WG * 8}u>;
+var<workgroup> xs: array<vec4<f32>, ${R * KCW}u>;
+
+@compute @workgroup_size(${WG})
+fn main(@builtin(workgroup_id) wg: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid  = lid.x;
+    let lane = tid % ${LANES}u;
+    let col  = wg.x * ${COLS}u + tid / ${LANES}u;
+    let liveCol = col < u.N;
+
+    let K4     = u.K / 4u;
+    let nGroup = (u.K + ${group}u - 1u) / ${group}u;
+    let wBase  = col * K4;
+    let sBase  = col * nGroup;
+
+    var acc: array<f32, ${R}>;
+    for (var r = 0u; r < R; r++) { acc[r] = 0.0; }
+
+    for (var k0 = 0u; k0 < K4; k0 += ${KCW}u) {
+        for (var i = tid; i < ${R * KCW}u; i += ${WG}u) {
+            let w = k0 + i % ${KCW}u;
+            xs[i] = select(vec4<f32>(0.0), X[(i / ${KCW}u) * K4 + w], w < K4);
+        }
+        workgroupBarrier();
+        if (liveCol) {
+            for (var j = 0u; j < ${KCW / LANES}u; j++) {
+                let idx = k0 + j * ${LANES}u + lane;
+                if (idx < K4) {
+                    let q  = vec4<f32>(unpack4xI8(W[wBase + idx]));
+                    let sc = S[sBase + idx / ${LANES}u];
+                    for (var r = 0u; r < R; r++) {
+                        acc[r] += sc * dot(xs[r * ${KCW}u + j * ${LANES}u + lane], q);
+                    }
+                }
             }
         }
         workgroupBarrier();
     }
 
-    if (lane == 0u && liveCol) {
-        for (var r = 0u; r < R; r++) { Y[r * u.N + col] = red[r * ${WG}u + tid]; }
+    for (var r0 = 0u; r0 < R; r0 += 8u) {
+        for (var r = 0u; r < 8u; r++) { red[r * ${WG}u + tid] = acc[r0 + r]; }
+        workgroupBarrier();
+        for (var s = ${LANES}u / 2u; s > 0u; s >>= 1u) {
+            if (lane < s) {
+                for (var r = 0u; r < 8u; r++) {
+                    red[r * ${WG}u + tid] += red[r * ${WG}u + tid + s];
+                }
+            }
+            workgroupBarrier();
+        }
+        if (lane == 0u && liveCol) {
+            for (var r = 0u; r < 8u; r++) {
+                if (r0 + r < u.M) { Y[(r0 + r) * u.N + col] = red[r * ${WG}u + tid]; }
+            }
+        }
+        workgroupBarrier();
     }
 }
 `;
@@ -1765,8 +1884,12 @@ export function matmulNobias(device, pass, X, W, Y, M, K, N) {
     // Three weight formats and three shapes. Each combination is a separate
     // compiled source, not a branch in the shader.
     if (q8) {
+        // Past 8 rows, the kernel that stages X in workgroup memory.
+        const R = gemvRows(M);
+        const many = rows && M > 8 && rowsQ8Fits(q8.group, R);
         const p  = getPipeline(device, gemv ? matmulGemvQ8Src(q8.group)
-                                     : rows ? matmulGemvRowsQ8Src(q8.group, M)
+                                     : many ? matmulRowsQ8Src(q8.group, R)
+                                     : rows ? matmulGemvRowsQ8Src(q8.group, R)
                                             : matmulTiledQ8Src(q8.group));
         const u  = uniform(device, u4(M, K, N));
         const bg = bind(device, p, [X, W, Y, u, q8.scales]);
@@ -1781,7 +1904,7 @@ export function matmulNobias(device, pass, X, W, Y, M, K, N) {
 
     // vec4 whenever K is a multiple of 4, which holds for every real checkpoint.
     const p  = getPipeline(device, gemv ? matmulGemvSrc(isF16(W), K % 4 === 0)
-                                 : rows ? matmulGemvRowsSrc(isF16(W), K % 4 === 0, M)
+                                 : rows ? matmulGemvRowsSrc(isF16(W), K % 4 === 0, gemvRows(M))
                                         : matmulTiledSrc(isF16(W)));
     const u  = uniform(device, u4(M, K, N));
     const bg = bind(device, p, [X, W, Y, u]);

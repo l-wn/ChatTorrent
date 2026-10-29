@@ -203,6 +203,46 @@ export async function benchForward(device, d, w, { T_new = 1, T_past = 0, N_max 
     }
 }
 
+// --- Rows: one q8 matmul at 1 to 64 rows ---
+//
+// What batching and speculative decoding cost on the projections: one q8
+// matmul (group 32, random weights) at Qwen3.8-27B's shapes, for each row
+// count. Up to GEMV_ROWS_MAX rows each row is bit-identical to a one-row call
+// (kernels.test.js checks it); past it the tiled kernel runs.
+const ROWS_SHAPES = [['gate/up', 5120, 17408], ['down', 17408, 5120], ['q/z', 5120, 6144]];
+const ROWS_COUNTS = [1, 2, 4, 8, 12, 16, 24, 32, 64];
+
+export async function benchRows(device) {
+    const out = [];
+    for (const [name, Kd, N] of ROWS_SHAPES) {
+        const data = new Uint8Array(N * Kd);
+        for (let o = 0; o < data.length; o += 65536) {
+            crypto.getRandomValues(data.subarray(o, Math.min(o + 65536, data.length)));
+        }
+        const W = K.uploadQ8(device, data, new Float32Array(N * Math.ceil(Kd / 32)).fill(1e-3), 32);
+        const X = K.makeStorage(device, 64 * Kd * F32), Y = K.makeStorage(device, 64 * N * F32);
+        const row = [];
+        for (const M of ROWS_COUNTS) {
+            const t = await timeKernel(device, `${name} ${M}`,
+                (e) => K.matmulNobias(device, e, X, W, Y, M, Kd, N), { iters: 16 });
+            row.push({ M, ms: t.ok ? t.gpuMs : NaN });
+        }
+        out.push({ name, Kd, N, row });
+        W.destroy(); X.destroy(); Y.destroy();
+    }
+    return out;
+}
+
+export function formatRowsBench(out) {
+    const lines = ['\n--- q8 matmul by rows (ms; per row in brackets) ---',
+        `  ${'shape'.padEnd(20)} ${ROWS_COUNTS.map((M) => pad(M, 13)).join('')}`];
+    for (const { name, Kd, N, row } of out) {
+        lines.push(`  ${`${name} ${Kd}→${N}`.padEnd(20)} ` + row.map(({ M, ms }) =>
+            pad(`${ms.toFixed(2)} (${(ms / M).toFixed(2)})`, 13)).join(''));
+    }
+    return lines.join('\n');
+}
+
 // --- Reporting ---
 
 const pad = (v, n) => String(v).padStart(n);

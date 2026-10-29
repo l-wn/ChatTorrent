@@ -774,12 +774,18 @@ export function makeRouter({
     // Where to hand the session on. Decided on its first job here and pinned
     // (Runner.#exit), so a session keeps its path.
     //
-    // On an idle mesh: the furthest position I hold that another peer can
-    // pick up, because hop count dominates decode latency. Under load: the
-    // exit that evens out my work and the next peer's, among the exits whose
-    // next peer reaches as far as the furthest one's, so balancing never adds
-    // a hop. Stopping short of my last position also routes around a hole at
-    // my boundary.
+    // Only exits whose next peer reaches as far as the furthest exit's are
+    // considered, so the choice never adds a hop. Among them:
+    // - If sessions running here from `pos` already leave somewhere, the
+    //   exit most of them use. Sessions with the same entry and exit share
+    //   GPU passes here and at the next peer (stage.js batching), so joining
+    //   them costs almost nothing, and a split would halve every pass.
+    // - Otherwise the exit that evens out my work per token and the next
+    //   peer's, so a pipeline of peers is not held up by one of them. A lone
+    //   chat crosses the same positions in the same hops whatever the exit.
+    // - With a speed unknown, the furthest exit.
+    // Stopping short of my last position also routes around a hole at my
+    // boundary.
     function plan(h) {
         const pos = h.pos;
         const r = runner();
@@ -824,11 +830,21 @@ export function makeRouter({
             assign(c.who, net.reach(c.who, c.at));
             return c.at;
         };
-        if (me.w === 0 && them.every((l) => l.w === 0)) return take(far);
+        // Join the exit the sessions running here from `pos` use, including
+        // ones planned and not yet run. Ties go to the further exit.
+        const groups = r.groups?.(pos) ?? new Map();
+        for (const x of planned.values()) {
+            if (x.pos === pos && performance.now() - x.at < ASSIGN_TTL_MS) {
+                groups.set(x.cut, (groups.get(x.cut) ?? 0) + 1);
+            }
+        }
+        let join = null;
+        for (const c of ok) if ((groups.get(c.at) ?? 0) > (groups.get(join?.at) ?? 0)) join = c;
+        if (join) return take(join);
 
         // Balancing needs every peer's measured speed. Counted in positions,
         // a slow peer looks as fast as a quick one, so until then the path is
-        // the idle one.
+        // the furthest.
         const timed = me.p != null && them.every((l) => l.p != null);
         if (!timed) return take(far);
 

@@ -9,6 +9,7 @@
 //   node tools/mesh.gpu.test.mjs --show              stream every peer's console
 //   node tools/mesh.gpu.test.mjs --round-trip        every row without the closed loop
 //   node tools/mesh.gpu.test.mjs --long              prompts of several T_MAX chunks
+//   node tools/mesh.gpu.test.mjs --no-batch          every job in a pass of its own
 //   node tools/mesh.gpu.test.mjs --fuzz 12 --seed 3  random scenarios, each replayed
 //                                                    against a one-peer reference
 //
@@ -50,6 +51,8 @@ const FUZZ     = Number(opt('fuzz', 0));
 const LONG     = has('long');
 // Run every row on the round trip, to compare with the closed loop.
 const ROUND_TRIP = has('round-trip');
+// Turn off batching on every worker (?batch=0), to compare with it on.
+const NO_BATCH = has('no-batch');
 
 if (!['rtc', 'bc'].includes(WIRE)) {
     console.error(`--wire ${WIRE}: expected rtc or bc`);
@@ -534,7 +537,8 @@ async function runScenario(browser, base, scenario, reference) {
                                         : `role=worker&floor=${scenario.floor ?? 1}`)
             + (scenario.sessions ? `&sessions=${scenario.sessions}` : '')
             + (scenario.waitMs !== undefined ? `&wait=${scenario.waitMs}` : '')
-            + (scenario.pageTokens ? `&pages=${scenario.pageTokens}` : '');
+            + (scenario.pageTokens ? `&pages=${scenario.pageTokens}` : '')
+            + (NO_BATCH ? '&batch=0' : '');
 
         const peers = [];
         for (let i = 0; i < workers.length; i++) {
@@ -1156,6 +1160,14 @@ function check(row, reference) {
         console.log(`    closed loop: the head fed ${closed} of ${feedable} tokens`);
     }
 
+    // Batching (stage.js #batchWith): passes that carried more than one job.
+    // Shown for every row. Not asserted: whether two chats' jobs meet in a
+    // queue depends on timing, and on the tiny model a pass is short.
+    const runners = (row.stats ?? []).filter((s) => s.runner);
+    const batched = runners.reduce((n, s) => n + (s.runner.batched ?? 0), 0);
+    const batchedJobs = runners.reduce((n, s) => n + (s.runner.batchedJobs ?? 0), 0);
+    if (batched) console.log(`    batching: ${batched} passes carried ${batchedJobs} jobs`);
+
     const ladder = all.flatMap((r) => r.events ?? []);
     const repairs = ladder.filter((e) => e === 'repair').length;
     const fixes = ladder.filter((e) => e === 'fix').length;
@@ -1330,7 +1342,8 @@ function verdict(rows, reference) {
             ? `${w[0].runner.pagesTotal} pages x ${w[0].runner.pageTokens} tok` : '';
         console.log(`${row.name.padEnd(12)} KV pool: ${sum('admitted')} admitted, ` +
             `${sum('released')} released, ${sum('evicted')} evicted, ` +
-            `${sum('cold')} cold (${w.length} workers, ${vram} MiB each, ${pages})`);
+            `${sum('cold')} cold, ${sum('batched')} batched passes ` +
+            `(${w.length} workers, ${vram} MiB each, ${pages})`);
     }
 
     const pressure = rows.flatMap((row) => row.stats.filter((s) => s.runner)
@@ -1355,7 +1368,7 @@ function verdict(rows, reference) {
     console.log(`\n${pass} passed, ${fail} failed`);
     if (fail) {
         console.log(`reproduce with:  node tools/mesh.gpu.test.mjs --wire ${WIRE} ` +
-            `--prompts ${PROMPTS} --tokens ${TOKENS} --seed ${SEED}`);
+            `--prompts ${PROMPTS} --tokens ${TOKENS} --seed ${SEED}${NO_BATCH ? ' --no-batch' : ''}`);
     }
 }
 

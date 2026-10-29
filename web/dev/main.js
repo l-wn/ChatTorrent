@@ -17,8 +17,9 @@
 import { DIMS, adapterLabel } from '../model/kernels.js';
 import { runAllTests } from './kernels.test.js';
 import { runSpecTests } from './spec.test.js';
+import { runBatchTests } from './batch.test.js';
 import { runMtpTests } from './mtp.test.js';
-import { benchKernels, benchForward, formatRows, formatForward } from './bench.js';
+import { benchKernels, benchForward, formatRows, formatForward, benchRows, formatRowsBench } from './bench.js';
 import { smokeForward } from './smoke.js';
 import { checkDims, makeCache, makeScratch, weightBudget } from '../model/model.js';
 import { loadWeights, loadManifest, activeWeights, dimsFromManifest, checkManifest } from '../model/loader.js';
@@ -256,10 +257,13 @@ async function main(device) {
     const kernelsOk = logRows('kernel tests', kernels.rows);
     logRows('speculative decoding (bitwise against plain decoding)', (await runSpecTests(device)).rows);
     logRows('MTP draft head (plumbing, random weights)', (await runMtpTests(device)).rows);
+    logRows('batching (bitwise against one job at a time)', (await runBatchTests(device)).rows);
 
     // Runs before the smoke test and the weights: the bench builds its own
     // fixture.
-    if (BENCH) await runBenchmarks(device, benchDims(BENCH, DIMS));
+    // ?bench=rows: q8 matmuls at Qwen3.8-27B's shapes by row count instead.
+    if (BENCH === 'rows') log(formatRowsBench(await benchRows(device)));
+    else if (BENCH) await runBenchmarks(device, benchDims(BENCH, DIMS));
     const archOk = logRows('architecture smoke (TINY config, random weights)',
         (await smokeForward(device)).rows);
 

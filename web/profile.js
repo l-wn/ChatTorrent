@@ -63,6 +63,8 @@ function group(samples) {
             for (const p of PHASES) put(p, hop[p]);
             put('dispatches', hop.dispatches);
             put('bindGroups', hop.bindGroups);
+            // Jobs in the pass that ran this one (stage.js batching).
+            put('batch', hop.batch ?? 1);
             put('rtt', hop.link?.rtt);
             put('send', hop.link?.send);
             if (hop.gpu) {
@@ -159,6 +161,7 @@ export function formatText(summary, { top = 12 } = {}) {
                 + `ms ${med(h.ms)} (p90 ${f(h.ms?.p90)}) = ${phases}${gpu}`);
             const counts = [h.dispatches && `dispatches ${med(h.dispatches)}`,
                             h.bindGroups && `bind groups built ${med(h.bindGroups)}`,
+                            h.batch?.p90 > 1 && `jobs per pass ${med(h.batch)} (p90 ${f(h.batch.p90)})`,
                             h.quantized && 'timestamps quantized to 100µs'].filter(Boolean);
             if (counts.length) out.push(`      ${counts.join(' · ')}`);
             if (h.rtt || h.send) {

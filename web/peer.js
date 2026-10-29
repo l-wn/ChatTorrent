@@ -705,10 +705,12 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
     ui.bootnote.textContent = 'connecting to the signaling server…';
     // Holding the head, also hold the MTP draft head; ?mtp=0 turns it off.
     // ?warm=0: no keep-warm kernel between jobs (stage.js KEEP_WARM_MS).
+    // ?batch=0: each job in a pass of its own (stage.js #batchWith).
     const params = new URLSearchParams(location.search);
     engine = new Engine({ onEvent: handleEngineEvent,
                           mtp: params.get('mtp') !== '0',
-                          warm: params.get('warm') !== '0' });
+                          warm: params.get('warm') !== '0',
+                          batch: params.get('batch') !== '0' });
 
     let manifest;
     try {

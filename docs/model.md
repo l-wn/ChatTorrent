@@ -194,8 +194,13 @@ position, or a verified token could differ from plain decoding's. Each kernel
 on the verify path gives row i the same arithmetic in the same order as a
 one-row call:
 
-- the batched GEMV (2 to 8 rows) reads each weight once and accumulates every
-  row with the GEMV's lane split, expression and reduction tree;
+- the batched GEMV (2 to 32 rows) reads each weight once and accumulates every
+  row with the GEMV's lane split, expression and reduction tree. Past 8 rows,
+  q8 weights use `matmulRowsQ8Src`, which stages each row's slice of X in
+  workgroup memory instead of having every thread re-read it from memory
+  (on a 1070 Ti at Qwen3.8-27B's shapes, 16 rows then cost what 8 do and 32
+  rows twice that). Which thread does the work changes, the arithmetic per
+  row and column does not;
 - attention: a score is one dot product, softmax visits only unmasked columns
   with a fixed thread-to-column mapping, and the value sum adds exact zeros for
   masked columns;
@@ -204,6 +209,29 @@ one-row call:
 
 `kernels.test.js` reports whether a GPU matches to the bit (it needs only the
 usual tolerance to serve); `spec.test.js` requires it.
+
+## Batching several sessions in one pass
+
+A Runner can run several sessions' jobs as one pass (architecture.md,
+Batching). `blockSegs` takes a list of segments, each one session's `n` rows
+at row `rowOff` of the scratch, with its cache, `T_past` and speculative
+state. Rows are packed in order from row 0.
+
+```
+every row at once:   rmsnorm, every projection, q/k norm, attn_gate,
+                     o_proj, out_proj, gated norm, the MLP, round_f16
+per segment:         copy its q/k/v (or DeltaNet projections) to row 0 of
+                     the segment scratch (makeSegScratch); store_kv, rope,
+                     attention over its own pages (or the restore, snapshot
+                     and recurrence on its own state); copy the output back
+```
+
+With at most 32 rows the projections use the batched GEMV above, so each row
+gets the bits a one-row call gives, and a batched session's rows, KV and
+recurrent state are the ones it gets alone. `batch.test.js` checks this to
+the bit for both block kinds, f32 and q8 weights, with a verify and a
+rollback inside the batch. One segment runs exactly the dispatches of
+`block()`, with no copies.
 
 ## Weight formats
 
@@ -225,7 +253,7 @@ dispatch shape:
 
 | kernel | does |
 |---|---|
-| `matmul` (GEMV, rows, tiled; f32/f16/q8) | `Y = X @ W^T`; GEMV for one row, the batched GEMV for 2 to 8 rows, 16×16 tiles otherwise |
+| `matmul` (GEMV, rows, tiled; f32/f16/q8) | `Y = X @ W^T`; GEMV for one row, the batched GEMV for 2 to 32 rows (q8 past 8: X staged in workgroup memory), 16×16 tiles otherwise |
 | `gather_embed_nopos` | `out[t] = wte[ids[t]]` |
 | `rmsnorm` | one workgroup per row |
 | `reshape_heads`, `merge_heads` | row-major ↔ head-major |

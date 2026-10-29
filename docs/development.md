@@ -29,7 +29,9 @@ Served only by `Caddyfile.dev`, never by the production build:
   `?weights=<url>`, `?oracle=<url>`, `?stream=1` (verify a block at a time,
   for a model larger than this GPU), `?decodeSteps=N`, and `?bench=1` (kernel
   and forward-pass microbenchmarks at the checkpoint's dimensions) or
-  `?bench=<hidden>x<n_layer>x<n_heads>x<n_kv>x<head_dim>x<ffn>x<vocab>`.
+  `?bench=<hidden>x<n_layer>x<n_heads>x<n_kv>x<head_dim>x<ffn>x<vocab>`, or
+  `?bench=rows` (one q8 matmul at Qwen3.8-27B's shapes for 1 to 64 rows: what
+  batching and speculative decoding cost on the projections).
 - `web/dev/history.html`: the saved-chat checks against a real IndexedDB.
 
 The oracle dumps in `oracle/` come from `tools/dump_*_oracle.py`, which run the

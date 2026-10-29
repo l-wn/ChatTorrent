@@ -17,6 +17,7 @@
 //   node tools/stage.test.mjs
 
 import { Runner, MAX_QUEUE, MAX_SESSION_QUEUE } from '../web/model/stage.js';
+import { fromF16 } from '../web/f16.js';
 import { device, D, L, N, SINGLE, BLOCK_TENSORS, marker, weightsFor, pieceFor,
          resetTrace, takeTrace, makeGpu, DH, LAYER_TYPES, hybridWeightsFor } from './stub-gpu.mjs';
 
@@ -1219,6 +1220,137 @@ console.log('\nload: the work a peer reports for routing');
     r.msPerPos = 1000;                     // so the replacement below is visible
     await r.run({ k: 'job', s: 'a', pos: 0, past: 0, n: 1, ids: [1], opts: {} }, null, 2);
     ok('and the first decode token replaces it', r.msPerPos < 1000, `${r.msPerPos}`);
+}
+
+// --- Batching: several sessions' jobs in one pass ---
+
+console.log('\nbatching: jobs queued together run as one pass');
+{
+    const H = D.hidden;
+    // Its own stub GPU, so the pass count is this test's alone. The middle
+    // of the line: no embedding, no head, so every job hands on rows.
+    const mk = (opts = {}) => {
+        const gpu = makeGpu();
+        const r = new Runner(gpu.device, D, weightsFor(1, N - 1),
+                             { lo: 1, hi: N - 1, nMax: 16, tMax: 4, slots: 4, sessions: 4, idleMs: 0, ...opts });
+        return { r, gpu };
+    };
+    const job = (s, { pos = 1, past = 0, n = 1 } = {}) => ({ k: 'job', s, pos, past, n, opts: {} });
+    const rows = (n) => new Float32Array(n * H);
+    // A readback whose row i holds i + 1 everywhere, so each job's rows say
+    // where in the pass they were.
+    const numbered = (bytes) => {
+        const out = new Float32Array(bytes / 4);
+        for (let i = 0; i < out.length; i++) out[i] = Math.floor(i / H) + 1;
+        return out;
+    };
+    const firstOf = (res) => fromF16(res.hidden)[0];
+
+    {
+        const { r, gpu } = mk();
+        const before = gpu.passes.opened;
+        gpu.setFill(numbered);
+        const [a, b, c] = await Promise.all(['a', 'b', 'c'].map((s) => r.run(job(s), rows(1))));
+        eq('three sessions queued at once run in one pass', gpu.passes.opened - before, 1);
+        eq('each job gets its own row back', [a, b, c].map(firstOf), [1, 2, 3]);
+        eq('the batch is counted', [r.counts.batched, r.counts.batchedJobs], [1, 3]);
+        eq('and reported in each job\'s phases', [a, b, c].map((x) => x.phases.batch), [3, 3, 3]);
+        eq('each job keeps its own boundary log',
+           ['a', 'b', 'c'].map((s) => fromF16(r.logs.get(s).get(N - 1).rows.subarray(0, H))[0]), [1, 2, 3]);
+    }
+    {
+        const { r, gpu } = mk({ batchRows: 1 });
+        const before = gpu.passes.opened;
+        await Promise.all(['a', 'b', 'c'].map((s) => r.run(job(s), rows(1))));
+        eq('batchRows 1 runs one pass per job', gpu.passes.opened - before, 3);
+        eq('and counts no batch', r.counts.batched, 0);
+    }
+    {
+        const { r, gpu } = mk();
+        const before = gpu.passes.opened;
+        gpu.setFill(numbered);
+        const runs = [r.run(job('a'), rows(1)), r.run(job('cold', { past: 3 }), rows(1)),
+                      r.run(job('b'), rows(1))];
+        const got = await Promise.allSettled(runs);
+        eq('a job that cannot run leaves the batch', got.map((x) => x.status),
+           ['fulfilled', 'rejected', 'fulfilled']);
+        ok('with its own error', /no longer cached/.test(got[1].reason?.message), got[1].reason?.message);
+        eq('the others still share one pass', gpu.passes.opened - before, 1);
+        eq('and get their rows', [got[0].value, got[2].value].map(firstOf), [1, 2]);
+    }
+    {
+        const { r, gpu } = mk();
+        const before = gpu.passes.opened;
+        const runs = [r.run(job('a'), rows(1)), r.run(job('b'), rows(1)),
+                      r.release('gone'), r.run(job('c'), rows(1))];
+        await Promise.all(runs);
+        eq('nothing passes a task with no session', gpu.passes.opened - before, 2);
+    }
+    {
+        const { r, gpu } = mk();
+        const before = gpu.passes.opened;
+        const order = [];
+        const runs = [r.run(job('a'), rows(1)).then(() => order.push('a0')),
+                      r.run(job('a', { past: 1 }), rows(1)).then(() => order.push('a1')),
+                      r.run(job('b'), rows(1)).then(() => order.push('b'))];
+        await Promise.all(runs);
+        eq('a session\'s second job waits for the next pass', gpu.passes.opened - before, 2);
+        eq('and runs after its first', order.indexOf('a0') < order.indexOf('a1'), true);
+        eq('the session continues where the first job left it', r.live.get('a').fed.get(1), 2);
+    }
+    {
+        const { r, gpu } = mk();
+        const before = gpu.passes.opened;
+        await Promise.all([r.run(job('a', { pos: 1 }), rows(1)), r.run(job('b', { pos: 2 }), rows(1)),
+                           r.run(job('c', { pos: 1 }), rows(1))]);
+        eq('only jobs entering at the same cursor share a pass', gpu.passes.opened - before, 2);
+    }
+    {
+        const { r, gpu } = mk();
+        const before = gpu.passes.opened;
+        await Promise.all([r.run(job('a', { n: 2 }), rows(2)), r.run(job('b', { n: 2 }), rows(2)),
+                           r.run(job('c', { n: 1 }), rows(1))]);
+        eq('a pass carries at most batchRows rows (here tMax, 4)', gpu.passes.opened - before, 2);
+    }
+    {
+        // Ends at the head: each job samples its own row. Greedy with no
+        // penalties reads back one (value, index) pair per row.
+        const gpu = makeGpu();
+        const r = new Runner(gpu.device, D, weightsFor(1, N),
+                             { lo: 1, hi: N, nMax: 16, tMax: 4, slots: 4, sessions: 4, idleMs: 0 });
+        const greedy = (s) => ({ k: 'job', s, pos: 1, past: 0, n: 1, opts: { temp: 0, topK: 0 } });
+        const before = gpu.passes.opened;
+        gpu.setFill((bytes) => {
+            const out = new Float32Array(bytes / 4);
+            const ids = new Uint32Array(out.buffer);
+            for (let i = 0; i < bytes / 8; i++) ids[i * 2 + 1] = 5 + i;
+            return out;
+        });
+        const got = await Promise.all(['a', 'b', 'c'].map((s) => r.run(greedy(s), rows(1))));
+        eq('jobs at the head share a pass', gpu.passes.opened - before, 1);
+        eq('and each samples its own row', got.map((x) => x.token), [5, 6, 7]);
+    }
+    {
+        // Past 8 rows: a pass takes up to batchRows (here tMax, 16) rows.
+        const gpu = makeGpu();
+        const r = new Runner(gpu.device, D, weightsFor(1, N - 1),
+                             { lo: 1, hi: N - 1, nMax: 32, tMax: 16, slots: 12, sessions: 12, idleMs: 0 });
+        const before = gpu.passes.opened;
+        gpu.setFill(numbered);
+        const ids = Array.from({ length: 12 }, (_, i) => `s${i}`);
+        const got = await Promise.all(ids.map((s) => r.run(job(s), rows(1))));
+        eq('twelve one-row jobs share one pass', gpu.passes.opened - before, 1);
+        eq('each gets its own row', got.map(firstOf), ids.map((_, i) => i + 1));
+        eq('batchRows follows tMax up to GEMV_ROWS_MAX', r.batchRows, 16);
+    }
+    {
+        // Replays and profiled jobs run alone.
+        const { r, gpu } = mk();
+        const before = gpu.passes.opened;
+        await Promise.all([r.run(job('a'), rows(1)), r.run({ ...job('b'), replay: true }, rows(1)),
+                           r.run({ ...job('c'), prof: 1 }, rows(1))]);
+        eq('replays and profiled jobs are not batched', gpu.passes.opened - before, 3);
+    }
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

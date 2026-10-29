@@ -268,7 +268,7 @@ export function recurrentStateBytes(d) {
 }
 
 // The widest speculative verify job, in tokens: the last sampled token plus
-// up to SPEC_COLS - 1 drafts. Matches kernels.js's GEMV_ROWS_MAX, so every
+// up to SPEC_COLS - 1 drafts. At most kernels.js's GEMV_ROWS_MAX, so every
 // verify row goes through the batched GEMV and gets plain decoding's bits.
 export const SPEC_COLS = 8;
 

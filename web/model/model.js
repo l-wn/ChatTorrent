@@ -62,7 +62,7 @@ export { recurrentStateBytes, replayLayerBytes };
 //   S, hist{Q,K,V}   the recurrent state and conv rings before the job
 //   lin{Q,K,V,A,B}   the job's per-token projections (pre-conv q/k/v, a, b)
 // A rejection keeping k < n tokens puts the state back and re-runs the same
-// kernels over the first k rows (linearBlock), so the restored state has the
+// kernels over the first k rows (restoreSpec), so the restored state has the
 // bits a k-token job would have left.
 export function makeReplayLayer(device, d, cols = SPEC_COLS) {
     const { nV, Dk, Dv, K4, keyDim, valueDim } = d.linear;
@@ -315,6 +315,41 @@ function ffnBlock(device, pass, d, L, s, T_new) {
     addInplace(device, pass, s.x, s.down, T_new * H);
 }
 
+// One session's attention for T_new rows of q/k/v (rows from 0): store K/V
+// in its cache at T_past, then attend over everything up to T_past + T_new.
+// Writes the merged heads to `out`. `s` gives qh, scores, ctx and attnRows.
+function attend(device, pass, d, layer, cache, s, q, k, v, out, T_new, T_past) {
+    const D = d.head_dim, nH = d.n_heads, nKV = d.n_kv_heads;
+    const T_act = T_past + T_new;
+    const K = cache.K[layer], V = cache.V[layer];
+    // A contiguous cache is the one-page case: `pageTokens` is its whole
+    // window and `pages` is null (see scatter_kv in kernels.js).
+    const P = cache.pageTokens ?? cache.N_max;
+    const pages = cache.pages ?? null;
+
+    // Q is reshaped head-major. K/V are quantized into the cache at T_past,
+    // K rotated first. V is not rotated.
+    reshapeHeads(device, pass, q, s.qh, T_new, nH, D);
+    storeKV(device, pass, k, K, T_new, T_past, P, nKV, D,
+            { theta: d.rope_theta, scaling: d.rope_scaling, rotDim: d.rot_dim ?? D }, pages);
+    storeKV(device, pass, v, V, T_new, T_past, P, nKV, D, null, pages);
+
+    // RoPE on Q after projection, before the scores. Q is dense: one page of
+    // T_new rows starting at 0.
+    rope(device, pass, s.qh, nH, T_new, D, T_past, T_new, 0, d.rope_theta, d.rope_scaling, d.rot_dim);
+
+    // Attention in chunks of s.attnRows query rows, so the scores buffer is
+    // bounded. Each output element is computed the same way in any chunking.
+    for (let r0 = 0; r0 < T_new; r0 += s.attnRows) {
+        const R = Math.min(s.attnRows, T_new - r0);
+        qkScoresGQA(device, pass, s.qh, K, s.scores, R, T_act, P, D, nH, d.group, pages, r0, T_new);
+        causalSoftmax(device, pass, s.scores, R, T_act, T_past + r0, nH);
+        attnAVGQA(device, pass, s.scores, V, s.ctx, R, T_act, P, D, nH, d.group, pages, r0, T_new);
+    }
+
+    mergeHeads(device, pass, s.ctx, out, T_new, nH, D);
+}
+
 // One pre-norm transformer block: attention with GQA and a KV cache, then
 // SwiGLU. Updates s.x in place (both residual adds) and extends the cache by
 // T_new rows.
@@ -325,15 +360,16 @@ function ffnBlock(device, pass, d, L, s, T_new) {
 // Q/K after projection, and partial rotary via d.rot_dim. o_proj's input width
 // is qDim (n_heads*head_dim), which is larger than H on those layers.
 export function fullBlock(device, pass, d, w, layer, cache, s, T_new, T_past) {
+    fullBlockSegs(device, pass, d, w, layer, [{ cache, T_past, n: T_new, rowOff: 0 }], s, null);
+}
+
+// fullBlock over a batch (see blockSegs). Attention reads each session's own
+// KV, so it runs per segment.
+function fullBlockSegs(device, pass, d, w, layer, segs, s, g) {
     const H = d.hidden, D = d.head_dim, nH = d.n_heads, nKV = d.n_kv_heads;
     const kvDim = nKV * D, qDim = nH * D;
-    const T_act = T_past + T_new;
+    const T_new = rowsOf(segs);
     const L = w.layers[layer];
-    const K = cache.K[layer], V = cache.V[layer];
-    // A contiguous cache is the one-page case: `pageTokens` is its whole
-    // window and `pages` is null (see scatter_kv in kernels.js).
-    const P = cache.pageTokens ?? cache.N_max;
-    const pages = cache.pages ?? null;
 
     // --- attention ---
     rmsnorm(device, pass, s.x, L.input_layernorm, s.h, T_new, H, d.rms_eps);
@@ -351,27 +387,18 @@ export function fullBlock(device, pass, d, w, layer, cache, s, T_new, T_past) {
     if (L.q_norm) { rmsnorm(device, pass, s.q, L.q_norm, s.qNormed, T_new * nH,  D, d.rms_eps); qBuf = s.qNormed; }
     if (L.k_norm) { rmsnorm(device, pass, s.k, L.k_norm, s.kNormed, T_new * nKV, D, d.rms_eps); kBuf = s.kNormed; }
 
-    // Q is reshaped head-major. K/V are quantized into the cache at T_past,
-    // K rotated first. V is not rotated.
-    reshapeHeads(device, pass, qBuf, s.qh, T_new, nH, D);
-    storeKV(device, pass, kBuf, K, T_new, T_past, P, nKV, D,
-            { theta: d.rope_theta, scaling: d.rope_scaling, rotDim: d.rot_dim ?? D }, pages);
-    storeKV(device, pass, s.v, V, T_new, T_past, P, nKV, D, null, pages);
-
-    // RoPE on Q after projection, before the scores. Q is dense: one page of
-    // T_new rows starting at 0.
-    rope(device, pass, s.qh, nH, T_new, D, T_past, T_new, 0, d.rope_theta, d.rope_scaling, d.rot_dim);
-
-    // Attention in chunks of s.attnRows query rows, so the scores buffer is
-    // bounded. Each output element is computed the same way in any chunking.
-    for (let r0 = 0; r0 < T_new; r0 += s.attnRows) {
-        const R = Math.min(s.attnRows, T_new - r0);
-        qkScoresGQA(device, pass, s.qh, K, s.scores, R, T_act, P, D, nH, d.group, pages, r0, T_new);
-        causalSoftmax(device, pass, s.scores, R, T_act, T_past + r0, nH);
-        attnAVGQA(device, pass, s.scores, V, s.ctx, R, T_act, P, D, nH, d.group, pages, r0, T_new);
+    if (segs.length === 1) {
+        attend(device, pass, d, layer, segs[0].cache, s, qBuf, kBuf, s.v, s.merged,
+               T_new, segs[0].T_past);
+    } else {
+        for (const { cache, T_past, n, rowOff } of segs) {
+            copyF32(device, pass, qBuf, g.q, n * qDim, rowOff * qDim, 0);
+            copyF32(device, pass, kBuf, g.k, n * kvDim, rowOff * kvDim, 0);
+            copyF32(device, pass, s.v, g.v, n * kvDim, rowOff * kvDim, 0);
+            attend(device, pass, d, layer, cache, g, g.q, g.k, g.v, g.merged, n, T_past);
+            copyF32(device, pass, g.merged, s.merged, n * qDim, 0, rowOff * qDim);
+        }
     }
-
-    mergeHeads(device, pass, s.ctx, s.merged, T_new, nH, D);
     let attnIn = s.merged;
     if (L.attn_gate) { sigmoidMul(device, pass, s.gateRaw, s.merged, s.gated, T_new * qDim); attnIn = s.gated; }
 
@@ -414,40 +441,51 @@ function linearCore(device, pass, d, L, rc, s, lin, T) {
     updateConvHistory(device, pass, rc.histV, lin.v, T, valueDim, K4);
 }
 
-// `spec` (optional) is the session's speculative state at this Runner:
+// Put a session's recurrent state back to before its last verify job, then
+// re-run that job's first `keep` rows from the replay data. `sc` is the
+// scratch linearCore runs in.
+function restoreSpec(device, pass, d, L, rc, rp, keep, sc) {
+    copyF32(device, pass, rp.S, rc.S, rc.S.size / F32);
+    copyF32(device, pass, rp.histQ, rc.histQ, rc.histQ.size / F32);
+    copyF32(device, pass, rp.histK, rc.histK, rc.histK.size / F32);
+    copyF32(device, pass, rp.histV, rc.histV, rc.histV.size / F32);
+    if (keep > 0) linearCore(device, pass, d, L, rc, sc, replayLin(rp), keep);
+}
+
+// Record the state a verify job starts from, for a later restoreSpec.
+function snapSpec(device, pass, rc, rp) {
+    copyF32(device, pass, rc.S, rp.S, rc.S.size / F32);
+    copyF32(device, pass, rc.histQ, rp.histQ, rc.histQ.size / F32);
+    copyF32(device, pass, rc.histK, rp.histK, rc.histK.size / F32);
+    copyF32(device, pass, rc.histV, rp.histV, rc.histV.size / F32);
+}
+
+const replayLin = (rp) => ({ q: rp.linQ, k: rp.linK, v: rp.linV, a: rp.linA, b: rp.linB });
+
+// One Gated DeltaNet block over a batch (see blockSegs). Each segment's `spec` (optional)
+// is its session's speculative state at this Runner:
 //   replay[layer]  its replay data (makeReplayLayer), or none
 //   keep           not null: the last verify job left too many tokens; put
 //                  the state back and re-run its first `keep` rows (0: none)
 //   snap           this job is a verify: record what a later `keep` needs
-function linearBlock(device, pass, d, w, layer, cache, s, T_new, spec = null) {
+// The recurrence reads each session's own state, so it runs per segment.
+function linearBlockSegs(device, pass, d, w, layer, segs, s, g) {
     const H = d.hidden;
     const { nV, Dv, keyDim, valueDim } = d.linear;
     const L = w.layers[layer];
-    const rc = cache.recurrent[layer];
-    const rp = spec?.replay?.[layer] ?? null;
+    const T_new = rowsOf(segs);
+    const one = segs.length === 1;
 
-    if (rp && spec.keep != null) {
-        copyF32(device, pass, rp.S, rc.S, rc.S.size / F32);
-        copyF32(device, pass, rp.histQ, rc.histQ, rc.histQ.size / F32);
-        copyF32(device, pass, rp.histK, rc.histK, rc.histK.size / F32);
-        copyF32(device, pass, rp.histV, rc.histV, rc.histV.size / F32);
-        if (spec.keep > 0) {
-            linearCore(device, pass, d, L, rc, s,
-                { q: rp.linQ, k: rp.linK, v: rp.linV, a: rp.linA, b: rp.linB }, spec.keep);
-        }
+    // A lone verify job's projections go straight into the replay buffers,
+    // which then serve as its inputs too. In a batch they are copied there.
+    let lin = { q: s.linQ, k: s.linK, v: s.linV, a: s.linA, b: s.linB };
+    if (one) {
+        const { cache, spec } = segs[0];
+        const rc = cache.recurrent[layer];
+        const rp = spec?.replay?.[layer] ?? null;
+        if (rp && spec.keep != null) restoreSpec(device, pass, d, L, rc, rp, spec.keep, s);
+        if (rp && spec.snap) { snapSpec(device, pass, rc, rp); lin = replayLin(rp); }
     }
-    const snap = rp && spec.snap;
-    if (snap) {
-        copyF32(device, pass, rc.S, rp.S, rc.S.size / F32);
-        copyF32(device, pass, rc.histQ, rp.histQ, rc.histQ.size / F32);
-        copyF32(device, pass, rc.histK, rp.histK, rc.histK.size / F32);
-        copyF32(device, pass, rc.histV, rp.histV, rc.histV.size / F32);
-    }
-    // A verify job's projections go straight into the replay buffers, which
-    // then serve as this job's inputs too.
-    const lin = snap
-        ? { q: rp.linQ, k: rp.linK, v: rp.linV, a: rp.linA, b: rp.linB }
-        : { q: s.linQ, k: s.linK, v: s.linV, a: s.linA, b: s.linB };
 
     rmsnorm(device, pass, s.x, L.input_layernorm, s.h, T_new, H, d.rms_eps);
 
@@ -458,8 +496,27 @@ function linearBlock(device, pass, d, w, layer, cache, s, T_new, spec = null) {
     matmulNobias(device, pass, s.h, L.in_proj_b, lin.b, T_new, H, nV);
     matmulNobias(device, pass, s.h, L.in_proj_a, lin.a, T_new, H, nV);
 
-    linearCore(device, pass, d, L, rc, s, lin, T_new);
-
+    if (one) {
+        linearCore(device, pass, d, L, segs[0].cache.recurrent[layer], s, lin, T_new);
+    } else {
+        for (const { cache, n, rowOff, spec } of segs) {
+            const rc = cache.recurrent[layer];
+            const rp = spec?.replay?.[layer] ?? null;
+            // The restore reads the replay buffers, so it runs before this
+            // job's rows are copied into them.
+            if (rp && spec.keep != null) restoreSpec(device, pass, d, L, rc, rp, spec.keep, g);
+            const snap = rp && spec.snap;
+            if (snap) snapSpec(device, pass, rc, rp);
+            const dst = snap ? replayLin(rp) : { q: g.linQ, k: g.linK, v: g.linV, a: g.linA, b: g.linB };
+            copyF32(device, pass, lin.q, dst.q, n * keyDim, rowOff * keyDim, 0);
+            copyF32(device, pass, lin.k, dst.k, n * keyDim, rowOff * keyDim, 0);
+            copyF32(device, pass, lin.v, dst.v, n * valueDim, rowOff * valueDim, 0);
+            copyF32(device, pass, lin.a, dst.a, n * nV, rowOff * nV, 0);
+            copyF32(device, pass, lin.b, dst.b, n * nV, rowOff * nV, 0);
+            linearCore(device, pass, d, L, rc, g, dst, n);
+            copyF32(device, pass, g.coreOut, s.coreOut, n * nV * Dv, 0, rowOff * nV * Dv);
+        }
+    }
 
     rmsnorm(device, pass, s.coreOut, L.gated_norm, s.gatedNorm, T_new * nV, Dv, d.rms_eps);
     siluMul(device, pass, s.linZ, s.gatedNorm, s.gatedFinal, T_new * nV * Dv);
@@ -545,10 +602,57 @@ export function makeMtpScratch(device, d, draftVocab, T_max, N_max) {
 // between blocks, so with the rounding in the same places on every peer a
 // reply is the same however the model is split.
 export function block(device, pass, d, w, layer, cache, s, T_new, T_past, spec = null) {
+    blockSegs(device, pass, d, w, layer, [{ cache, T_past, n: T_new, rowOff: 0, spec }], s, null);
+}
+
+// One block over a batch: several sessions' rows in one pass. Segment i is
+// one session's `n` rows at row `rowOff` of the scratch `s`, with its
+// `cache`, `T_past` and `spec`. Segments are packed in order from row 0.
+//
+// Row-wise work (norms, projections, the MLP) runs once over every row. Work
+// that reads a session's own state (attention, the recurrence) runs per
+// segment in `g` (makeSegScratch): its rows are copied in at row 0, the
+// one-session kernels run, and the output is copied back. With up to
+// GEMV_ROWS_MAX rows the projections use the rows kernel, which gives each
+// row the bits of a one-row call, so every row is the one its session gets
+// alone. One segment runs exactly block()'s dispatches and needs no `g`.
+export function blockSegs(device, pass, d, w, layer, segs, s, g) {
     const kind = w.layers[layer].kind ?? 'full_attention';
-    if (kind === 'linear_attention') linearBlock(device, pass, d, w, layer, cache, s, T_new, spec);
-    else fullBlock(device, pass, d, w, layer, cache, s, T_new, T_past);
-    roundF16(device, pass, s.x, T_new * d.hidden);
+    if (kind === 'linear_attention') linearBlockSegs(device, pass, d, w, layer, segs, s, g);
+    else fullBlockSegs(device, pass, d, w, layer, segs, s, g);
+    roundF16(device, pass, s.x, rowsOf(segs) * d.hidden);
+}
+
+const rowsOf = (segs) => segs.reduce((n, seg) => n + seg.n, 0);
+
+// The bytes makeSegScratch() would allocate, without allocating.
+export const segScratchBytes = (d, rows) =>
+    makeSegScratch({ createBuffer: () => ({}) }, d, rows, {}).bytes;
+
+// The per-segment scratch blockSegs() needs, for segments of up to `rows`
+// rows. The attention scores are shared with `s`, since segments run one
+// after another.
+export function makeSegScratch(device, d, rows, s) {
+    const D = d.head_dim, nH = d.n_heads;
+    const kvDim = d.n_kv_heads * D, qDim = nH * D;
+    let bytes = 0;
+    const buf = (n) => { bytes += Math.max(n * F32, 16); return makeStorage(device, n * F32); };
+    const g = {
+        q: buf(rows * qDim), k: buf(rows * kvDim), v: buf(rows * kvDim),
+        qh: buf(nH * rows * D), ctx: buf(nH * rows * D), merged: buf(rows * qDim),
+        scores: s.scores, attnRows: s.attnRows,
+    };
+    if (d.linear) {
+        const { keyDim, valueDim, nV, Dk, Dv } = d.linear;
+        Object.assign(g, {
+            linQ: buf(rows * keyDim), linK: buf(rows * keyDim), linV: buf(rows * valueDim),
+            linA: buf(rows * nV), linB: buf(rows * nV),
+            convQ: buf(rows * keyDim), convK: buf(rows * keyDim), convV: buf(rows * valueDim),
+            qL2: buf(rows * nV * Dk), kL2: buf(rows * nV * Dk), coreOut: buf(rows * nV * Dv),
+        });
+    }
+    g.bytes = bytes;
+    return g;
 }
 
 // Records the whole stack on `pass`, an open compute pass. `ids` is an f32

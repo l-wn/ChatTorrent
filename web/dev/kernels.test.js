@@ -590,7 +590,12 @@ async function testMatmulRowsBitwise(device, r) {
     async function check(label, K, N, upload) {
         const wb = upload(K, N);
         let bitwise = true, worst = 0, scale = 0;
-        for (let M = 2; M <= GEMV_ROWS_MAX; M++) {
+        // Every count up to 8, then each size past it (gemvRows pads to a
+        // multiple of 8), one short of it so a padded row is not stored.
+        // Peers run these tests at startup and each M costs M readbacks.
+        const counts = [2, 3, 4, 5, 6, 7, 8];
+        for (let M = 16; M <= GEMV_ROWS_MAX; M += 8) counts.push(M - 1, M);
+        for (const M of counts) {
             const X = randF32(M * K, rng);
             const xb = uploadF32(device, X);
             const ym = makeStorage(device, M * N * F32);
@@ -620,13 +625,17 @@ async function testMatmulRowsBitwise(device, r) {
     } else {
         r.assert('matmul rows f16 (skipped: no shader-f16)', true);
     }
-    const group = 64;
-    await check('q8', 6 * group + 32, 70, (K, N) => {
-        const data = new Int8Array(N * K);
-        for (let i = 0; i < data.length; i++) data[i] = Math.floor(rng() * 255) - 127;
-        const scales = randF32(N * Math.ceil(K / group), rng);
-        return uploadQ8(device, new Uint8Array(data.buffer), scales, group);
-    });
+    // q8 at two group sizes, each with a partial last group and N not a
+    // multiple of the columns a workgroup covers. Group 32 is the shipped
+    // checkpoint's; past 8 rows both use matmulRowsQ8Src.
+    for (const group of [64, 32]) {
+        await check(`q8 group ${group}`, 6 * group + 32, 70, (K, N) => {
+            const data = new Int8Array(N * K);
+            for (let i = 0; i < data.length; i++) data[i] = Math.floor(rng() * 255) - 127;
+            const scales = randF32(N * Math.ceil(K / group), rng);
+            return uploadQ8(device, new Uint8Array(data.buffer), scales, group);
+        });
+    }
 
     // And against the CPU reference, so the rows are right as well as alike.
     {

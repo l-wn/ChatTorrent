@@ -114,6 +114,15 @@ console.log('\ntext');
     eq('and has no one-liner', formatLine(summarize(null)), '');
 }
 
+console.log('\nbatching: jobs per pass');
+{
+    const samples = [3, 3, 1].map((b) => ({ kind: 'decode', n: 1, rt: 80, overhead: 3,
+        trace: [hop0(30, 4, { batch: b }), hop1(40)] }));
+    const text = formatText(summarize({ level: 0, samples }));
+    ok('a hop that batched shows its jobs per pass', /jobs per pass 3/.test(text), text);
+    ok('a hop that never batched does not', (text.match(/jobs per pass/g) ?? []).length === 1, text);
+}
+
 console.log('\na closed-loop reply');
 {
     const hop = (id, ms, from, to, rtt) => ({ id, ms, from, to, ...(rtt != null && { link: { rtt } }) });

@@ -101,6 +101,7 @@ export async function boot() {
             if (type === 'status') say(`status: ${detail.text}`);
             if (type === 'repair') say(`repair (${detail.reason}): ${detail.message ?? ''}`);
         },
+        batch: q.get('batch') !== '0',
     });
 
     booted = (async () => {
