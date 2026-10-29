@@ -22,7 +22,7 @@ Everyone gets their own chat, several replies run at once, and anyone can leave 
 
 <br />
 
-| [**12 people**](#several-people-at-once) | [**19.7 tok/s**](#one-person) | [**8.1 tok/s**](#one-person) | **0 installs** |
+| [**12 people**](#performance) | [**19.7 tok/s**](#performance) | [**8.1 tok/s**](#performance) | **0 installs** |
 |:-:|:-:|:-:|:-:|
 | chatting at once on two RTX 3090s | two RTX 3090s, one machine | one RTX 3090 in France, one in Spain | a browser tab |
 
@@ -44,8 +44,8 @@ running a model instead of the pieces of a file.
   their own browser. One cluster writes several replies at the same time,
   each with its own KV cache on every machine, for up to 64 people. Each
   browser runs the waiting chats' next tokens as one GPU pass, so with twelve
-  people on two RTX 3090s, a reply still writes at 7.1 tok/s while 5 to 8
-  replies are being written ([numbers](#several-people-at-once)).
+  people on two RTX 3090s, a reply still writes at 7.1 tok/s with 5 to 8
+  concurrent prompts ([numbers](#performance)).
 - **Nobody has to stay.** There is no host. Each piece of the model can be
   held by more than one browser. When someone leaves mid-reply, the browser
   before them replays the lost work into another holder, and the reply
@@ -106,71 +106,46 @@ coding agent, and its license is AGPL. See
 
 ## Performance
 
-Qwen3.8-27B at full 8-bit needs about 27 GB of GPU memory, more than any single
-24 GB card. Every number here splits it across two RTX 3090s: either both in one
-machine, or one in France and one in Spain, 28 ms apart over the internet.
-
 - **Twelve people at once:** 19.1 tok/s in total on one machine, 16.0 across
   two countries. All 36 replies finished.
 - **One person:** 19.7 tok/s on one machine, 8.1 across two countries, and
   14.5 on code and lists.
 
-### Several people at once
+Qwen3.8-27B q8 on two RTX 3090s, either in one machine or one in France and one
+in Spain (28 ms apart). 128-token replies, default settings, measured with
+[`tools/load.mjs`](tools/load.mjs).
 
-Twelve people arrive over 30 seconds and ask three questions each, with
-128-token replies and default settings. They only chat, and the two GPUs do the
-work. Tokens per second for each reply (median), by how many replies were being
-written at the time:
+**Twelve people**, arriving over 30 seconds, three questions each. Tok/s per
+reply (median), by number of concurrent prompts:
 
-| Replies being written | One machine | Two machines, France and Spain |
+| Concurrent prompts | 1 | 2 | 3 to 4 | 5 to 8 | 9 to 16 | **Total** |
+|---|--:|--:|--:|--:|--:|--:|
+| One machine | 13.9 | 4.9 | 7.2 | 7.1 | – | **19.1** |
+| France and Spain | 9.0 | 6.3 | 5.9 | 4.0 | 5.0 | **16.0** |
+
+**One person**, six questions. Tok/s over the whole run:
+
+| | Speculation off | On (default) |
 |---|--:|--:|
-| 1 | 13.9 | 9.0 |
-| 2 | 4.9 | 6.3 |
-| 3 to 4 | 7.2 | 5.9 |
-| 5 to 8 | 7.1 | 4.0 |
-| 9 to 16 | – | 5.0 |
-| **Whole cluster, in total** | **19.1** | **16.0** |
+| One machine | – | **19.7** |
+| France and Spain | 6.5 | **8.1** |
+| France and Spain, code and lists (greedy) | 6.5 | **14.5** |
 
-On one machine the first token arrived after 2 to 5 seconds (median). Each
-browser runs the next token of every waiting chat as one GPU pass. A pass costs
-about one read of the weights however many chats it carries (on an RTX 3090, 32
-chats take twice as long as one), so more people add throughput instead of
-slowing everyone down. Each chat still gets exactly the tokens it would get
-alone.
+Speculation checks up to 7 drafted tokens per trip through the GPUs, and the
+text is the same as without it ([how](docs/architecture.md#speculative-decoding)).
 
-### One person
-
-Tokens per second, total tokens over total time:
-
-| Setup | Without speculation | Default |
-|---|--:|--:|
-| One machine, chat questions | –¹ | **19.7** |
-| France and Spain, chat questions | 6.5 | **8.1** |
-| France and Spain, code, lists and tables² | 6.5 | **14.5** |
-
-¹ Not measured yet. Prompt lookup alone, without the prediction head, gives
-10.6. ² Greedy sampling.
-
-Without speculation, every token is a full trip through both GPUs and the link
-between them, so the link sets the speed. With it (on by default), the browser
-holding the end of the model guesses up to 7 tokens, from earlier text and from
-the model's own multi-token prediction head, and one trip checks them all. The
-text doesn't change: with greedy sampling every reply matched the one without
-speculation. How it works: [Speculative decoding](docs/architecture.md#speculative-decoding).
-
-### Measure it yourself
-
-With [`tools/load.mjs`](tools/load.mjs). The several-people figures are medians
-per reply, and the one-person figures are totals over the whole run, which is
-why one reply alone reads 13.9 in one table and 19.7 in the other.
+<details>
+<summary>Commands</summary>
 
 ```bash
-# One person, six turns. Add --no-spec or --greedy for the other columns.
+# One person. Add --no-spec or --greedy for the other columns.
 node tools/load.mjs --url <cluster url> --users 1 --turns 6 --tokens 128
 
-# Twelve people arriving over 30 seconds, three prompts each.
+# Twelve people.
 node tools/load.mjs --url <cluster url> --users 12 --ramp 30 --turns 3 --think 10 --tokens 128
 ```
+
+</details>
 
 ## How it works
 
