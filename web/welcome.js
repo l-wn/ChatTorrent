@@ -8,6 +8,15 @@
 // violet the way a real join gets them (lend.js's previewRange()). peer.js
 // sends the cluster as a `cluster` event on document.
 //
+// The public demo has a limit on people chatting (signal-server.js's
+// MAX_PEOPLE). At it, the card says so and Join waits until a spot frees.
+// A visitor lending their GPU can still join, to lend, and chats once a spot
+// frees. A tab turned away
+// at the limit on tabs sees the same card while net.js retries.
+//
+// A browser that can't lend (no WebGPU, no adapter, or only a software one)
+// gets the slider locked at zero and a line saying why.
+//
 // It shows each time a tab arrives at a cluster, and not when that tab
 // reloads: answering marks the cluster joined for the tab (joinedKey, in
 // sessionStorage). The create page marks its new cluster joined itself. The
@@ -52,6 +61,18 @@ export function saveChoice({ contribute, limit }) {
     save({ ...v, v: 1, agreed: true, contribute, limit: limit ?? v.limit ?? '' });
 }
 
+// Whether this browser can lend its GPU. Asking for an adapter does not open
+// the GPU, so this runs before the visitor has agreed to anything.
+async function canLend() {
+    if (!navigator.gpu) return false;
+    try {
+        const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+        return !!adapter && !(adapter.info?.isFallbackAdapter ?? adapter.isFallbackAdapter);
+    } catch {
+        return false;
+    }
+}
+
 // Resolves with { contribute: boolean, limit: string }.
 export function askWelcome() {
     let secret = null;
@@ -82,15 +103,35 @@ export function askWelcome() {
     function renderLobby() {
         const crowd = info.crowd ?? [];
         const lending = crowd.filter((c) => c.lending).length;
-        $('lobbyName').textContent = info.name ?? 'Cluster';
+        if (info.name) $('lobbyName').textContent = info.name;
         $('lobbyLine').textContent = crowd.length
             ? `${crowd.length} connection${crowd.length === 1 ? '' : 's'} (${lending} lending)`
             : "Nobody else is here yet. You'd be the first.";
     }
 
+    // Whether Join can be pressed: not while the demo is full, unless the
+    // visitor joins to lend.
+    function renderGate() {
+        const go = $('welcomeYes');
+        const atLimit = info.maxPeople != null && info.people >= info.maxPeople;
+        const blocked = info.full || (atLimit && !slider.value);
+        go.disabled = blocked;
+        go.textContent = blocked ? 'Full, waiting for a spot'
+            : atLimit ? 'Join and lend' : 'Join and chat';
+        if (info.full) {
+            $('lobbyLine').textContent = "The public demo is full right now. You'll get in when a spot opens.";
+        } else if (atLimit) {
+            $('lobbyLine').textContent = `Full right now: ${info.people} of ${info.maxPeople} people are chatting. `
+                + (slider.value ? 'You can lend your GPU now and chat once a spot frees up.'
+                    : 'Wait until a spot frees up.');
+        }
+    }
+
     function render() {
         if (!info) return;
+        if (!info.L) { renderGate(); return; }
         renderLobby();
+        renderGate();
         const { L, peers } = info;
         const cells = cellsFor(barEl, L);
         const pct = (n) => Math.round((n / L) * 100);
@@ -134,15 +175,28 @@ export function askWelcome() {
                 ? `${withYou > now ? `You'd add ${pct(withYou - now)}%.` : `You'd hold a second copy of ${pct(n)}%.`} ` +
                   'The rest is downloading on another computer.'
             : `You'd add ${pct(withYou - now)}%. It still needs ${100 - pct(withYou)}% more.`;
+        if (noGpu) {
+            $('previewCaption').textContent = "This browser can't lend its GPU, but you can still chat. "
+                + 'To lend, use desktop Chrome, Edge or Safari 26.';
+        }
     }
 
-    const start = saved ? (saved.contribute ? limitGb(saved.limit) ?? DEFAULT_GB : 0) : DEFAULT_GB;
+    // A first visit starts at 0: chat only, lending is opt-in.
+    const start = saved ? (saved.contribute ? limitGb(saved.limit) ?? DEFAULT_GB : 0) : 0;
     const slider = lendSlider({
         bar: $('lendBar'), fill: $('lendYou'), handle: $('lendHandle'), out: $('lendOut'),
         value: start, onChange: render,
     });
+    let noGpu = false;
+    canLend().then((ok) => {
+        if (ok) return;
+        noGpu = true;
+        slider.lock();
+        $('lendOut').textContent = "Can't lend";
+        render();
+    });
     document.addEventListener('cluster', (e) => {
-        if (!e.detail?.L) return;
+        if (!e.detail?.L && !e.detail?.full) return;
         info = e.detail;
         render();
     });

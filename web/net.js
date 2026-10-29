@@ -262,8 +262,11 @@ const iceDone = (pc) => new Promise((res) => {
 // (see Mesh's #flush()). ICE takes about a second, longer through TURN.
 export const LINK_WAIT_MS = 5000;
 
-// How long seat() waits for the signaling server to answer.
+// How long seat() and enter() wait for the signaling server to answer.
 const SEAT_WAIT_MS = 5000;
+
+// How often a tab turned away from the full public demo tries again.
+const FULL_RETRY_MS = 15000;
 
 export class Mesh {
     // onMessage(header, payload, raw, from). `raw` is the whole reassembled
@@ -280,13 +283,14 @@ export class Mesh {
     // `sessions` is how many chats each peer keeps in memory, and `ctx` the
     // context window in tokens, asked for the same way.
     // `relayOnly` routes every link through TURN, so no peer learns this tab's
-    // address. `rate`, `linkWait`, `readyTimeout`, `linkRetry` and `linkOpen`
-    // override RATE, LINK_WAIT_MS, READY_TIMEOUT_MS, LINK_RETRY_MS and
-    // LINK_OPEN_MS, for tests.
+    // address. `rate`, `linkWait`, `readyTimeout`, `linkRetry`, `linkOpen`
+    // and `fullRetry` override RATE, LINK_WAIT_MS, READY_TIMEOUT_MS,
+    // LINK_RETRY_MS, LINK_OPEN_MS and FULL_RETRY_MS, for tests.
     constructor({ onMessage, onChange, rate = RATE, room = GLOBAL, chats = null, sessions = null,
                   ctx = null, relayOnly = true,
                   linkWait = LINK_WAIT_MS, readyTimeout = READY_TIMEOUT_MS,
-                  linkRetry = LINK_RETRY_MS, linkOpen = LINK_OPEN_MS } = {}) {
+                  linkRetry = LINK_RETRY_MS, linkOpen = LINK_OPEN_MS,
+                  fullRetry = FULL_RETRY_MS } = {}) {
         this.id = null;
         this.blocks = 0;            // L, the model's depth, from the welcome
         this.positions = 0;         // L + 2: what peers are placed on
@@ -317,8 +321,18 @@ export class Mesh {
         this.readyTimeout = readyTimeout;
         this.linkRetry = linkRetry;
         this.linkOpen = linkOpen;
+        this.fullRetry = fullRetry;
         this.authFailures = 0;      // offers/answers that failed the room's seal
         this.refused = null;        // why the server refused this tab, if it did
+        // The public demo turned this tab away at its limit on tabs, and it
+        // is retrying every FULL_RETRY_MS.
+        this.full = false;
+        // People chatting in this mesh and the limit on them (null for none),
+        // from the welcome and every roster.
+        this.people = 0;
+        this.maxPeople = null;
+        // How many times the server freed this tab's spot for being idle.
+        this.idled = 0;
         // Why the signaling server has not welcomed this tab yet, for the page
         // to show while retrying. Null once welcomed.
         this.trouble = null;
@@ -395,6 +409,13 @@ export class Mesh {
         });
         ws.addEventListener('close', (e) => {
             if (gone || ws !== this.ws) return;
+            // The public demo at its limit on tabs: wait at the join card and
+            // try again. A full private cluster is final.
+            if (e.code === 4002 && !this.room.private) {
+                this.full = true;
+                drop('the public demo is full');
+                return;
+            }
             if (REFUSED[e.code]) this.#stopFor(REFUSED[e.code]);
             drop(`the connection to the signaling server closed (code ${e.code})`);
         });
@@ -418,10 +439,11 @@ export class Mesh {
         this.online = false;
         if (!this.#closed) {
             this.#rejoining = true;
-            this.trouble = `${why}, retrying in ${Math.round(this.#backoff / 1000)}s`;
+            const wait = this.full ? this.fullRetry : this.#backoff;
+            this.trouble = `${why}, retrying in ${Math.round(wait / 1000)}s`;
             console.warn(`signaling: ${this.trouble}`);
-            setTimeout(() => this.#connect(), this.#backoff);
-            this.#backoff = Math.min(this.#backoff * 2, RECONNECT_MAX_MS);
+            setTimeout(() => this.#connect(), wait);
+            if (!this.full) this.#backoff = Math.min(this.#backoff * 2, RECONNECT_MAX_MS);
         }
         this.onChange?.();
     }
@@ -790,6 +812,23 @@ export class Mesh {
 
     #seating = null;
 
+    // The visitor pressed Join: ask for a spot among the people chatting.
+    // `lend` says this tab is about to hold part of the model, which needs
+    // none. Resolves { ok }. Like seat(), a silent or missing socket resolves
+    // ok: the server checks again when a reply starts.
+    enter(lend) {
+        return new Promise((resolve) => {
+            if (!this.#ws({ type: 'enter', lend: !!lend })) return resolve({ ok: true });
+            const timer = setTimeout(() => {
+                this.#entering = null;
+                resolve({ ok: true });
+            }, SEAT_WAIT_MS);
+            this.#entering = { resolve, timer };
+        });
+    }
+
+    #entering = null;
+
     // Messages are dropped, not queued, when the socket is down. Each one
     // describes the roster at the time it was sent and would be stale later.
     // The reconnect re-sends the claim and readiness.
@@ -815,6 +854,7 @@ export class Mesh {
             clearTimeout(this.#hang);
             this.#backoff = RECONNECT_MIN_MS;
             this.trouble = null;
+            this.full = false;
             const rejoin = this.#rejoining;
             const held = this.range;
             const sessions = Number.isInteger(m.sessions) && m.sessions >= 1 ? m.sessions : null;
@@ -867,6 +907,8 @@ export class Mesh {
         }
         if (m.type === 'welcome' || m.type === 'roster' || m.type === 'assign') {
             if (m.peers) this.peers = m.peers;
+            if (Number.isInteger(m.people)) this.people = m.people;
+            if ('maxPeople' in m) this.maxPeople = m.maxPeople ?? null;
             this.#sync();
             this.#flush();
             this.onChange?.();
@@ -874,7 +916,19 @@ export class Mesh {
         if (m.type === 'chat') {
             const wait = this.#seating;
             this.#seating = null;
-            if (wait) { clearTimeout(wait.timer); wait.resolve({ ok: m.ok !== false, max: m.max ?? null }); }
+            if (wait) {
+                clearTimeout(wait.timer);
+                wait.resolve({ ok: m.ok !== false, max: m.max ?? null, full: m.full === true });
+            }
+        }
+        if (m.type === 'entered') {
+            const wait = this.#entering;
+            this.#entering = null;
+            if (wait) { clearTimeout(wait.timer); wait.resolve({ ok: m.ok !== false }); }
+        }
+        if (m.type === 'idle') {
+            this.idled++;
+            this.onChange?.();
         }
         if (m.type === 'offer') this.#answer(m).catch((e) => console.warn(e.message));
         if (m.type === 'answer') this.#answered(m).catch((e) => console.warn(e.message));

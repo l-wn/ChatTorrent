@@ -37,9 +37,13 @@ export class Room {
     // no cap). `chatLeaseMs` frees a seat whose `chat-end` never came.
     // `sessions` is how many chats each peer here keeps in memory, sent in
     // the welcome, as is `ctx`, the context window in tokens.
+    // `maxPeople` caps the people chatting here (Infinity: no cap), lenders
+    // included. Lending needs no spot. `idleMs` frees the spot of someone who
+    // has not sent a message for that long.
     constructor({ label = '', positions, head, minBlocks, maxPeers = Infinity,
                   maxChats = Infinity, chatLeaseMs = 600000, sessions = SESSIONS,
-                  ctx = DEFAULT_CTX, log = console.log }) {
+                  ctx = DEFAULT_CTX, maxPeople = Infinity, idleMs = 600000,
+                  log = console.log }) {
         this.label = label;
         this.positions = positions;
         this.head = head;
@@ -49,6 +53,10 @@ export class Room {
         this.chatLeaseMs = chatLeaseMs;
         this.sessions = sessions;
         this.ctx = ctx;
+        this.maxPeople = maxPeople;
+        this.idleMs = idleMs;
+        // People chatting: id -> when they last sent a message.
+        this.people = new Map();
         // Peers with a reply generating: id -> the lease timer.
         this.chats = new Map();
         this.log = (line) => log(`${this.label}${line}`);
@@ -74,6 +82,7 @@ export class Room {
         const me = this.peers.get(id);
         if (!this.peers.delete(id)) return;
         this.#unseat(id);
+        this.people.delete(id);
         this.log(`- peer ${id} ${me ? this.where(me) : ''} (${this.peers.size} online): ${this.health()}`);
         this.broadcast();
     }
@@ -87,7 +96,7 @@ export class Room {
     }
 
     broadcast() {
-        const msg = { type: 'roster', peers: this.roster() };
+        const msg = { type: 'roster', peers: this.roster(), ...this.crowd() };
         for (const p of this.peers.values()) send(p.ws, msg);
     }
 
@@ -135,6 +144,38 @@ export class Room {
 
     // The room's limit as sent to pages: a number, or null for none.
     get chatLimit() { return Number.isFinite(this.maxChats) ? this.maxChats : null; }
+
+    // How many people are chatting and the limit (null for none), sent in
+    // every roster so the join card can say when the room is full.
+    crowd() {
+        return { people: this.people.size,
+                 maxPeople: Number.isFinite(this.maxPeople) ? this.maxPeople : null };
+    }
+
+    // Give peer `id` a spot to chat in, or renew it. False when the room is
+    // full.
+    #enter(id) {
+        if (!this.people.has(id) && this.people.size >= this.maxPeople) return false;
+        const fresh = !this.people.has(id);
+        this.people.set(id, Date.now());
+        if (fresh) this.broadcast();
+        return true;
+    }
+
+    // Free the spots of people who have not sent a message for `idleMs`, and
+    // tell them. signal-server.js calls this on a timer.
+    sweep(now = Date.now()) {
+        let changed = false;
+        for (const [id, at] of this.people) {
+            const p = this.peers.get(id);
+            if (now - at < this.idleMs || this.chats.has(id)) continue;
+            this.people.delete(id);
+            changed = true;
+            if (p) send(p.ws, { type: 'idle' });
+            this.log(`  peer ${id} idle, spot freed (${this.people.size}/${this.maxPeople} chatting)`);
+        }
+        if (changed) this.broadcast();
+    }
 
     // Free a peer's seat, if it holds one.
     #unseat(id) {
@@ -266,8 +307,25 @@ export class Room {
         // refused once `maxChats` replies are generating. A peer holds at most
         // one seat, so asking again while holding one only renews its lease.
         // chat-end frees it, as does leaving.
+        // enter: the visitor pressed Join on the card. Answered with
+        // `entered`, refused while `maxPeople` are chatting. A visitor joining
+        // to lend is always let in, without a spot: lending keeps the cluster
+        // up, and they get a spot when they first send a message.
+        if (m.type === 'enter') {
+            const ok = m.lend === true || this.#enter(id);
+            send(ws, { type: 'entered', ok, ...this.crowd() });
+            return;
+        }
+
         if (m.type === 'chat-start') {
             const max = this.chatLimit;
+            // Someone who lost their spot, or never pressed Join (an older
+            // page), gets one here if there is room.
+            if (!this.#enter(id)) {
+                this.log(`  peer ${id} refused a chat: ${this.people.size}/${this.maxPeople} people chatting`);
+                send(ws, { type: 'chat', ok: false, max, full: true, ...this.crowd() });
+                return;
+            }
             if (!this.chats.has(id) && this.chats.size >= this.maxChats) {
                 this.log(`  peer ${id} refused a chat: ${this.chats.size}/${max} running`);
                 send(ws, { type: 'chat', ok: false, max });
@@ -280,7 +338,11 @@ export class Room {
             send(ws, { type: 'chat', ok: true, max });
             return;
         }
-        if (m.type === 'chat-end') { this.#unseat(id); return; }
+        if (m.type === 'chat-end') {
+            this.#unseat(id);
+            if (this.people.has(id)) this.people.set(id, Date.now());
+            return;
+        }
 
         // signal: deliver this SDP to a peer in this room. `mac` is relayed
         // unchanged. It is the sender's seal over the SDP and both ids

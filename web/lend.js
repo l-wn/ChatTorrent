@@ -49,8 +49,10 @@ export function cellsFor(bar, L) {
 // Wire a slider: `bar` the track, `fill` the part up to the value, `handle`
 // the knob (role="slider"), `out` the number shown. Drag or click the track,
 // or use the arrow keys on the handle. Calls onChange(gb) on every change.
+// lock() sets it to zero for good, for a browser that can't lend.
 export function lendSlider({ bar, fill, handle, out, value = DEFAULT_GB, onChange = () => {} }) {
     let gb = Math.max(0, Math.min(MAX_GB, value));
+    let locked = false;
     const show = () => {
         out.textContent = gb ? `${gb} GB` : 'None';
         fill.style.width = `${(gb / MAX_GB) * 100}%`;
@@ -59,6 +61,7 @@ export function lendSlider({ bar, fill, handle, out, value = DEFAULT_GB, onChang
         handle.setAttribute('aria-valuetext', gb ? `${gb} GB` : 'none');
     };
     const set = (v) => {
+        if (locked) return;
         const next = Math.max(0, Math.min(MAX_GB, Math.round(v)));
         if (next === gb) return;
         gb = next;
@@ -86,5 +89,14 @@ export function lendSlider({ bar, fill, handle, out, value = DEFAULT_GB, onChang
         else if (e.key === 'End') { e.preventDefault(); set(MAX_GB); }
     });
     show();
-    return { get value() { return gb; } };
+    return {
+        get value() { return gb; },
+        lock() {
+            set(0);
+            locked = true;
+            bar.classList.add('locked');
+            handle.setAttribute('aria-disabled', 'true');
+            handle.tabIndex = -1;
+        },
+    };
 }

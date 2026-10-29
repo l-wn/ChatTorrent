@@ -235,8 +235,17 @@ const LEFT_RE = /is unreachable|no peer that can run|no answer from the cluster/
 // the ready peers' ranges cover the model, a job of mine can enter, my own
 // hand-off is open, and an answer can come back. What this tab holds does not
 // matter.
+// The idle notices shown, against net.idled.
+let idleShown = 0;
+
 function refresh() {
     const net = engine.net;
+
+    // The server freed this tab's spot for being idle.
+    if (net.idled > idleShown) {
+        idleShown = net.idled;
+        note("You were idle, so your spot went to someone waiting. Send a message to get it back, if there's room.");
+    }
 
     // The Contribute drawer's numbers. #covered and #role keep the formats
     // tools/load.mjs reads.
@@ -295,6 +304,9 @@ function refresh() {
             crowd: net.peers.filter((p) => p.id !== net.id)
                 .map((p) => ({ name: p.name ?? `GPU ${p.id}`, lending: holding(p) })),
             running: !!net.positions && cov.covered === cov.total,
+            // The public demo turned this tab away, or how many people are
+            // chatting and the limit (null for none).
+            full: net.full, people: net.people, maxPeople: net.maxPeople,
             needGb: Math.ceil(missingBytes(cov) / 2 ** 30),
             modelGb: (posBytes ? posBytes.reduce((x, y) => x + y, 0) : 27 * 2 ** 30) / 2 ** 30,
             pieceGb: posBytes ? posBytes.map((b) => b / 2 ** 30) : null,
@@ -315,6 +327,7 @@ function refresh() {
 
     const why = foreign() ? 'read-only: made on another model'
         : net.refused ? net.refused
+        : net.full ? 'demo full, waiting for a spot…'
         : engine.canPrompt === null && !net.online && net.trouble ? 'signalling offline, reconnecting…'
         : net.relayOnly && !net.relay ? 'no relay server: links cannot open'
         : engine.canPrompt === null ? 'starting up…'
@@ -779,6 +792,10 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
     ui.bootwhat.textContent = 'Waiting for your answer…';
     ui.bootnote.textContent = 'about lending your GPU';
     const { contribute, limit } = await gpuConsent;
+    // Take a spot among the people chatting. Two people can press Join for
+    // the last one at once; the one turned away is told here, and gets a spot
+    // with their next message if one has freed.
+    engine.net.enter(contribute).then(({ ok }) => { if (!ok) problem('DEMO_FULL'); });
     ui.vramlimit.value = limit;
     if (!contribute) {
         ui.boot.remove();
@@ -1450,6 +1467,12 @@ async function submitPrompt() {
     setBusy(true);
     ui.stop.disabled = true;
     const seat = await engine.net.seat();
+    if (!seat.ok && seat.full) {
+        setBusy(false);
+        problem('DEMO_FULL');
+        setStatus('demo full', 'busy');
+        return;
+    }
     if (!seat.ok) {
         setBusy(false);
         problem('REPLY_LIMIT', `the cluster's limit of ${seat.max} replies at once`);

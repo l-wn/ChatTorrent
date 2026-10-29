@@ -1010,6 +1010,10 @@ process.env.MAX_PRIVATE_CHATS = '3';
 process.env.MESH_SESSIONS = '6';
 process.env.MAX_PRIVATE_SESSIONS = '12';
 process.env.CHAT_LEASE_MS = '300';
+// The limit on people chatting in the global mesh, and an idle time short
+// enough to see a spot freed within the test.
+process.env.MAX_PEOPLE = '3';
+process.env.PEOPLE_IDLE_MS = '400';
 // Our own TURN server, so every welcome carries a per-peer credential.
 process.env.TURN_SECRET = 'testsecret';
 process.env.TURN_URLS = 'turn:turn.example:3478?transport=udp, turn:turn.example:3478?transport=tcp';
@@ -1624,6 +1628,60 @@ console.log('\nsignal-server: chats at once');
     await sleep(150);
 }
 
+console.log('\nsignal-server: people chatting');
+{
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    // Send `msg` and wait for the next `type` message not seen before.
+    const reply = async (p, msg, type) => {
+        const seen = p.msgs.filter((m) => m.type === type).length;
+        p.send(msg);
+        return p.next((m) => m.type === type && p.msgs.filter((x) => x.type === type).indexOf(m) === seen);
+    };
+    const enter = (p, lend = false) => reply(p, { type: 'enter', lend }, 'entered');
+    const ask = (p) => reply(p, { type: 'chat-start' }, 'chat');
+
+    // MAX_PEOPLE is 3 in the global mesh.
+    const ps = [connect(null), connect(null), connect(null), connect(null)];
+    const welcomes = await Promise.all(ps.map((p) => p.next((m) => m.type === 'welcome')));
+    eq('the welcome gives the limit on people', welcomes[0].maxPeople, 3);
+    const [a, b, c, d] = ps;
+    eq('three people may join', [(await enter(a)).ok, (await enter(b)).ok, (await enter(c)).ok],
+        [true, true, true]);
+    const turned = await enter(d);
+    eq('a fourth is turned away, with the count', [turned.ok, turned.people, turned.maxPeople],
+        [false, 3, 3]);
+    const roster = await d.next((m) => m.type === 'roster' && m.people === 3);
+    ok('and every roster carries the count', roster.maxPeople === 3);
+    const refused = await ask(d);
+    ok('a reply from someone without a spot is refused as full',
+        refused.ok === false && refused.full === true);
+    ok('a lender is let in without a spot', (await enter(d, true)).ok === true);
+    eq('but is not counted', (await enter(a)).people, 3);
+
+    d.send({ type: 'capacity', cap: 10 });
+    await d.next((m) => m.type === 'assign' && m.lo != null);
+    ok('but a lender still needs a spot to chat', (await ask(d)).full === true);
+
+    a.close();
+    await sleep(100);
+    const e = connect(null);
+    await e.next((m) => m.type === 'welcome');
+    ok('leaving frees a spot', (await enter(e)).ok === true);
+
+    // PEOPLE_IDLE_MS is 400; b and c have sent nothing since joining.
+    const idle = await b.next((m) => m.type === 'idle');
+    ok('an idle person is told their spot was freed', idle.type === 'idle');
+    await c.next((m) => m.type === 'idle');
+    ok('and a message after that takes a spot again if there is room', (await ask(b)).ok === true);
+    b.send({ type: 'chat-end' });
+
+    const t = (await openRoom(newSecret())).joinToken;
+    const priv = connect(t);
+    eq('a private mesh has no limit on people', (await priv.next((m) => m.type === 'welcome')).maxPeople, null);
+    for (const p of [b, c, d, e, priv]) p.close();
+    await sleep(150);
+}
+
 console.log('\nsignal-server: chats in memory');
 {
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -1830,6 +1888,23 @@ console.log('\nsignal-server: chats in memory');
         const n = FakeWS.all.length;
         await tick(1200);
         eq('and not retried', FakeWS.all.length, n);
+    }
+    {
+        const p = new Mesh({ fullRetry: 300 });
+        const s1 = FakeWS.all.at(-1);
+        s1.open();
+        s1.close(4002);
+        await tick(50);
+        ok('a public tab turned away at the limit waits as full', p.full && !p.refused);
+        const n = FakeWS.all.length;
+        await tick(400);
+        eq('and tries again', FakeWS.all.length, n + 1);
+        const s2 = FakeWS.all.at(-1);
+        s2.open();
+        s2.deliver(welcome(2, false));
+        await p.ready;
+        ok('and is no longer full once welcomed', !p.full);
+        p.stop();
     }
 
     // A spectator's only link, to the one holder of position 0, fails ICE.

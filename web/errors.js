@@ -20,6 +20,7 @@ export const PROBLEMS = {
     REPLY_FAILED:  { code: 'E20', text: 'The reply failed.', hint: 'Send your message again.' },
     BUSY:          { code: 'E21', text: 'The cluster is busy right now.', hint: 'Try again in a moment.' },
     REPLY_LIMIT:   { code: 'E22', text: 'The cluster is answering as many people as it can.', hint: 'Try again in a moment.' },
+    DEMO_FULL:     { code: 'E24', text: 'The public demo is full right now.', hint: 'Try again in a few minutes, or start your own private cluster.' },
     CHAT_FULL:     { code: 'E23', text: 'This chat is too long for the model to read.', hint: 'Start a new chat from the chat list.' },
 
     SAVE_FAILED:   { code: 'E30', text: "This message couldn't be saved in your browser.", hint: 'The chat still works, but may be gone after a reload.' },

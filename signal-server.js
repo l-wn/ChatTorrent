@@ -190,6 +190,12 @@ const MAX_PEERS_PER_ROOM = Number(process.env.MAX_PEERS_PER_ROOM) || 64;
 const limit = (v) => Number(v) > 0 ? Math.floor(Number(v)) : Infinity;
 const MAX_CHATS = limit(process.env.MAX_CHATS);
 const MAX_PRIVATE_CHATS = limit(process.env.MAX_PRIVATE_CHATS);
+// People chatting at once in the global mesh, lenders included (lending
+// itself needs no spot). 16 by default; 0 for no limit. Private meshes have none.
+// Past it, the join card says the demo is full until a spot frees, and a spot
+// frees when its holder leaves or sends nothing for PEOPLE_IDLE_MS.
+const MAX_PEOPLE = process.env.MAX_PEOPLE == null ? 16 : limit(process.env.MAX_PEOPLE);
+const PEOPLE_IDLE_MS = Number(process.env.PEOPLE_IDLE_MS) || 600000;
 // A seat whose `chat-end` never came is freed after this long. Longer than a
 // page waits for any one job (route.js's JOB_TIMEOUT, 300 s).
 const CHAT_LEASE_MS = Number(process.env.CHAT_LEASE_MS) || 600000;
@@ -223,13 +229,13 @@ export const CLOSE_FULL = 4002;
 // A join token is HKDF output: 32 bytes, base64url.
 const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 
-const makeRoom = (label, maxChats, sessions, ctx) => new Room({
+const makeRoom = (label, maxChats, sessions, ctx, maxPeople = Infinity) => new Room({
     label, positions: POSITIONS, head: HEAD, minBlocks: MIN_BLOCKS, maxPeers: MAX_PEERS_PER_ROOM,
-    maxChats, chatLeaseMs: CHAT_LEASE_MS, sessions, ctx,
+    maxChats, chatLeaseMs: CHAT_LEASE_MS, sessions, ctx, maxPeople, idleMs: PEOPLE_IDLE_MS,
 });
 
 const GLOBAL = 'global';
-const rooms = new Map([[GLOBAL, makeRoom('', MAX_CHATS, MESH_SESSIONS, MESH_CTX)]]);
+const rooms = new Map([[GLOBAL, makeRoom('', MAX_CHATS, MESH_SESSIONS, MESH_CTX, MAX_PEOPLE)]]);
 
 // One id counter for all rooms: monotonic and never reused. A browser keys
 // links by peer id, so an id must never refer to a later peer, even after a
@@ -258,6 +264,12 @@ setInterval(() => {
     }
 }, PING_MS).unref?.();
 
+// Free idle people's spots. Checked often enough that a spot frees within a
+// few percent of PEOPLE_IDLE_MS.
+setInterval(() => {
+    for (const room of rooms.values()) room.sweep();
+}, Math.min(30000, Math.max(50, PEOPLE_IDLE_MS / 4))).unref?.();
+
 const conns = new Map();          // CF-Connecting-IP -> open socket count
 
 const wss = new WebSocketServer({
@@ -279,6 +291,9 @@ console.log(`  weights: ${WEIGHTS_URL}${process.env.WEIGHTS_URL ? ' (WEIGHTS_URL
     : ` (from ${CHECKPOINT})`}`);
 console.log(`  chats at once: ${Number.isFinite(MAX_CHATS) ? MAX_CHATS : 'no limit'} in the global mesh, `
     + `${Number.isFinite(MAX_PRIVATE_CHATS) ? `at most ${MAX_PRIVATE_CHATS}` : 'no cap'} in a private one`);
+console.log(`  people chatting: ${Number.isFinite(MAX_PEOPLE) ? MAX_PEOPLE : 'no limit'} in the global mesh, `
+    + `a spot freed after ${PEOPLE_IDLE_MS >= 60000
+        ? `${Math.round(PEOPLE_IDLE_MS / 60000)} min` : `${PEOPLE_IDLE_MS / 1000} s`} idle`);
 console.log(`  chats in memory per peer: ${MESH_SESSIONS} in the global mesh, `
     + `at most ${MAX_PRIVATE_SESSIONS} in a private one`);
 console.log(`  context: ${MESH_CTX} tokens in the global mesh, at most ${MAX_PRIVATE_CTX} in a private one`);
@@ -362,6 +377,8 @@ wss.on('connection', (ws, req) => {
             sessions: room.sessions,
             // The context window of every chat here, in tokens.
             ctx: room.ctx,
+            // People chatting here and the limit on them (null for none).
+            ...room.crowd(),
             ice, peers: room.roster(),
         });
         room.broadcast();

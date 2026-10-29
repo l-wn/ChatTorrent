@@ -134,15 +134,15 @@ const PROMPTS = PROMPT_SET === 'copy' ? COPY_PROMPTS : CHAT_PROMPTS;
 
 const call = (fn, arg) => `(${fn})(${JSON.stringify(arg ?? null)})`;
 
-// Answer the setup screen (web/welcome.js): lend the default amount, or move
-// the slider to zero to only chat, then press "Join and chat". The screen is
-// not shown when this browser profile has answered it before.
+// Answer the setup screen (web/welcome.js): move the slider to zero to only
+// chat, or to 4 GB to lend, then press "Join and chat". The screen is not
+// shown when this browser profile has answered it before.
 const answerWelcome = (contribute) => {
     if (!document.getElementById('welcome').open) return;
-    if (!contribute) {
-        document.getElementById('lendHandle')
-            .dispatchEvent(new KeyboardEvent('keydown', { key: 'Home', bubbles: true }));
-    }
+    const key = (k) => document.getElementById('lendHandle')
+        .dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true }));
+    key('Home');
+    if (contribute) key('PageUp');
     document.getElementById('welcomeYes').click();
 };
 
@@ -160,6 +160,10 @@ const waitReady = async ({ timeout }) => {
             return { outcome: 'ok', joinMs: joined ?? now, readyMs: now, status };
         }
         if (/cluster is full/.test(status)) return { outcome: 'full', joinMs: joined, status };
+        // The public demo's limit on people (welcome.js): Join stays disabled.
+        if ($('welcome').open && $('welcomeYes').disabled) {
+            return { outcome: 'full', joinMs: joined, status: $('lobbyLine').textContent };
+        }
         if (/did not accept this page/.test(status)) return { outcome: 'refused', joinMs: joined, status };
         if (now > timeout) return { outcome: 'never-ready', joinMs: joined, status };
         await new Promise((r) => setTimeout(r, 50));
@@ -246,12 +250,13 @@ const turn = async ({ text, tokens, timeout, spec, greedy }) => {
 
     // E20 a failed reply, E21 a computer with no room for another chat
     // (stage.js's #atCapacity), E22 the cluster's limit on replies at once
-    // (signal-room.js), refused before anything reached a GPU.
-    const at = codes.findIndex((c) => c === 'E20' || c === 'E21' || c === 'E22');
+    // (signal-room.js), refused before anything reached a GPU. E24 the public
+    // demo's limit on people chatting, also counted as full.
+    const at = codes.findIndex((c) => c === 'E20' || c === 'E21' || c === 'E22' || c === 'E24');
     const failed = at >= 0 ? errs[at] : errs[0] ?? null;
     const code = at >= 0 ? codes[at] : codes[0] ?? '';
     const outcome = timedOut ? 'timeout'
-        : code === 'E22' ? 'full'
+        : code === 'E22' || code === 'E24' ? 'full'
         : code === 'E21' ? 'busy'
         : failed || !mm ? 'error'
         : 'ok';
