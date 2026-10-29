@@ -106,14 +106,16 @@ coding agent, and its license is AGPL. See
 
 ## Performance
 
-- **Twelve people at once:** 19.1 tok/s in total on one machine, 16.0 across
-  two countries. All 36 replies finished.
-- **One person:** 19.7 tok/s on one machine, 8.1 across two countries, and
-  14.5 on code and lists.
+ClusterChat was tested on two RTX 3090s in two setups: both in one PC, and one in each of two PCs, in France and Spain (28ms apart).
 
-Qwen3.8-27B q8 on two RTX 3090s, either in one machine or one in France and one
-in Spain (28 ms apart). 128-token replies, default settings, measured with
-[`tools/load.mjs`](tools/load.mjs).
+Speed was measured for one prompt alone, and for up to twelve people prompting at once.
+
+- **One prompt:** 19.7 tok/s on one PC, two GPUS. 8.1 tok/s across two PCs , and
+  14.5 tok/s on code and lists.
+- **Twelve concurrent prompts at once:** each chat gets about 7 tok/s on one PC, ~5 tok/s
+  across two PCs.
+
+128-token replies, default settings, measured with [`tools/load.mjs`](tools/load.mjs).
 
 **Twelve people**, arriving over 30 seconds, three questions each. Tok/s per
 reply (median), by number of concurrent prompts:
