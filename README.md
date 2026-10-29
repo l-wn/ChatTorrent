@@ -74,7 +74,7 @@ running a model instead of the pieces of a file.
 | | |
 |---|---|
 | **Model** | Qwen3.8-27B, 8-bit, about 27 GiB across the cluster |
-| **Speed** | see [Performance](#performance) |
+| **Speed** | up to 19.7 tok/s per chat ([Performance](#performance)) |
 | **Context** | 4K to 32K tokens, chosen when the cluster is created (16K by default); the KV cache is int8 |
 | **Replies at once** | set by whoever starts the cluster |
 | **Chats each browser keeps in memory** | 8 by default, up to 32 in a private cluster |
