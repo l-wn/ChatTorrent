@@ -90,7 +90,7 @@ project's README or the linked source as of October 2026.
 
 | Project | Runs in | Splits one model across machines | Install per machine | Several people at once | When a machine leaves | Published speed (source, hardware) |
 |---|---|---|---|---|---|---|
-| **ClusterChat** | browser tab (WebGPU) | yes, over WebRTC through a relay | none, open a link | yes, each person has their own chat, and several replies run at once | pieces are held by more than one browser; an interrupted reply is replayed elsewhere | Qwen3.8-27B q8: 19.7 tok/s on two RTX 3090s in one machine, 8.1 across two machines 28 ms apart over a real internet link ([Performance](#performance)) |
+| **ClusterChat** | browser tab (WebGPU) | yes, over WebRTC through a relay | none, open a link | yes, each person has their own chat, and several replies run at once | pieces are held by more than one browser; an interrupted reply is replayed elsewhere | Qwen3.8-27B q8: 19.7 tok/s on two RTX 3090s in one machine, 8.1 tok/s across two machines 28 ms apart over a real internet link ([Performance](#performance)) |
 | [Pooled](https://github.com/Nehanth/pooled) | browser tab (WebGPU) | yes, over direct WebRTC, relay as a fallback | none, open a link | one shared conversation that everyone in the room sees; requests run one at a time | the host deals the layers out again | Qwen 3.8 27B Q4_0: 20 to 27 tok/s on one GB10; 7.6 to 11.9 on two devices under emulated delay ([README](https://github.com/Nehanth/pooled#performance)) |
 | [Petals](https://github.com/bigscience-workshop/petals) | native Python | yes, layers served by volunteers | pip package, PyTorch | yes, each client runs its own session | clients route around servers that leave | up to 6 tok/s Llama 2 70B ([README](https://github.com/bigscience-workshop/petals)); last commit 2024-08-25 |
 | [exo](https://github.com/exo-explore/exo) | native (MLX); macOS app, Linux on CPU | yes, with RDMA over Thunderbolt 5 on Macs | macOS app or build from source | serves an OpenAI-compatible API | not stated | 31.9 tok/s Qwen3 235B on 4x M3 Ultra ([Jeff Geerling](https://www.jeffgeerling.com/blog/2025/15-tb-vram-on-mac-studio-rdma-over-thunderbolt-5/)) |
@@ -111,8 +111,8 @@ How fast each chat writes, in tokens per second. Qwen3.8-27B q8 on two RTX
 
 | | One PC | Two PCs, France and Spain |
 |---|--:|--:|
-| One person chatting | **19.7** | **8.1** |
-| Twelve people chatting at once | **about 7** | **about 5** |
+| One person chatting | **19.7 tok/s** | **8.1 tok/s** |
+| Twelve people chatting at once | **about 7 tok/s** | **about 5 tok/s** |
 
 Code and lists are faster: 14.5 tok/s across the two PCs.
 
@@ -127,18 +127,18 @@ each chat (median), by how many prompts were running at once:
 
 | Prompts at once | 1 | 2 | 3 to 4 | 5 to 8 | 9 to 16 |
 |---|--:|--:|--:|--:|--:|
-| One PC | 13.9 | 4.9 | 7.2 | 7.1 | – |
-| Two PCs | 9.0 | 6.3 | 5.9 | 4.0 | 5.0 |
+| One PC | 13.9 tok/s | 4.9 tok/s | 7.2 tok/s | 7.1 tok/s | – |
+| Two PCs | 9.0 tok/s | 6.3 tok/s | 5.9 tok/s | 4.0 tok/s | 5.0 tok/s |
 
 All 36 replies finished. The cluster wrote 19.1 tok/s in total on one PC and
-16.0 on two.
+16.0 tok/s on two.
 
 **One person** asks six questions. Speed over the whole run:
 
 | | Speculation off | On (default) |
 |---|--:|--:|
-| One PC | – | 19.7 |
-| Two PCs | 6.5 | 8.1 |
+| One PC | – | 19.7 tok/s |
+| Two PCs | 6.5 tok/s | 8.1 tok/s |
 | Two PCs, code and lists (greedy) | 6.5 | 14.5 |
 
 Speculation checks up to 7 drafted tokens per trip through the GPUs, and the
