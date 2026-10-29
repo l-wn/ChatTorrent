@@ -106,38 +106,43 @@ coding agent, and its license is AGPL. See
 
 ## Performance
 
-ClusterChat was tested on two RTX 3090s in two setups: both in one PC, and one in each of two PCs, in France and Spain (28ms apart).
+How fast each chat writes, in tokens per second. Qwen3.8-27B q8 on two RTX
+3090s, either both in one PC or in two PCs, one in France and one in Spain.
 
-Speed was measured for one prompt alone, and for up to twelve people prompting at once.
+| | One PC | Two PCs, France and Spain |
+|---|--:|--:|
+| One person chatting | **19.7** | **8.1** |
+| Twelve people chatting at once | **about 7** | **about 5** |
 
-- **One prompt:** 19.7 tok/s on one PC, two GPUS. 8.1 tok/s across two PCs , and
-  14.5 tok/s on code and lists.
-- **Twelve concurrent prompts at once:** each chat gets about 7 tok/s on one PC, ~5 tok/s
-  across two PCs.
+Code and lists are faster: 14.5 tok/s across the two PCs.
 
-128-token replies, default settings, measured with [`tools/load.mjs`](tools/load.mjs).
+<details>
+<summary>How it was measured, and the full numbers</summary>
 
-**Twelve people**, arriving over 30 seconds, three questions each. Tok/s per
-reply (median), by number of concurrent prompts:
+Replies of up to 128 tokens, default settings, measured with
+[`tools/load.mjs`](tools/load.mjs).
 
-| Concurrent prompts | 1 | 2 | 3 to 4 | 5 to 8 | 9 to 16 | **Total** |
-|---|--:|--:|--:|--:|--:|--:|
-| One machine | 13.9 | 4.9 | 7.2 | 7.1 | – | **19.1** |
-| France and Spain | 9.0 | 6.3 | 5.9 | 4.0 | 5.0 | **16.0** |
+**Twelve people** arrive over 30 seconds and ask three questions each. Speed of
+each chat (median), by how many prompts were running at once:
 
-**One person**, six questions. Tok/s over the whole run:
+| Prompts at once | 1 | 2 | 3 to 4 | 5 to 8 | 9 to 16 |
+|---|--:|--:|--:|--:|--:|
+| One PC | 13.9 | 4.9 | 7.2 | 7.1 | – |
+| Two PCs | 9.0 | 6.3 | 5.9 | 4.0 | 5.0 |
+
+All 36 replies finished. The cluster wrote 19.1 tok/s in total on one PC and
+16.0 on two.
+
+**One person** asks six questions. Speed over the whole run:
 
 | | Speculation off | On (default) |
 |---|--:|--:|
-| One machine | – | **19.7** |
-| France and Spain | 6.5 | **8.1** |
-| France and Spain, code and lists (greedy) | 6.5 | **14.5** |
+| One PC | – | 19.7 |
+| Two PCs | 6.5 | 8.1 |
+| Two PCs, code and lists (greedy) | 6.5 | 14.5 |
 
 Speculation checks up to 7 drafted tokens per trip through the GPUs, and the
 text is the same as without it ([how](docs/architecture.md#speculative-decoding)).
-
-<details>
-<summary>Commands</summary>
 
 ```bash
 # One person. Add --no-spec or --greedy for the other columns.
