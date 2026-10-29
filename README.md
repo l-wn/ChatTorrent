@@ -22,7 +22,7 @@ Everyone gets their own chat, several replies run at once, and anyone can leave 
 
 <br />
 
-| [**12 people**](#several-people-at-once) | [**19.7 tok/s**](#one-reply-at-a-time) | [**6 tok/s**](#one-reply-at-a-time) | **0 installs** |
+| [**12 people**](#several-people-at-once) | [**19.7 tok/s**](#one-reply-at-a-time) | [**8 tok/s**](#one-reply-at-a-time) | **0 installs** |
 |:-:|:-:|:-:|:-:|
 | chatting at once on two RTX 3090s | two RTX 3090s, one machine | two RTX 3090s, across the internet | a browser tab |
 
@@ -52,8 +52,8 @@ running a model instead of the pieces of a file.
   carries on.
 - **Built for real networks.** Speculative decoding (prompt lookup plus the
   model's own multi-token prediction head) checks up to 7 tokens per trip
-  around the cluster. Two machines 81 ms apart reach 6 tok/s at default
-  settings and 11.7 on repetitive text.
+  around the cluster. Two machines 28 ms apart reach 8.1 tok/s at default
+  settings and 14.5 on repetitive text.
 - **Full 8-bit weights, same text however it is split.** The model runs at q8.
   The residual stream is rounded to f16 after every block, so a reply is
   bit-identical whether one browser or ten hold the model.
@@ -90,7 +90,7 @@ project's README or the linked source as of October 2026.
 
 | Project | Runs in | Splits one model across machines | Install per machine | Several people at once | When a machine leaves | Published speed (source, hardware) |
 |---|---|---|---|---|---|---|
-| **ClusterChat** | browser tab (WebGPU) | yes, over WebRTC through a relay | none, open a link | yes, each person has their own chat, and several replies run at once | pieces are held by more than one browser; an interrupted reply is replayed elsewhere | Qwen3.8-27B q8: 19.7 tok/s on two RTX 3090s in one machine, 6.0 across two machines 81 ms apart ([Performance](#performance)) |
+| **ClusterChat** | browser tab (WebGPU) | yes, over WebRTC through a relay | none, open a link | yes, each person has their own chat, and several replies run at once | pieces are held by more than one browser; an interrupted reply is replayed elsewhere | Qwen3.8-27B q8: 19.7 tok/s on two RTX 3090s in one machine, 8.1 across two machines 28 ms apart ([Performance](#performance)) |
 | [Pooled](https://github.com/Nehanth/pooled) | browser tab (WebGPU) | yes, over direct WebRTC, relay as a fallback | none, open a link | one shared conversation that everyone in the room sees; requests run one at a time | the host deals the layers out again | Qwen 3.8 27B Q4_0: 20 to 27 tok/s on one GB10; 7.6 to 11.9 on two devices under emulated delay ([README](https://github.com/Nehanth/pooled#performance)) |
 | [Petals](https://github.com/bigscience-workshop/petals) | native Python | yes, layers served by volunteers | pip package, PyTorch | yes, each client runs its own session | clients route around servers that leave | up to 6 tok/s Llama 2 70B ([README](https://github.com/bigscience-workshop/petals)); last commit 2024-08-25 |
 | [exo](https://github.com/exo-explore/exo) | native (MLX); macOS app, Linux on CPU | yes, with RDMA over Thunderbolt 5 on Macs | macOS app or build from source | serves an OpenAI-compatible API | not stated | 31.9 tok/s Qwen3 235B on 4x M3 Ultra ([Jeff Geerling](https://www.jeffgeerling.com/blog/2025/15-tb-vram-on-mac-studio-rdma-over-thunderbolt-5/)) |
@@ -115,9 +115,9 @@ Tokens per second, total tokens over total decode time:
 | Setup | Prompts | Sampling | Plain | Prompt lookup | Prompt lookup + MTP |
 |---|---|---|--:|--:|--:|
 | One machine | chat questions | page defaults | | 10.6 | **19.7** |
-| Two machines, 81 ms apart | chat questions | page defaults | 4.0 | 4.1 | **6.0** |
-| Two machines, 81 ms apart | chat questions | greedy | 4.4 | 6.2 | **9.1** |
-| Two machines, 81 ms apart | lists, code, tables | greedy | 4.2 | 6.3 | **11.7** |
+| Two machines, 28 ms apart | chat questions | page defaults | 6.5 | 6.1 | **8.1** |
+| Two machines, 28 ms apart | chat questions | greedy | 6.5 | 6.1 | **7.2** |
+| Two machines, 28 ms apart | lists, code, tables | greedy | 6.5 | 8.8 | **14.5** |
 
 Every token is a full lap across the GPUs and the links between them, so
 plain decoding is capped by the lap time. Speculative decoding breaks that
